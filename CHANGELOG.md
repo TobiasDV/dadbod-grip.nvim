@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments in those dialects. Resolve projections and their actual source
   from the same token stream, including PostgreSQL nested comments. Only
   allow qualified projections that match the source table or alias, keeping
-  DuckDB struct expansion and struct-field access read-only.
+  DuckDB struct expansion and struct-field access read-only. Preserve editing
+  with ordinary filters and ordering, including `LEFT()`/`RIGHT()`, supported
+  string literals, PostgreSQL JSON operators, and DuckDB lists.
 
 ## [3.11.0] - 2026-08-31
 

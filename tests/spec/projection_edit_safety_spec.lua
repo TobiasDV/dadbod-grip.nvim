@@ -152,6 +152,16 @@ test("SQLite ordinary keyword-named columns stay editable", function()
   end
 end)
 
+test("SQLite literal backslash path filter stays editable", function()
+  local session = open_query([[
+SELECT id, "user" FROM projection_values
+WHERE 'C:\data\orders' = 'C:\data\orders'
+]], fixture_url)
+  eq(session.state.columns[2], "user", "original column name")
+  eq(session.state.rows[1][2], "stored-user", "real stored column value")
+  assert_edit_targets(session, "user")
+end)
+
 cleanup_grids()
 vim.fn.delete(fixture)
 

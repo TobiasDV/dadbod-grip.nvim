@@ -404,6 +404,80 @@ test("resolve_query: ordinary tail expressions preserve single-source metadata",
   end
 end)
 
+test("resolve_query: LEFT and RIGHT tail functions are not joins", function()
+  for _, kind in ipairs({ "postgresql", "duckdb", "mysql" }) do
+    local statement = "SELECT id, status FROM orders WHERE LEFT(status, 1) = 'b' ORDER BY RIGHT(status, 1)"
+    local _, tbl = grip._resolve_query(statement, 50, kind)
+    eq(tbl, "orders", kind)
+    _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id, status FROM other", 50, kind)
+    eq(tbl, nil, kind .. " real set operation")
+  end
+end)
+
+test("resolve_query: plain backslash filters preserve direct-column editing", function()
+  for _, kind in ipairs({ "postgresql", "duckdb", "mysql", "sqlite" }) do
+    local _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\orders']], 50, kind)
+    eq(tbl, "orders", kind)
+    _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\\']], 50, kind)
+    eq(tbl, "orders", kind .. " even trailing backslashes")
+    _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\']], 50, kind)
+    local expected
+    if kind ~= "postgresql" and kind ~= "mysql" then expected = "orders" end
+    eq(tbl, expected, kind .. " trailing backslash quote boundary")
+  end
+end)
+
+test("resolve_query: explicit escape strings cannot hide set operations", function()
+  for _, kind in ipairs({ "postgresql", "duckdb" }) do
+    for _, literal in ipairs({
+      [[E'it\'s FROM other UNION SELECT']],
+      "E''\n'first'\n'\\' -- '",
+      "E'' -- continuation\n'\\' -- '",
+    }) do
+      local statement = "SELECT id FROM orders WHERE status = " .. literal
+      local _, tbl = grip._resolve_query(statement, 50, kind)
+      eq(tbl, "orders", kind .. " " .. literal)
+      _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id FROM other", 50, kind)
+      eq(tbl, nil, kind .. " real set operation after " .. literal)
+    end
+  end
+end)
+
+test("resolve_query: dollar-quoted filters use exact delimiter boundaries", function()
+  for _, kind in ipairs({ "postgresql", "duckdb" }) do
+    for _, literal in ipairs({ "$$it's FROM other UNION SELECT$$", "$tag$' /* FROM $$ UNION */$tag$" }) do
+      local statement = "SELECT id FROM orders WHERE status = " .. literal
+      local _, tbl = grip._resolve_query(statement, 50, kind)
+      eq(tbl, "orders", kind .. " " .. literal)
+      _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id FROM other", 50, kind)
+      eq(tbl, nil, kind .. " real set operation")
+      _, tbl = grip._resolve_query("SELECT id, " .. literal .. " FROM orders", 50, kind)
+      eq(tbl, nil, kind .. " literal projection")
+    end
+    for _, literal in ipairs({ "$$unterminated", "$tag$wrong case$TAG$", "$1$invalid tag$1$" }) do
+      local _, tbl = grip._resolve_query("SELECT id FROM orders WHERE status = " .. literal, 50, kind)
+      eq(tbl, nil, kind .. " " .. literal)
+    end
+  end
+end)
+
+test("resolve_query: PostgreSQL JSON operators are allowed only in tail expressions", function()
+  local _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE details #>> '{status}' = 'base']], 50, "postgresql")
+  eq(tbl, "orders")
+  _, tbl = grip._resolve_query([[SELECT id, details #>> '{status}' FROM orders]], 50, "postgresql")
+  eq(tbl, nil, "JSON extraction is not a direct column")
+end)
+
+test("resolve_query: DuckDB nested lists do not act as quoted identifiers", function()
+  local statement = [=[SELECT id FROM orders WHERE [[status]] = [['base']]]=]
+  local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+  eq(tbl, "orders")
+  _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id FROM other", 50, "duckdb")
+  eq(tbl, nil, "real set operation after list filter")
+  _, tbl = grip._resolve_query("SELECT id, [status] FROM orders", 50, "duckdb")
+  eq(tbl, nil, "list construction is not a direct column")
+end)
+
 test("resolve_query: aliased projected column does not expose editable table", function()
   local spec, tbl = grip._resolve_query("SELECT id, total AS status FROM orders", 50)
   assert(spec, "spec should not be nil")

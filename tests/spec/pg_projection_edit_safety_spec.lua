@@ -119,6 +119,49 @@ local ok, err = pcall(function()
       eq(view._is_editable(session), true, "grid edits remain enabled")
     end)
   end
+
+  local function assert_tail_editable(tail)
+    local session = open_query("SELECT id, total FROM " .. table_name .. " " .. tail)
+    eq(table.concat(session.state.columns, ","), "id,total", "direct output columns")
+    eq(#session.state.rows, 1, "filter keeps the fixture row")
+    eq(session.state.rows[1][1], "1", "actual row primary key")
+    eq(session.state.rows[1][2], "from-total", "direct stored value")
+    eq(session.state.table_name, table_name, "actual source table")
+    eq(session.state.pks[1], "id", "actual source primary key")
+    eq(session.state.readonly, false, "tail expression preserves direct-column editing")
+    eq(view._is_editable(session), true, "grid edits remain enabled")
+  end
+
+  test("LEFT and RIGHT in filters and ordering preserve editing", function()
+    for _, tail in ipairs({
+      "WHERE LEFT(status, 4) = 'base' ORDER BY RIGHT(status, 6)",
+      "WHERE RIGHT(status, 6) = 'status' ORDER BY LEFT(status, 4)",
+    }) do
+      assert_tail_editable(tail)
+    end
+  end)
+
+  test("dollar-quoted tail strings preserve editing", function()
+    assert_tail_editable([[
+      WHERE status = $value$base-status$value$
+        AND $$FROM orders UNION SELECT 'other'$$ <> ''
+      ORDER BY id
+    ]])
+  end)
+
+  test("plain backslashes in tail strings preserve editing", function()
+    assert_tail_editable([[
+      WHERE 'C:\temp\orders' = 'C:' || chr(92) || 'temp' || chr(92) || 'orders'
+      ORDER BY id
+    ]])
+  end)
+
+  test("JSON path extraction in a filter preserves editing", function()
+    assert_tail_editable([[
+      WHERE ('{"nested":{"status":"base-status"}}'::jsonb #>> '{nested,status}') = status
+      ORDER BY id
+    ]])
+  end)
 end)
 
 cleanup_grids()

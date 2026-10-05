@@ -132,16 +132,26 @@ local function tokenize_select(sql_text, adapter_kind)
     return sql_text:sub(start, i - 1)
   end
 
-  local function read_quoted(quote)
+  local function read_quoted(quote, escape_string)
     local close_quote = quote == "[" and "]" or quote
     local value = {}
     i = i + 1
     while i <= len do
       local ch = sql_text:sub(i, i)
-      -- Backslash escapes depend on connection settings. Unresolved quoting
-      -- cannot safely determine which later tokens belong to the query.
-      if ch == "\\" then return nil end
-      if ch == close_quote then
+      if ch == "\\" and quote == "'" then
+        local start = i
+        while sql_text:sub(i, i) == "\\" do i = i + 1 end
+        local odd = (i - start) % 2 == 1
+        if escape_string and odd then
+          if i > len then return nil end
+          i = i + 1
+        elseif odd and sql_text:sub(i, i) == "'"
+            and (adapter_kind == "postgresql" or adapter_kind == "mysql") then
+          -- Session escape settings can change this quote's closing boundary.
+          return nil
+        end
+        value[#value + 1] = sql_text:sub(start, i - 1)
+      elseif ch == close_quote then
         if sql_text:sub(i + 1, i + 1) == close_quote then
           value[#value + 1] = close_quote
           i = i + 2
@@ -199,18 +209,38 @@ local function tokenize_select(sql_text, adapter_kind)
         end
       end
       if depth ~= 0 then return nil end
-    elseif ch == '"' or ch == "`" or ch == "[" or ch == "'" then
+    elseif ch == '"' or ch == "`" or ch == "'"
+        or (ch == "[" and adapter_kind ~= "postgresql" and adapter_kind ~= "duckdb") then
       -- The MySQL/MariaDB adapter enables ANSI_QUOTES before each query,
       -- so double quotes denote identifiers there too.
-      local ident = read_quoted(ch)
+      -- Adjacent string segments retain E-string escapes across newlines.
+      local previous = tokens[#tokens]
+      local escape_string = ch == "'" and previous and previous.escape_string
+      local ident = read_quoted(ch, escape_string)
       if not ident then return nil end
-      tokens[#tokens + 1] = { kind = ch == "'" and "literal" or "ident", text = ident }
+      tokens[#tokens + 1] = {
+        kind = ch == "'" and "literal" or "ident", text = ident, escape_string = escape_string,
+      }
     elseif ch:match(word_start) then
       local word = read_word()
-      tokens[#tokens + 1] = { kind = "ident", text = word, upper = word:upper() }
-    elseif ch == "$" or ch == "#" then
-      -- Dollar-quoted strings and dialect-specific comments are outside the
-      -- supported subset; they can otherwise hide a source or set operation.
+      if word:upper() == "E" and sql_text:sub(i, i) == "'"
+          and (adapter_kind == "postgresql" or adapter_kind == "duckdb") then
+        local value = read_quoted("'", true)
+        if not value then return nil end
+        tokens[#tokens + 1] = { kind = "literal", text = value, escape_string = true }
+      else
+        tokens[#tokens + 1] = { kind = "ident", text = word, upper = word:upper() }
+      end
+    elseif ch == "$" and (adapter_kind == "postgresql" or adapter_kind == "duckdb") then
+      local rest = sql_text:sub(i)
+      local delimiter = rest:match("^%$%$")
+        or rest:match("^%$[%a_\128-\255][%w_\128-\255]*%$")
+      if not delimiter then return nil end
+      local close = sql_text:find(delimiter, i + #delimiter, true)
+      if not close then return nil end
+      tokens[#tokens + 1] = { kind = "literal" }
+      i = close + #delimiter
+    elseif ch == "$" or (ch == "#" and adapter_kind ~= "postgresql" and adapter_kind ~= "duckdb") then
       return nil
     else
       tokens[#tokens + 1] = { kind = ch }
@@ -259,6 +289,7 @@ local function select_editable_table(sql_text, adapter_kind)
     JOIN = true, INNER = true, LEFT = true, RIGHT = true, FULL = true,
     CROSS = true, NATURAL = true, UNION = true, INTERSECT = true, EXCEPT = true,
   }
+  local set_operations = { UNION = true, INTERSECT = true, EXCEPT = true }
   local alias
   local next_token = tokens[pos]
   if next_token and next_token.upper == "AS" then
@@ -282,7 +313,7 @@ local function select_editable_table(sql_text, adapter_kind)
     local token = tokens[idx]
     if token.kind == "(" then depth = depth + 1 end
     if token.kind == ")" then depth = depth - 1 end
-    if depth < 0 or (depth == 0 and blocked[token.upper]) then return nil end
+    if depth < 0 or (depth == 0 and set_operations[token.upper]) then return nil end
     if token.kind == ";" and (depth ~= 0 or idx ~= #tokens) then return nil end
   end
   if depth ~= 0 then return nil end

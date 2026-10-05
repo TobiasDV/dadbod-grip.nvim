@@ -93,6 +93,13 @@ for _, case in ipairs({
   end)
 end
 
+test("continued escape string cannot hide a UNION", function()
+  assert_struct_readonly([[
+SELECT id, status FROM orders WHERE status = E''
+'\' -- ' UNION ALL SELECT id, details.status FROM orders
+]])
+end)
+
 local function assert_base_editable(query_sql, table_name, quoted_table)
   local session = open_query(query_sql)
   eq(session.state.table_name, table_name, "base table")
@@ -120,6 +127,21 @@ for _, case in ipairs({
   { "table-qualified columns", "SELECT orders.id, orders.status FROM orders" },
   { "alias columns with a same-named struct", "SELECT o.id, o.status FROM orders AS o" },
   { "quoted alias columns", 'SELECT "o"."id", "o"."status" FROM orders AS "o"' },
+  { "LEFT function filter", "SELECT id, status FROM orders WHERE left(status, 1) = 'b'" },
+  { "RIGHT function ordering", "SELECT id, status FROM orders ORDER BY right(status, 1)" },
+  {
+    "dollar-quoted filter containing SQL keywords",
+    "SELECT id, status FROM orders "
+      .. "WHERE $$LEFT JOIN UNION FROM orders$$ = 'LEFT JOIN UNION FROM orders'",
+  },
+  {
+    "nested list filter",
+    [=[SELECT id, status FROM orders WHERE [[status]] = [['base']]]=],
+  },
+  {
+    "literal backslash path filter",
+    [[SELECT id, status FROM orders WHERE 'C:\data\orders' = 'C:\data\orders']],
+  },
 }) do
   test(case[1] .. " stays editable", function()
     assert_base_editable(case[2], "orders", '"orders"')
