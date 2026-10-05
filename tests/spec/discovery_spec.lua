@@ -124,14 +124,8 @@ end)
 test("missing dev.localdb.user is skipped", function()
   set_now(3e10)
   discovery._reset_cache()
+  -- Use raw JSON so only the user label is missing from the bad row.
   stub_docker({
-    row("good", "nucleus", "nucleus", "pw", "0.0.0.0:6810"),
-    row("bad-no-user", nil, "nucleus", "pw", "0.0.0.0:6811"),
-  })
-  -- Wait, `row()` builds without user when user param is nil. Patch:
-  -- We want to drop just user, keep name. Use raw json.
-  vim.fn.systemlist = function(_)
-    return {
       vim.json.encode({
         Labels = {
           ["dev.localdb.kind"] = "postgres",
@@ -151,8 +145,7 @@ test("missing dev.localdb.user is skipped", function()
         },
         Ports = "0.0.0.0:6811->5432/tcp",
       }),
-    }
-  end
+  })
   local result = discovery.fetch()
   eq(#result.connections, 1, "only the labeled-correctly row survives")
   eq(result.connections[1].name, "good", "good row")
@@ -282,22 +275,19 @@ end)
 test("malformed JSON line is skipped, valid lines kept", function()
   set_now(12e10)
   discovery._reset_cache()
-  vim.fn.executable = function(_) return 1 end
-  vim.fn.systemlist = function(_)
-    return {
-      "{not valid json",
-      vim.json.encode({
-        Labels = {
-          ["dev.localdb.kind"] = "postgres",
-          ["dev.localdb.name"] = "good",
-          ["dev.localdb.user"] = "u",
-          ["dev.localdb.database"] = "d",
-          ["dev.localdb.password"] = "p",
-        },
-        Ports = "0.0.0.0:6810->5432/tcp",
-      }),
-    }
-  end
+  stub_docker({
+    "{not valid json",
+    vim.json.encode({
+      Labels = {
+        ["dev.localdb.kind"] = "postgres",
+        ["dev.localdb.name"] = "good",
+        ["dev.localdb.user"] = "u",
+        ["dev.localdb.database"] = "d",
+        ["dev.localdb.password"] = "p",
+      },
+      Ports = "0.0.0.0:6810->5432/tcp",
+    }),
+  })
   local result = discovery.fetch()
   eq(#result.connections, 1, "only valid row survives")
   eq(result.connections[1].name, "good", "valid row")
