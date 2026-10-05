@@ -111,41 +111,15 @@ local function deny_if_readonly(cmd_name, url)
   return require("dadbod-grip.connections").deny_if_readonly(cmd_name, url)
 end
 
--- Return true only when a SELECT list contains direct column references.
--- Editing uses result column names as mutation column names, so aliases and
--- expressions must not expose base-table metadata unless column lineage is
--- known. This intentionally accepts a small, dialect-neutral subset:
---   *, alias.*, col, alias.col, schema.table.col
--- with optional DISTINCT/ALL and comma-separated items.
-local function select_projection_is_direct(sql_text, adapter_kind)
+-- Share the token stream between projection and source checks: comments and
+-- quoted identifiers must never supply a different FROM to either check.
+local function tokenize_select(sql_text, adapter_kind)
   local tokens = {}
   local i = 1
   local len = #sql_text
   -- Keep UTF-8 identifier bytes together; punctuation still ends the word.
   local word_start = "[%a_\128-\255]"
   local word_part = "[%w_$\128-\255]"
-  local value_keywords = {
-    CURRENT_DATE = true,
-    CURRENT_TIME = true,
-    CURRENT_TIMESTAMP = true,
-    ["NULL"] = true,
-  }
-  local dialect_values = {
-    postgresql = {
-      "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_CATALOG", "CURRENT_ROLE",
-      "CURRENT_SCHEMA", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER",
-      "TRUE", "FALSE",
-    },
-    mysql = {
-      "CURRENT_USER", "CURRENT_ROLE", "LOCALTIME", "LOCALTIMESTAMP",
-      "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP", "TRUE", "FALSE",
-    },
-    sqlserver = { "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER" },
-  }
-  for _, keyword in ipairs(dialect_values[adapter_kind] or {}) do
-    value_keywords[keyword] = true
-  end
-
   local function skip_space()
     while i <= len and sql_text:sub(i, i):match("%s") do i = i + 1 end
   end
@@ -164,6 +138,9 @@ local function select_projection_is_direct(sql_text, adapter_kind)
     i = i + 1
     while i <= len do
       local ch = sql_text:sub(i, i)
+      -- Backslash escapes depend on connection settings. Unresolved quoting
+      -- cannot safely determine which later tokens belong to the query.
+      if ch == "\\" then return nil end
       if ch == close_quote then
         if sql_text:sub(i + 1, i + 1) == close_quote then
           value[#value + 1] = close_quote
@@ -180,13 +157,9 @@ local function select_projection_is_direct(sql_text, adapter_kind)
     return nil
   end
 
-  skip_space()
-  local first = read_word()
-  if not first or first:upper() ~= "SELECT" then return false end
-
   while i <= len do
     skip_space()
-    if i > len then return false end
+    if i > len then break end
 
     local ch = sql_text:sub(i, i)
     local next_ch = sql_text:sub(i + 1, i + 1)
@@ -196,90 +169,196 @@ local function select_projection_is_direct(sql_text, adapter_kind)
       -- arithmetic, e.g. total--1 AS status, rather than a comment.
       local following = sql_text:sub(i + 2, i + 2)
       if adapter_kind == "mysql" and following ~= ""
-          and not following:match("[%s%c]") then return false end
-      local newline = sql_text:find("\n", i + 2, true)
+          and not following:match("[%s%c]") then return nil end
+      local newline = sql_text:find("[\r\n]", i + 2)
+      -- PostgreSQL and DuckDB also end comments at a bare CR. Other clients
+      -- differ, so accept their shared CRLF form and reject an ambiguous CR.
+      if newline and sql_text:sub(newline, newline) == "\r"
+          and sql_text:sub(newline + 1, newline + 1) ~= "\n"
+          and adapter_kind ~= "postgresql" and adapter_kind ~= "duckdb" then return nil end
       i = newline and (newline + 1) or (len + 1)
     elseif ch == "/" and next_ch == "*" then
       -- MySQL/MariaDB execute SQL inside these comment forms. Skipping them
       -- could hide an alias or expression from the projection check.
       if adapter_kind == "mysql"
           and (sql_text:sub(i + 2, i + 2) == "!"
-            or sql_text:sub(i + 2, i + 3) == "M!") then return false end
-      local close = sql_text:find("*/", i + 2, true)
-      if not close then return false end
-      i = close + 2
-    elseif ch == '"' or ch == "`" or ch == "[" then
+            or sql_text:sub(i + 2, i + 3) == "M!") then return nil end
+      local depth = 1
+      i = i + 2
+      while i <= len and depth > 0 do
+        local pair = sql_text:sub(i, i + 1)
+        if pair == "/*" then
+          if adapter_kind ~= "postgresql" then return nil end
+          depth = depth + 1
+          i = i + 2
+        elseif pair == "*/" then
+          depth = depth - 1
+          i = i + 2
+        else
+          i = i + 1
+        end
+      end
+      if depth ~= 0 then return nil end
+    elseif ch == '"' or ch == "`" or ch == "[" or ch == "'" then
       -- The MySQL/MariaDB adapter enables ANSI_QUOTES before each query,
       -- so double quotes denote identifiers there too.
       local ident = read_quoted(ch)
-      if not ident then return false end
-      tokens[#tokens + 1] = { kind = "ident", text = ident }
+      if not ident then return nil end
+      tokens[#tokens + 1] = { kind = ch == "'" and "literal" or "ident", text = ident }
     elseif ch:match(word_start) then
       local word = read_word()
-      if word:upper() == "FROM" then break end
       tokens[#tokens + 1] = { kind = "ident", text = word, upper = word:upper() }
-    elseif ch == "*" then
-      tokens[#tokens + 1] = { kind = "star" }
-      i = i + 1
-    elseif ch == "." then
-      tokens[#tokens + 1] = { kind = "dot" }
-      i = i + 1
-    elseif ch == "," then
-      tokens[#tokens + 1] = { kind = "comma" }
-      i = i + 1
+    elseif ch == "$" or ch == "#" then
+      -- Dollar-quoted strings and dialect-specific comments are outside the
+      -- supported subset; they can otherwise hide a source or set operation.
+      return nil
     else
-      -- Literals, operators, function calls, casts, and other expressions are
-      -- deliberately not considered editable projections.
-      return false
+      tokens[#tokens + 1] = { kind = ch }
+      i = i + 1
     end
   end
+  return tokens
+end
 
-  if #tokens == 0 then return false end
+-- Expose metadata only for direct columns of one known source. A dotted name
+-- may be a struct field, so its qualifier must match the actual table/alias.
+local function select_editable_table(sql_text, adapter_kind)
+  local tokens = tokenize_select(sql_text, adapter_kind)
+  if not tokens or not tokens[1] or tokens[1].upper ~= "SELECT" then return nil end
 
-  local pos = 1
-  if tokens[pos].kind == "ident"
-      and (tokens[pos].upper == "DISTINCT" or tokens[pos].upper == "ALL") then
+  local from
+  for idx = 2, #tokens do
+    if tokens[idx].upper == "FROM" then
+      from = idx
+      break
+    end
+  end
+  if not from then return nil end
+
+  local pos = from + 1
+  local source = {}
+  while tokens[pos] and tokens[pos].kind == "ident" do
+    local part = tokens[pos]
+    if part.upper == "ONLY" or part.upper == "LATERAL" then return nil end
+    -- Table metadata represents schema separators as dots; a literal dot in
+    -- a quoted name would point mutations at a different qualified table.
+    if part.text == "" or part.text:find(".", 1, true) then return nil end
+    source[#source + 1] = part
+    pos = pos + 1
+    if not tokens[pos] or tokens[pos].kind ~= "." then break end
+    pos = pos + 1
+    if not tokens[pos] or tokens[pos].kind ~= "ident" then return nil end
+  end
+  if #source == 0 then return nil end
+
+  local clauses = {
+    WHERE = true, GROUP = true, HAVING = true, ORDER = true, LIMIT = true,
+    OFFSET = true, FETCH = true, FOR = true, WINDOW = true, QUALIFY = true,
+  }
+  local blocked = {
+    JOIN = true, INNER = true, LEFT = true, RIGHT = true, FULL = true,
+    CROSS = true, NATURAL = true, UNION = true, INTERSECT = true, EXCEPT = true,
+  }
+  local alias
+  local next_token = tokens[pos]
+  if next_token and next_token.upper == "AS" then
+    pos = pos + 1
+    next_token = tokens[pos]
+    if not next_token or next_token.kind ~= "ident" then return nil end
+    alias = next_token
+    pos = pos + 1
+  elseif next_token and next_token.kind == "ident"
+      and not clauses[next_token.upper] and not blocked[next_token.upper] then
+    alias = next_token
     pos = pos + 1
   end
-  if pos > #tokens then return false end
+  next_token = tokens[pos]
+  if next_token and next_token.kind ~= ";" and not clauses[next_token.upper] then return nil end
 
+  -- Tail expressions do not change column lineage, but a top-level set
+  -- operation can append rows from an unrelated source under the same names.
+  local depth = 0
+  for idx = pos, #tokens do
+    local token = tokens[idx]
+    if token.kind == "(" then depth = depth + 1 end
+    if token.kind == ")" then depth = depth - 1 end
+    if depth < 0 or (depth == 0 and blocked[token.upper]) then return nil end
+    if token.kind == ";" and (depth ~= 0 or idx ~= #tokens) then return nil end
+  end
+  if depth ~= 0 then return nil end
+
+  local function normalized(token)
+    if adapter_kind == "postgresql" then
+      return token.upper and token.text:lower() or token.text
+    end
+    return token.text:lower()
+  end
+
+  local value_keywords = {
+    CURRENT_DATE = true, CURRENT_TIME = true, CURRENT_TIMESTAMP = true,
+    ["NULL"] = true,
+  }
+  local dialect_values = {
+    postgresql = {
+      "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_CATALOG", "CURRENT_ROLE",
+      "CURRENT_SCHEMA", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER",
+      "TRUE", "FALSE",
+    },
+    mysql = {
+      "CURRENT_USER", "CURRENT_ROLE", "LOCALTIME", "LOCALTIMESTAMP",
+      "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP", "TRUE", "FALSE",
+    },
+    sqlserver = { "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER" },
+  }
+  for _, keyword in ipairs(dialect_values[adapter_kind] or {}) do
+    value_keywords[keyword] = true
+  end
+
+  pos = 2
+  if tokens[pos] and (tokens[pos].upper == "DISTINCT" or tokens[pos].upper == "ALL") then
+    pos = pos + 1
+  end
   local function consume_item()
-    local token = tokens[pos]
-    if not token then return false end
-
-    if token.kind == "star" then
+    local parts = {}
+    while pos < from do
+      local token = tokens[pos]
+      if token.kind ~= "ident" and token.kind ~= "*" then return false end
+      parts[#parts + 1] = token
       pos = pos + 1
-      return true
+      if tokens[pos].kind ~= "." then break end
+      if token.kind == "*" then return false end
+      pos = pos + 1
+      if pos >= from then return false end
     end
-
-    if token.kind ~= "ident" then return false end
-    pos = pos + 1
-
-    -- Bare SQL value expressions must not be treated as column references.
-    -- Quoted names have no `upper`; qualified names are column references.
-    if value_keywords[token.upper]
-        and (not tokens[pos] or tokens[pos].kind ~= "dot") then
-      return false
+    if #parts == 0 then return false end
+    if #parts == 1 then
+      return not value_keywords[parts[1].upper]
     end
-
-    while tokens[pos] and tokens[pos].kind == "dot" do
-      pos = pos + 1
-      local part = tokens[pos]
-      if not part or (part.kind ~= "ident" and part.kind ~= "star") then return false end
-      pos = pos + 1
-      if part.kind == "star" and tokens[pos] and tokens[pos].kind == "dot" then return false end
+    local qualifiers = #parts - 1
+    if alias then
+      return qualifiers == 1 and normalized(parts[1]) == normalized(alias)
+    end
+    if qualifiers == 1 then
+      return normalized(parts[1]) == normalized(source[#source])
+    end
+    if qualifiers ~= #source then return false end
+    for idx = 1, qualifiers do
+      if normalized(parts[idx]) ~= normalized(source[idx]) then return false end
     end
     return true
   end
 
-  if not consume_item() then return false end
-  while pos <= #tokens do
-    if tokens[pos].kind ~= "comma" then return false end
+  if not consume_item() then return nil end
+  while pos < from do
+    if tokens[pos].kind ~= "," then return nil end
     pos = pos + 1
-    if not consume_item() then return false end
+    if not consume_item() then return nil end
   end
-
-  return true
+  local names = {}
+  for _, part in ipairs(source) do
+    names[#names + 1] = adapter_kind == "postgresql" and normalized(part) or part.text
+  end
+  return table.concat(names, ".")
 end
 
 -- Decide the query spec for a given :Grip argument.
@@ -323,35 +402,7 @@ local function resolve_query(arg, page_size, adapter_kind)
         or flat:match("^%s*[Tt][Aa][Bb][Ll][Ee]%s+([%w_%.]+)")
       if raw then table_name = sql.unquote_ident(raw) end
     else
-      -- SELECT: extract from FROM clause for simple single-table queries.
-      -- Only expose table metadata when projected columns map directly back to
-      -- base-table columns; mutation generation uses result column names.
-      local projection_is_direct = select_projection_is_direct(arg, adapter_kind)
-      local after_from = flat:match("[Ff][Rr][Oo][Mm]%s+(.*)")
-      if projection_is_direct and after_from and not after_from:match("^%s*%(") then
-        -- Match full token including quotes (handles "schema"."table" compound)
-        local full_token = after_from:match('^"[^"]+"%.%s*"[^"]+"')
-          or after_from:match('^`[^`]+`%.%s*`[^`]+`')
-          or after_from:match('^"[^"]+"')
-          or after_from:match("^`[^`]+`")
-          or after_from:match("^[%w_%.]+")
-        if full_token then
-          -- Extract the FROM clause up to WHERE/ORDER/GROUP/HAVING/LIMIT/; to check for joins
-          local remainder = after_from:sub(#full_token + 1):upper()
-          local from_clause = remainder:match("^(.-)%f[%u]WHERE%f[^%u]")
-            or remainder:match("^(.-)%f[%u]ORDER%f[^%u]")
-            or remainder:match("^(.-)%f[%u]GROUP%f[^%u]")
-            or remainder:match("^(.-)%f[%u]HAVING%f[^%u]")
-            or remainder:match("^(.-)%f[%u]LIMIT%f[^%u]")
-            or remainder:match("^(.-)%s*;")
-            or remainder
-          local has_join = from_clause:match("%f[%u]JOIN%f[^%u]")
-          local has_comma = from_clause:match(",")
-          if not has_join and not has_comma then
-            table_name = sql.unquote_ident(full_token)
-          end
-        end
-      end
+      table_name = select_editable_table(arg, adapter_kind)
     end
     return query.new_raw(arg, page_size), table_name
   end

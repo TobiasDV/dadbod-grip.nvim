@@ -788,6 +788,10 @@ when the normal primary-key requirements are met. This includes unquoted
 Unicode column names and quoted or qualified columns named CURRENT_TIMESTAMP.
 MySQL/MariaDB support backtick and double-quoted identifiers because the
 adapter enables ANSI_QUOTES; executable comments in projections stay read-only.
+PostgreSQL nested comments are skipped when checking columns and locating the
+source table. Qualified columns and wildcards must match that table or its
+alias. Struct projections such as DuckDB's details.* and details.status stay
+read-only because their output names do not identify base-table columns.
 
 Full-buffer cell editor ~
                                                         *grip-cell-buffer*

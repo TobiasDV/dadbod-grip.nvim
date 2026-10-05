@@ -265,6 +265,145 @@ function()
   end
 end)
 
+test("resolve_query: PostgreSQL nested comments cannot hide an alias", function()
+  local _, tbl = grip._resolve_query(
+    "SELECT id, total /* outer /* inner */ FROM orders */ AS status FROM orders;",
+    50, "postgresql")
+  eq(tbl, nil, "the actual projection aliases total as status")
+end)
+
+test("resolve_query: PostgreSQL nested comments keep direct columns editable", function()
+  local _, tbl = grip._resolve_query(
+    "SELECT id, total /* outer /* inner /* deeper */ */ FROM decoy */ FROM orders",
+    50, "postgresql")
+  eq(tbl, "orders", "the full nested comment must be skipped")
+end)
+
+test("resolve_query: malformed or dialect-ambiguous nested comments stay read-only", function()
+  for _, kind in ipairs({ "postgresql", "mysql", "sqlite", "duckdb" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT id, total /* outer /* inner */ FROM orders", 50, kind)
+    eq(tbl, nil, kind)
+  end
+end)
+
+test("resolve_query: source extraction ignores FROM inside comments and identifiers", function()
+  for _, statement in ipairs({
+    "SELECT id /* FROM decoy */ FROM orders",
+    "SELECT id -- FROM decoy\nFROM orders",
+    "SELECT id -- FROM decoy\rFROM orders",
+    'SELECT "FROM decoy" FROM orders',
+    "SELECT id FROM /* FROM decoy */ orders",
+    "SELECT o.id FROM orders /* FROM decoy */ AS o",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, "orders", statement)
+  end
+end)
+
+test("resolve_query: comment text cannot hide additional sources", function()
+  for _, statement in ipairs({
+    "SELECT * FROM orders /* WHERE hidden */ JOIN other ON orders.id = other.id",
+    "SELECT * FROM orders /* LIMIT hidden */, other",
+    "SELECT * FROM orders AS o(id, status)",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, nil, statement)
+  end
+end)
+
+test("resolve_query: line comments respect dialect line endings", function()
+  for _, kind in ipairs({ "postgresql", "duckdb", "mysql", "sqlite" }) do
+    local _, tbl = grip._resolve_query("SELECT id -- comment\r\nFROM orders", 50, kind)
+    eq(tbl, "orders", kind .. " CRLF")
+    _, tbl = grip._resolve_query("SELECT id -- comment\rFROM orders", 50, kind)
+    local expected = (kind == "postgresql" or kind == "duckdb") and "orders" or nil
+    eq(tbl, expected, kind .. " bare CR")
+    _, tbl = grip._resolve_query(
+      "SELECT * FROM orders -- comment\rUNION ALL SELECT * FROM other", 50, kind)
+    eq(tbl, nil, kind .. " hidden set operation")
+  end
+end)
+
+test("resolve_query: DuckDB struct projections stay read-only", function()
+  for _, statement in ipairs({
+    "SELECT id, details.* FROM orders",
+    "SELECT id, details.status FROM orders",
+    "SELECT id, orders.details.status FROM orders",
+    "SELECT id, o.details.status FROM orders AS o",
+    'SELECT id, "details"."status" FROM orders',
+    "SELECT id, orders.status FROM orders AS o",
+    "SELECT id, orders.* FROM orders AS o",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+    eq(tbl, nil, statement)
+  end
+end)
+
+test("resolve_query: actual table and alias qualifiers stay editable", function()
+  for _, statement in ipairs({
+    "SELECT orders.* FROM orders",
+    "SELECT orders.id, orders.status FROM orders",
+    "SELECT o.* FROM orders AS o",
+    "SELECT o.id, o.status FROM orders o",
+    'SELECT "o".* FROM "orders" AS "o"',
+    "SELECT O.status FROM orders AS o",
+    "SELECT DISTINCT o.id, o.status FROM orders AS o",
+    "SELECT ALL orders.* FROM orders",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+    eq(tbl, "orders", statement)
+  end
+end)
+
+test("resolve_query: schema qualifiers must match the complete actual source", function()
+  for _, projection in ipairs({ "orders.*", "public.orders.*", "public.orders.status" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT " .. projection .. " FROM public.orders", 50, "postgresql")
+    eq(tbl, "public.orders", projection)
+  end
+  for _, projection in ipairs({ "other.orders.*", "orders.details.status", "public.status" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT " .. projection .. " FROM public.orders", 50, "postgresql")
+    eq(tbl, nil, projection)
+  end
+end)
+
+test("resolve_query: PostgreSQL qualifier matching preserves quoted case", function()
+  local _, tbl = grip._resolve_query('SELECT "O".* FROM orders AS "O"', 50, "postgresql")
+  eq(tbl, "orders")
+  _, tbl = grip._resolve_query('SELECT o.* FROM orders AS "O"', 50, "postgresql")
+  eq(tbl, nil, "an unquoted lowercase qualifier does not name the quoted alias")
+  _, tbl = grip._resolve_query("SELECT Orders.* FROM Orders", 50, "postgresql")
+  eq(tbl, "orders", "unquoted PostgreSQL table names fold to lowercase")
+end)
+
+test("resolve_query: unsupported source and projection shapes stay read-only", function()
+  for _, statement in ipairs({
+    'SELECT * FROM "public.orders"',
+    "SELECT * FROM ONLY orders",
+    "SELECT id, total. FROM orders",
+    "SELECT id, total FROM orders UNION ALL SELECT id, status FROM other",
+    "SELECT * FROM orders WHERE id > 0 UNION ALL SELECT * FROM other",
+    "SELECT * FROM orders -- comment\rUNION ALL SELECT * FROM other",
+    "SELECT * FROM orders; SELECT * FROM other",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, nil, statement)
+  end
+end)
+
+test("resolve_query: ordinary tail expressions preserve single-source metadata", function()
+  for _, statement in ipairs({
+    "SELECT * FROM orders WHERE status = 'FROM other UNION SELECT'",
+    "SELECT * FROM orders WHERE id IN (SELECT id FROM other) ORDER BY id LIMIT 10;",
+    "SELECT * FROM orders WHERE status = 'it''s a value'",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, "orders", statement)
+  end
+end)
+
 test("resolve_query: aliased projected column does not expose editable table", function()
   local spec, tbl = grip._resolve_query("SELECT id, total AS status FROM orders", 50)
   assert(spec, "spec should not be nil")

@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare SQL value expressions such as `CURRENT_TIMESTAMP` that can target an
   unrelated same-named column (#77). Preserve direct Unicode column references
   and MySQL/MariaDB quoted identifiers, and reject executable projection
-  comments in those dialects.
+  comments in those dialects. Resolve projections and their actual source
+  from the same token stream, including PostgreSQL nested comments. Only
+  allow qualified projections that match the source table or alias, keeping
+  DuckDB struct expansion and struct-field access read-only.
 
 ## [3.11.0] - 2026-08-31
 
