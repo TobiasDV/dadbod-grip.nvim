@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fields named `union`, `intersect`, or `except` in filters and ordering.
   Keep numeric literals intact so digit separators cannot hide real set
   operations from the editability check.
+- Avoid copying the remaining SQL for each dollar-quoted string while
+  checking query editability, avoiding quadratic copying for large lists.
 
 ## [3.11.0] - 2026-08-31
 

@@ -258,9 +258,8 @@ local function tokenize_select(sql_text, adapter_kind)
         tokens[#tokens + 1] = { kind = "ident", text = word, upper = word:upper() }
       end
     elseif ch == "$" and (adapter_kind == "postgresql" or adapter_kind == "duckdb") then
-      local rest = sql_text:sub(i)
-      local delimiter = rest:match("^%$%$")
-        or rest:match("^%$[%a_\128-\255][%w_\128-\255]*%$")
+      local delimiter = sql_text:match("^%$%$", i)
+        or sql_text:match("^%$[%a_\128-\255][%w_\128-\255]*%$", i)
       if not delimiter then return nil end
       local close = sql_text:find(delimiter, i + #delimiter, true)
       if not close then return nil end

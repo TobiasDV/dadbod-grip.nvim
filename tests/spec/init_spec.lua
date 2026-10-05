@@ -515,6 +515,25 @@ test("resolve_query: dollar-quoted filters use exact delimiter boundaries", func
   end
 end)
 
+test("resolve_query: dollar delimiters do not copy the remaining SQL", function()
+  local literals = {}
+  for idx = 1, 1000 do literals[idx] = "$tag$value" .. idx .. "$tag$" end
+  local statement = "SELECT id FROM orders WHERE status IN (" .. table.concat(literals, ",") .. ")"
+  local original_sub, suffix_copies = string.sub, 0
+  -- luacheck: push ignore 122
+  string.sub = function(value, first, last)
+    if value == statement and last == nil then suffix_copies = suffix_copies + 1 end
+    return original_sub(value, first, last)
+  end
+  local ok, spec, tbl = pcall(grip._resolve_query, statement, 50, "postgresql")
+  string.sub = original_sub
+  -- luacheck: pop
+  assert(ok, spec)
+  eq(spec.base_sql, statement, "query text remains unchanged")
+  eq(tbl, "orders", "large literal list retains its source")
+  eq(suffix_copies, 0, "dollar delimiter matching must not copy SQL suffixes")
+end)
+
 test("resolve_query: PostgreSQL JSON operators are allowed only in tail expressions", function()
   local _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE details #>> '{status}' = 'base']], 50, "postgresql")
   eq(tbl, "orders")
