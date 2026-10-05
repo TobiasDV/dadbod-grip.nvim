@@ -45,9 +45,20 @@ local ok, err = xpcall(function()
   assert(vim.wait(3000, function() return vim.fn.filereadable(ready_file) == 1 end, 1),
     "fake DuckDB did not reach its process-inspection barrier")
   local pid = assert(vim.fn.readfile(pid_file)[1], "fake DuckDB did not record its pid")
-  local cmdline_file = assert(io.open("/proc/" .. pid .. "/cmdline", "rb"))
-  local cmdline = cmdline_file:read("*a")
-  cmdline_file:close()
+  -- /proc/<pid>/cmdline only exists on Linux. macOS (and other BSDs) have no
+  -- /proc; read the full, untruncated argv via `ps -ww -o command=` instead.
+  local cmdline
+  local proc_path = "/proc/" .. pid .. "/cmdline"
+  if vim.fn.filereadable(proc_path) == 1 then
+    local cmdline_file = assert(io.open(proc_path, "rb"))
+    cmdline = cmdline_file:read("*a")
+    cmdline_file:close()
+  else
+    local ps = assert(io.popen("ps -ww -o command= -p " .. pid, "r"), "could not run ps")
+    cmdline = ps:read("*a")
+    ps:close()
+    assert(cmdline and cmdline ~= "", "ps returned no output for pid " .. pid)
+  end
 
   for _, forbidden in ipairs({
     "SELECT", "ATTACH", "CREATE SECRET", "postgres:", "db.internal",
