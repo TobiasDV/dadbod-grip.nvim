@@ -200,6 +200,41 @@ test("a trailing decimal point cannot hide a set operation", function()
   end
 end)
 
+test("an underscored decimal cannot expose UNION struct rows for editing", function()
+  local session = open_query([[
+SELECT id, status FROM orders WHERE id = 0_1.
+UNION ALL SELECT id, details.status FROM orders;
+]])
+  eq(table.concat(session.state.columns, ","), "id,status", "projected column names")
+  eq(#session.state.rows, 2, "both base and struct rows are displayed")
+  local values = {}
+  for _, row in ipairs(session.state.rows) do
+    eq(row[1], "1", "both rows have the same displayed primary key")
+    values[#values + 1] = row[2]
+  end
+  table.sort(values)
+  eq(table.concat(values, ","), "base,nested", "values come from distinct columns")
+  eq(#session.state.pks, 0, "mixed projections must not expose editable primary keys")
+  assert_grid_readonly(session)
+end)
+
+test("numeric literal filters preserve direct-column editing", function()
+  for _, literal in ipairs({ "0_1.", "1.0_0", "1e0_0", ".1e1", "1.e+0", "1e-0" }) do
+    assert_base_editable(
+      "SELECT id, status FROM orders WHERE id = " .. literal, "orders", '"orders"')
+  end
+end)
+
+test("set operations after underscored decimals stay read-only", function()
+  for _, operation in ipairs({ "UNION", "INTERSECT", "EXCEPT" }) do
+    local session = open_query("SELECT id, status FROM orders WHERE id = 0_1. "
+      .. operation .. " SELECT id, status FROM orders WHERE id = "
+      .. (operation == "EXCEPT" and "2" or "1"))
+    eq(session.state.rows[1][2], "base", "set operation returns the fixture row")
+    assert_grid_readonly(session)
+  end
+end)
+
 cleanup()
 
 print(string.format("duckdb_projection_edit_safety_spec: %d passed, %d failed", pass, fail))

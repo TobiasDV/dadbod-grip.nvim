@@ -132,6 +132,29 @@ local function tokenize_select(sql_text, adapter_kind)
     return sql_text:sub(start, i - 1)
   end
 
+  local function read_number()
+    local prefix = sql_text:sub(i, i + 1):lower()
+    local radix_pattern = prefix == "0x" and "^0[xX]_?[%da-fA-F][%da-fA-F_]*"
+      or prefix == "0b" and "^0[bB]_?[01][01_]*"
+      or prefix == "0o" and "^0[oO]_?[0-7][0-7_]*"
+    local _, finish
+    if radix_pattern then
+      _, finish = sql_text:find(radix_pattern, i)
+      if not finish then return false end
+    else
+      _, finish = sql_text:find("^%d[%d_]*", i)
+      finish = finish or (i - 1)
+      if sql_text:sub(finish + 1, finish + 1) == "." then
+        _, finish = sql_text:find("^%.[%d_]*", finish + 1)
+      end
+      local _, exponent_end = sql_text:find("^[eE][+-]?%d[%d_]*", finish + 1)
+      finish = exponent_end or finish
+    end
+    i = finish + 1
+    -- Numeric suffixes must not become identifiers in qualification checks.
+    return not sql_text:sub(i, i):match(word_start)
+  end
+
   local function read_quoted(quote, escape_string)
     local close_quote = quote == "[" and "]" or quote
     local value = {}
@@ -221,6 +244,9 @@ local function tokenize_select(sql_text, adapter_kind)
       tokens[#tokens + 1] = {
         kind = ch == "'" and "literal" or "ident", text = ident, escape_string = escape_string,
       }
+    elseif ch:match("%d") or (ch == "." and next_ch:match("%d")) then
+      if not read_number() then return nil end
+      tokens[#tokens + 1] = { kind = "literal" }
     elseif ch:match(word_start) then
       local word = read_word()
       if word:upper() == "E" and sql_text:sub(i, i) == "'"

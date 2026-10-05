@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with ordinary filters and ordering, including `LEFT()`/`RIGHT()`, supported
   string literals, PostgreSQL JSON operators, DuckDB lists, and qualified
   fields named `union`, `intersect`, or `except` in filters and ordering.
+  Keep numeric literals intact so digit separators cannot hide real set
+  operations from the editability check.
 
 ## [3.11.0] - 2026-08-31
 

@@ -434,12 +434,37 @@ test("resolve_query: qualified fields and decimal points cannot hide set operati
       "WHERE orders.union = 'base' ",
       "WHERE id = 1. ",
       "WHERE id = 1./* comment */",
+      "WHERE id = 0_1. ",
+      "WHERE id = 0_1.",
+      "WHERE id = 0_1./* comment */",
+      "WHERE id = .0_1e2 ",
+      "WHERE id = 0_1.e0 ",
+      "WHERE id = 1e0",
     }) do
       local statement = "SELECT id, status FROM orders " .. tail
         .. operation .. " SELECT id, status FROM other"
       local _, tbl = grip._resolve_query(statement, 50, "duckdb")
       eq(tbl, nil, statement)
     end
+  end
+end)
+
+test("resolve_query: numeric literals in filters preserve editing", function()
+  for _, literal in ipairs({ "0_1.", "1.0_0", "1e0_0", ".1e1", "1.e+0", "1e-0", "0x_1", "0b_1", "0o_1" }) do
+    local _, tbl = grip._resolve_query("SELECT id FROM orders WHERE id = " .. literal, 50, "postgresql")
+    eq(tbl, "orders", literal)
+    _, tbl = grip._resolve_query("SELECT id, " .. literal .. " FROM orders", 50, "postgresql")
+    eq(tbl, nil, "numeric projection " .. literal)
+  end
+  local _, tbl = grip._resolve_query(
+    "SELECT id, status FROM orders AS _1 WHERE _1.union = 'base'", 50, "duckdb")
+  eq(tbl, "orders", "underscore-prefixed aliases are still identifiers")
+end)
+
+test("resolve_query: ambiguous numeric suffixes stay read-only", function()
+  for _, literal in ipairs({ "0x", "0b_", "0o8", "1e_1", "1e+", "1e-", "1f", "0x1g" }) do
+    local _, tbl = grip._resolve_query("SELECT id FROM orders WHERE id = " .. literal, 50, "postgresql")
+    eq(tbl, nil, literal)
   end
 end)
 

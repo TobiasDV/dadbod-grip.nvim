@@ -162,6 +162,19 @@ local ok, err = pcall(function()
       ORDER BY id
     ]])
   end)
+
+  test("numeric literals preserve editing without hiding set operations", function()
+    for _, literal in ipairs({ "0_1.", ".1e1", "1e0_0", "1.e+0", "0x_1", "0b_1", "0o_1" }) do
+      assert_tail_editable("WHERE id = " .. literal)
+    end
+    local session = open_query("SELECT id, status FROM " .. table_name
+      .. " WHERE id = 0_1. UNION ALL SELECT id, total FROM " .. table_name)
+    eq(#session.state.rows, 2, "both base and differently sourced rows are displayed")
+    eq(session.state.table_name, nil, "set operation has no mutation table")
+    eq(#session.state.pks, 0, "set operation has no editable primary keys")
+    eq(session.state.readonly, true, "set operation must stay read-only")
+    eq(view._is_editable(session), false, "grid edits must stay disabled")
+  end)
 end)
 
 cleanup_grids()
