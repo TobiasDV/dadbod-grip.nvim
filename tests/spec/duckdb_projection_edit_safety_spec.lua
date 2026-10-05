@@ -37,10 +37,15 @@ CREATE TABLE orders (
   details STRUCT(status VARCHAR),
   status VARCHAR,
   orders STRUCT(status VARCHAR),
-  o STRUCT(status VARCHAR)
+  o STRUCT(status VARCHAR),
+  "union" VARCHAR,
+  "intersect" VARCHAR,
+  "except" VARCHAR,
+  keyword_fields STRUCT("union" VARCHAR, "intersect" VARCHAR, "except" VARCHAR)
 );
 INSERT INTO orders VALUES (
-  1, {'status': 'nested'}, 'base', {'status': 'nested'}, {'status': 'nested'}
+  1, {'status': 'nested'}, 'base', {'status': 'nested'}, {'status': 'nested'},
+  'base', 'base', 'base', {'union': 'nested', 'intersect': 'nested', 'except': 'nested'}
 );
 ]])
 if vim.v.shell_error ~= 0 then
@@ -71,13 +76,17 @@ local function open_query(query_sql)
   return session
 end
 
+local function assert_grid_readonly(session)
+  eq(session.state.readonly, true, "result must be read-only")
+  eq(session.state.table_name, nil, "result must not expose a mutation table")
+  eq(view._is_editable(session), false, "grid edit actions must stay disabled")
+end
+
 local function assert_struct_readonly(query_sql)
   local session = open_query(query_sql)
   eq(table.concat(session.state.columns, ","), "id,status", "projected column names")
   eq(session.state.rows[1][2], "nested", "displayed value comes from the struct")
-  eq(session.state.readonly, true, "struct projection must be read-only")
-  eq(session.state.table_name, nil, "struct projection must not expose a mutation table")
-  eq(view._is_editable(session), false, "grid edit actions must stay disabled")
+  assert_grid_readonly(session)
 end
 
 for _, case in ipairs({
@@ -152,6 +161,43 @@ test("schema-qualified columns stay editable", function()
   assert_base_editable(
     "SELECT main.orders.id, main.orders.status FROM main.orders",
     "main.orders", '"main"."orders"')
+end)
+
+for _, qualifier in ipairs({ "orders", "keyword_fields" }) do
+  test(qualifier .. " keyword-named fields preserve direct-column editing", function()
+    local value = qualifier == "orders" and "base" or "nested"
+    for _, keyword in ipairs({ "union", "intersect", "except" }) do
+      local field = qualifier .. "." .. keyword
+      for _, tail in ipairs({ "WHERE " .. field .. " = '" .. value .. "'", "ORDER BY " .. field }) do
+        assert_base_editable("SELECT id, status FROM orders " .. tail, "orders", '"orders"')
+      end
+    end
+  end)
+end
+
+test("set operations after qualified keyword filters stay read-only", function()
+  for _, operation in ipairs({ "UNION", "INTERSECT", "EXCEPT" }) do
+    for _, qualifier in ipairs({ "orders", "keyword_fields" }) do
+      local value = qualifier == "orders" and "base" or "nested"
+      local session = open_query("SELECT id, status FROM orders WHERE "
+        .. qualifier .. "." .. operation:lower() .. " = '" .. value .. "' "
+        .. operation .. " SELECT id, status FROM orders WHERE id = "
+        .. (operation == "EXCEPT" and "2" or "1"))
+      eq(table.concat(session.state.columns, ","), "id,status", "direct output columns")
+      eq(session.state.rows[1][2], "base", "set operation returns the fixture row")
+      assert_grid_readonly(session)
+    end
+  end
+end)
+
+test("a trailing decimal point cannot hide a set operation", function()
+  for _, operation in ipairs({ "UNION", "INTERSECT", "EXCEPT" }) do
+    local session = open_query("SELECT id, status FROM orders WHERE id = 1. "
+      .. operation .. " SELECT id, status FROM orders WHERE id = "
+      .. (operation == "EXCEPT" and "2" or "1"))
+    eq(session.state.rows[1][2], "base", "set operation returns the fixture row")
+    assert_grid_readonly(session)
+  end
 end)
 
 cleanup()

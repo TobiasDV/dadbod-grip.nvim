@@ -313,7 +313,10 @@ local function select_editable_table(sql_text, adapter_kind)
     local token = tokens[idx]
     if token.kind == "(" then depth = depth + 1 end
     if token.kind == ")" then depth = depth - 1 end
-    if depth < 0 or (depth == 0 and set_operations[token.upper]) then return nil end
+    -- Require an identifier before the dot: 1. UNION is still a set operation.
+    local qualified = idx >= 3 and tokens[idx - 1].kind == "."
+      and tokens[idx - 2].kind == "ident"
+    if depth < 0 or (depth == 0 and not qualified and set_operations[token.upper]) then return nil end
     if token.kind == ";" and (depth ~= 0 or idx ~= #tokens) then return nil end
   end
   if depth ~= 0 then return nil end

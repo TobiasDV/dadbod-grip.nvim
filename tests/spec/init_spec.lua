@@ -414,6 +414,35 @@ test("resolve_query: LEFT and RIGHT tail functions are not joins", function()
   end
 end)
 
+test("resolve_query: qualified keyword fields in the tail preserve editing", function()
+  for _, keyword in ipairs({ "union", "intersect", "except" }) do
+    for _, tail in ipairs({
+      "WHERE o." .. keyword .. " = 'base'",
+      "WHERE details." .. keyword .. " = 3",
+      "WHERE o./* comment */" .. keyword .. " = 'base'",
+      "ORDER BY o." .. keyword,
+    }) do
+      local _, tbl = grip._resolve_query("SELECT id, status FROM orders o " .. tail, 50, "duckdb")
+      eq(tbl, "orders", tail)
+    end
+  end
+end)
+
+test("resolve_query: qualified fields and decimal points cannot hide set operations", function()
+  for _, operation in ipairs({ "UNION", "INTERSECT", "EXCEPT" }) do
+    for _, tail in ipairs({
+      "WHERE orders.union = 'base' ",
+      "WHERE id = 1. ",
+      "WHERE id = 1./* comment */",
+    }) do
+      local statement = "SELECT id, status FROM orders " .. tail
+        .. operation .. " SELECT id, status FROM other"
+      local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+      eq(tbl, nil, statement)
+    end
+  end
+end)
+
 test("resolve_query: plain backslash filters preserve direct-column editing", function()
   for _, kind in ipairs({ "postgresql", "duckdb", "mysql", "sqlite" }) do
     local _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\orders']], 50, kind)

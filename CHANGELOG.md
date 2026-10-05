@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allow qualified projections that match the source table or alias, keeping
   DuckDB struct expansion and struct-field access read-only. Preserve editing
   with ordinary filters and ordering, including `LEFT()`/`RIGHT()`, supported
-  string literals, PostgreSQL JSON operators, and DuckDB lists.
+  string literals, PostgreSQL JSON operators, DuckDB lists, and qualified
+  fields named `union`, `intersect`, or `except` in filters and ordering.
 
 ## [3.11.0] - 2026-08-31
 
