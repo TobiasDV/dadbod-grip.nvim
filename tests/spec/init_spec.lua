@@ -167,6 +167,402 @@ test("resolve_query: SELECT with WHERE clause still extracts table", function()
   eq(tbl, "orders", "should extract table when WHERE clause follows")
 end)
 
+test("resolve_query: direct projected columns keep editable table metadata", function()
+  local spec, tbl = grip._resolve_query("SELECT id, total FROM orders", 50)
+  assert(spec, "spec should not be nil")
+  eq(tbl, "orders")
+end)
+
+test("resolve_query: qualified direct projected columns keep editable table metadata", function()
+  local spec, tbl = grip._resolve_query("SELECT o.id, o.total FROM orders o", 50)
+  assert(spec, "spec should not be nil")
+  eq(tbl, "orders")
+end)
+
+test("resolve_query: MySQL backtick projected columns keep editable table metadata", function()
+  local spec, tbl = grip._resolve_query("SELECT `id`, `total` FROM `orders`", 50, "mysql")
+  assert(spec, "spec should not be nil")
+  eq(tbl, "orders")
+end)
+
+test("resolve_query: MySQL ANSI_QUOTES columns stay editable", function()
+  local spec, tbl = grip._resolve_query('SELECT "id", "total" FROM orders', 50, "mysql")
+  assert(spec, "spec should not be nil")
+  eq(tbl, "orders", "the adapter enables ANSI_QUOTES before each query")
+end)
+
+test("resolve_query: Unicode direct columns stay editable", function()
+  for _, projection in ipairs({ "姓名", '"姓名"', "o.姓名", "name姓名2" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT id, " .. projection .. " FROM orders o", 50, "sqlite")
+    eq(tbl, "orders", projection)
+  end
+end)
+
+test("resolve_query: bare value keywords stay read-only", function()
+  local cases = {
+    sqlite = { "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "NULL" },
+    postgresql = {
+      "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_CATALOG", "CURRENT_ROLE",
+      "CURRENT_SCHEMA", "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER",
+      "TRUE", "FALSE",
+    },
+    mysql = {
+      "CURRENT_USER", "CURRENT_ROLE", "LOCALTIME", "LOCALTIMESTAMP",
+      "UTC_DATE", "UTC_TIME", "UTC_TIMESTAMP", "TRUE", "FALSE",
+    },
+    sqlserver = { "CURRENT_USER", "SESSION_USER", "SYSTEM_USER", "USER" },
+  }
+  for kind, keywords in pairs(cases) do
+    for _, keyword in ipairs(keywords) do
+      local _, tbl = grip._resolve_query(
+        "SELECT id, " .. keyword:lower() .. " FROM orders", 50, kind)
+      eq(tbl, nil, kind .. ": " .. keyword)
+    end
+  end
+end)
+
+test("resolve_query: quoted or qualified keyword columns stay editable",
+function()
+  for _, projection in ipairs({
+    '"CURRENT_TIMESTAMP"', "`CURRENT_DATE`", "[CURRENT_TIME]",
+    "o.CURRENT_TIMESTAMP", "o.CURRENT_DATE", "o.CURRENT_TIME",
+    "user", "true", "false",
+  }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT id, " .. projection .. " FROM orders o", 50, "sqlite")
+    eq(tbl, "orders", projection)
+  end
+end)
+
+test("resolve_query: MySQL executable comments stay read-only", function()
+  for _, comment in ipairs({
+    "/*! AS status */", "/*!80000 AS status */", "/*M! AS status */",
+    "/*M!100100 AS status */",
+  }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT id, total " .. comment .. " FROM orders", 50, "mysql")
+    eq(tbl, nil, comment)
+  end
+end)
+
+test("resolve_query: MySQL double minus arithmetic stays read-only",
+function()
+  local _, tbl = grip._resolve_query(
+    "SELECT id, total--1 AS status\nFROM orders", 50, "mysql")
+  eq(tbl, nil, "-- without following whitespace is not a MySQL comment")
+end)
+
+test("resolve_query: ordinary projection comments remain supported",
+function()
+  for _, projection in ipairs({
+    "id, total /* ordinary comment */",
+    "id, total -- ordinary comment\n",
+  }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT " .. projection .. " FROM orders", 50, "mysql")
+    eq(tbl, "orders", projection)
+  end
+end)
+
+test("resolve_query: PostgreSQL nested comments cannot hide an alias", function()
+  local _, tbl = grip._resolve_query(
+    "SELECT id, total /* outer /* inner */ FROM orders */ AS status FROM orders;",
+    50, "postgresql")
+  eq(tbl, nil, "the actual projection aliases total as status")
+end)
+
+test("resolve_query: PostgreSQL nested comments keep direct columns editable", function()
+  local _, tbl = grip._resolve_query(
+    "SELECT id, total /* outer /* inner /* deeper */ */ FROM decoy */ FROM orders",
+    50, "postgresql")
+  eq(tbl, "orders", "the full nested comment must be skipped")
+end)
+
+test("resolve_query: malformed or dialect-ambiguous nested comments stay read-only", function()
+  for _, kind in ipairs({ "postgresql", "mysql", "sqlite", "duckdb" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT id, total /* outer /* inner */ FROM orders", 50, kind)
+    eq(tbl, nil, kind)
+  end
+end)
+
+test("resolve_query: source extraction ignores FROM inside comments and identifiers", function()
+  for _, statement in ipairs({
+    "SELECT id /* FROM decoy */ FROM orders",
+    "SELECT id -- FROM decoy\nFROM orders",
+    "SELECT id -- FROM decoy\rFROM orders",
+    'SELECT "FROM decoy" FROM orders',
+    "SELECT id FROM /* FROM decoy */ orders",
+    "SELECT o.id FROM orders /* FROM decoy */ AS o",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, "orders", statement)
+  end
+end)
+
+test("resolve_query: comment text cannot hide additional sources", function()
+  for _, statement in ipairs({
+    "SELECT * FROM orders /* WHERE hidden */ JOIN other ON orders.id = other.id",
+    "SELECT * FROM orders /* LIMIT hidden */, other",
+    "SELECT * FROM orders AS o(id, status)",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, nil, statement)
+  end
+end)
+
+test("resolve_query: line comments respect dialect line endings", function()
+  for _, kind in ipairs({ "postgresql", "duckdb", "mysql", "sqlite" }) do
+    local _, tbl = grip._resolve_query("SELECT id -- comment\r\nFROM orders", 50, kind)
+    eq(tbl, "orders", kind .. " CRLF")
+    _, tbl = grip._resolve_query("SELECT id -- comment\rFROM orders", 50, kind)
+    local expected = (kind == "postgresql" or kind == "duckdb") and "orders" or nil
+    eq(tbl, expected, kind .. " bare CR")
+    _, tbl = grip._resolve_query(
+      "SELECT * FROM orders -- comment\rUNION ALL SELECT * FROM other", 50, kind)
+    eq(tbl, nil, kind .. " hidden set operation")
+  end
+end)
+
+test("resolve_query: DuckDB struct projections stay read-only", function()
+  for _, statement in ipairs({
+    "SELECT id, details.* FROM orders",
+    "SELECT id, details.status FROM orders",
+    "SELECT id, orders.details.status FROM orders",
+    "SELECT id, o.details.status FROM orders AS o",
+    'SELECT id, "details"."status" FROM orders',
+    "SELECT id, orders.status FROM orders AS o",
+    "SELECT id, orders.* FROM orders AS o",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+    eq(tbl, nil, statement)
+  end
+end)
+
+test("resolve_query: actual table and alias qualifiers stay editable", function()
+  for _, statement in ipairs({
+    "SELECT orders.* FROM orders",
+    "SELECT orders.id, orders.status FROM orders",
+    "SELECT o.* FROM orders AS o",
+    "SELECT o.id, o.status FROM orders o",
+    'SELECT "o".* FROM "orders" AS "o"',
+    "SELECT O.status FROM orders AS o",
+    "SELECT DISTINCT o.id, o.status FROM orders AS o",
+    "SELECT ALL orders.* FROM orders",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+    eq(tbl, "orders", statement)
+  end
+end)
+
+test("resolve_query: schema qualifiers must match the complete actual source", function()
+  for _, projection in ipairs({ "orders.*", "public.orders.*", "public.orders.status" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT " .. projection .. " FROM public.orders", 50, "postgresql")
+    eq(tbl, "public.orders", projection)
+  end
+  for _, projection in ipairs({ "other.orders.*", "orders.details.status", "public.status" }) do
+    local _, tbl = grip._resolve_query(
+      "SELECT " .. projection .. " FROM public.orders", 50, "postgresql")
+    eq(tbl, nil, projection)
+  end
+end)
+
+test("resolve_query: PostgreSQL qualifier matching preserves quoted case", function()
+  local _, tbl = grip._resolve_query('SELECT "O".* FROM orders AS "O"', 50, "postgresql")
+  eq(tbl, "orders")
+  _, tbl = grip._resolve_query('SELECT o.* FROM orders AS "O"', 50, "postgresql")
+  eq(tbl, nil, "an unquoted lowercase qualifier does not name the quoted alias")
+  _, tbl = grip._resolve_query("SELECT Orders.* FROM Orders", 50, "postgresql")
+  eq(tbl, "orders", "unquoted PostgreSQL table names fold to lowercase")
+end)
+
+test("resolve_query: unsupported source and projection shapes stay read-only", function()
+  for _, statement in ipairs({
+    'SELECT * FROM "public.orders"',
+    "SELECT * FROM ONLY orders",
+    "SELECT id, total. FROM orders",
+    "SELECT id, total FROM orders UNION ALL SELECT id, status FROM other",
+    "SELECT * FROM orders WHERE id > 0 UNION ALL SELECT * FROM other",
+    "SELECT * FROM orders -- comment\rUNION ALL SELECT * FROM other",
+    "SELECT * FROM orders; SELECT * FROM other",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, nil, statement)
+  end
+end)
+
+test("resolve_query: ordinary tail expressions preserve single-source metadata", function()
+  for _, statement in ipairs({
+    "SELECT * FROM orders WHERE status = 'FROM other UNION SELECT'",
+    "SELECT * FROM orders WHERE id IN (SELECT id FROM other) ORDER BY id LIMIT 10;",
+    "SELECT * FROM orders WHERE status = 'it''s a value'",
+  }) do
+    local _, tbl = grip._resolve_query(statement, 50, "postgresql")
+    eq(tbl, "orders", statement)
+  end
+end)
+
+test("resolve_query: LEFT and RIGHT tail functions are not joins", function()
+  for _, kind in ipairs({ "postgresql", "duckdb", "mysql" }) do
+    local statement = "SELECT id, status FROM orders WHERE LEFT(status, 1) = 'b' ORDER BY RIGHT(status, 1)"
+    local _, tbl = grip._resolve_query(statement, 50, kind)
+    eq(tbl, "orders", kind)
+    _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id, status FROM other", 50, kind)
+    eq(tbl, nil, kind .. " real set operation")
+  end
+end)
+
+test("resolve_query: qualified keyword fields in the tail preserve editing", function()
+  for _, keyword in ipairs({ "union", "intersect", "except" }) do
+    for _, tail in ipairs({
+      "WHERE o." .. keyword .. " = 'base'",
+      "WHERE details." .. keyword .. " = 3",
+      "WHERE o./* comment */" .. keyword .. " = 'base'",
+      "ORDER BY o." .. keyword,
+    }) do
+      local _, tbl = grip._resolve_query("SELECT id, status FROM orders o " .. tail, 50, "duckdb")
+      eq(tbl, "orders", tail)
+    end
+  end
+end)
+
+test("resolve_query: qualified fields and decimal points cannot hide set operations", function()
+  for _, operation in ipairs({ "UNION", "INTERSECT", "EXCEPT" }) do
+    for _, tail in ipairs({
+      "WHERE orders.union = 'base' ",
+      "WHERE id = 1. ",
+      "WHERE id = 1./* comment */",
+      "WHERE id = 0_1. ",
+      "WHERE id = 0_1.",
+      "WHERE id = 0_1./* comment */",
+      "WHERE id = .0_1e2 ",
+      "WHERE id = 0_1.e0 ",
+      "WHERE id = 1e0",
+    }) do
+      local statement = "SELECT id, status FROM orders " .. tail
+        .. operation .. " SELECT id, status FROM other"
+      local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+      eq(tbl, nil, statement)
+    end
+  end
+end)
+
+test("resolve_query: numeric literals in filters preserve editing", function()
+  for _, literal in ipairs({ "0_1.", "1.0_0", "1e0_0", ".1e1", "1.e+0", "1e-0", "0x_1", "0b_1", "0o_1" }) do
+    local _, tbl = grip._resolve_query("SELECT id FROM orders WHERE id = " .. literal, 50, "postgresql")
+    eq(tbl, "orders", literal)
+    _, tbl = grip._resolve_query("SELECT id, " .. literal .. " FROM orders", 50, "postgresql")
+    eq(tbl, nil, "numeric projection " .. literal)
+  end
+  local _, tbl = grip._resolve_query(
+    "SELECT id, status FROM orders AS _1 WHERE _1.union = 'base'", 50, "duckdb")
+  eq(tbl, "orders", "underscore-prefixed aliases are still identifiers")
+end)
+
+test("resolve_query: ambiguous numeric suffixes stay read-only", function()
+  for _, literal in ipairs({ "0x", "0b_", "0o8", "1e_1", "1e+", "1e-", "1f", "0x1g" }) do
+    local _, tbl = grip._resolve_query("SELECT id FROM orders WHERE id = " .. literal, 50, "postgresql")
+    eq(tbl, nil, literal)
+  end
+end)
+
+test("resolve_query: plain backslash filters preserve direct-column editing", function()
+  for _, kind in ipairs({ "postgresql", "duckdb", "mysql", "sqlite" }) do
+    local _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\orders']], 50, kind)
+    eq(tbl, "orders", kind)
+    _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\\']], 50, kind)
+    eq(tbl, "orders", kind .. " even trailing backslashes")
+    _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE status = 'C:\data\']], 50, kind)
+    local expected
+    if kind ~= "postgresql" and kind ~= "mysql" then expected = "orders" end
+    eq(tbl, expected, kind .. " trailing backslash quote boundary")
+  end
+end)
+
+test("resolve_query: explicit escape strings cannot hide set operations", function()
+  for _, kind in ipairs({ "postgresql", "duckdb" }) do
+    for _, literal in ipairs({
+      [[E'it\'s FROM other UNION SELECT']],
+      "E''\n'first'\n'\\' -- '",
+      "E'' -- continuation\n'\\' -- '",
+    }) do
+      local statement = "SELECT id FROM orders WHERE status = " .. literal
+      local _, tbl = grip._resolve_query(statement, 50, kind)
+      eq(tbl, "orders", kind .. " " .. literal)
+      _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id FROM other", 50, kind)
+      eq(tbl, nil, kind .. " real set operation after " .. literal)
+    end
+  end
+end)
+
+test("resolve_query: dollar-quoted filters use exact delimiter boundaries", function()
+  for _, kind in ipairs({ "postgresql", "duckdb" }) do
+    for _, literal in ipairs({ "$$it's FROM other UNION SELECT$$", "$tag$' /* FROM $$ UNION */$tag$" }) do
+      local statement = "SELECT id FROM orders WHERE status = " .. literal
+      local _, tbl = grip._resolve_query(statement, 50, kind)
+      eq(tbl, "orders", kind .. " " .. literal)
+      _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id FROM other", 50, kind)
+      eq(tbl, nil, kind .. " real set operation")
+      _, tbl = grip._resolve_query("SELECT id, " .. literal .. " FROM orders", 50, kind)
+      eq(tbl, nil, kind .. " literal projection")
+    end
+    for _, literal in ipairs({ "$$unterminated", "$tag$wrong case$TAG$", "$1$invalid tag$1$" }) do
+      local _, tbl = grip._resolve_query("SELECT id FROM orders WHERE status = " .. literal, 50, kind)
+      eq(tbl, nil, kind .. " " .. literal)
+    end
+  end
+end)
+
+test("resolve_query: dollar delimiters do not copy the remaining SQL", function()
+  local literals = {}
+  for idx = 1, 1000 do literals[idx] = "$tag$value" .. idx .. "$tag$" end
+  local statement = "SELECT id FROM orders WHERE status IN (" .. table.concat(literals, ",") .. ")"
+  local original_sub, suffix_copies = string.sub, 0
+  -- luacheck: push ignore 122
+  string.sub = function(value, first, last)
+    if value == statement and last == nil then suffix_copies = suffix_copies + 1 end
+    return original_sub(value, first, last)
+  end
+  local ok, spec, tbl = pcall(grip._resolve_query, statement, 50, "postgresql")
+  string.sub = original_sub
+  -- luacheck: pop
+  assert(ok, spec)
+  eq(spec.base_sql, statement, "query text remains unchanged")
+  eq(tbl, "orders", "large literal list retains its source")
+  eq(suffix_copies, 0, "dollar delimiter matching must not copy SQL suffixes")
+end)
+
+test("resolve_query: PostgreSQL JSON operators are allowed only in tail expressions", function()
+  local _, tbl = grip._resolve_query([[SELECT id FROM orders WHERE details #>> '{status}' = 'base']], 50, "postgresql")
+  eq(tbl, "orders")
+  _, tbl = grip._resolve_query([[SELECT id, details #>> '{status}' FROM orders]], 50, "postgresql")
+  eq(tbl, nil, "JSON extraction is not a direct column")
+end)
+
+test("resolve_query: DuckDB nested lists do not act as quoted identifiers", function()
+  local statement = [=[SELECT id FROM orders WHERE [[status]] = [['base']]]=]
+  local _, tbl = grip._resolve_query(statement, 50, "duckdb")
+  eq(tbl, "orders")
+  _, tbl = grip._resolve_query(statement .. " UNION ALL SELECT id FROM other", 50, "duckdb")
+  eq(tbl, nil, "real set operation after list filter")
+  _, tbl = grip._resolve_query("SELECT id, [status] FROM orders", 50, "duckdb")
+  eq(tbl, nil, "list construction is not a direct column")
+end)
+
+test("resolve_query: aliased projected column does not expose editable table", function()
+  local spec, tbl = grip._resolve_query("SELECT id, total AS status FROM orders", 50)
+  assert(spec, "spec should not be nil")
+  eq(tbl, nil, "aliased result columns cannot be safely mapped back to the base table")
+end)
+
+test("resolve_query: computed projected column does not expose editable table", function()
+  local spec, tbl = grip._resolve_query("SELECT id, total * 2 AS status FROM orders", 50)
+  assert(spec, "spec should not be nil")
+  eq(tbl, nil, "computed result columns cannot be safely mapped back to the base table")
+end)
+
 test("resolve_query: SELECT with JOIN returns nil table (ambiguous)", function()
   local spec, tbl = grip._resolve_query("SELECT a.*, b.* FROM users a JOIN orders b ON a.id = b.user_id", 50)
   assert(spec, "spec should not be nil")

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Guard query-grid edits against aliased columns, computed projections, and
+  bare SQL value expressions such as `CURRENT_TIMESTAMP` that can target an
+  unrelated same-named column (#77). Preserve direct Unicode column references
+  and MySQL/MariaDB quoted identifiers, and reject executable projection
+  comments in those dialects. Resolve projections and their actual source
+  from the same token stream, including PostgreSQL nested comments. Only
+  allow qualified projections that match the source table or alias, keeping
+  DuckDB struct expansion and struct-field access read-only. Preserve editing
+  with ordinary filters and ordering, including `LEFT()`/`RIGHT()`, supported
+  string literals, PostgreSQL JSON operators, DuckDB lists, and qualified
+  fields named `union`, `intersect`, or `except` in filters and ordering.
+  Keep numeric literals intact so digit separators cannot hide real set
+  operations from the editability check.
+- Avoid copying the remaining SQL for each dollar-quoted string while
+  checking query editability, avoiding quadratic copying for large lists.
+
 ## [3.11.0] - 2026-08-31
 
 ### Added

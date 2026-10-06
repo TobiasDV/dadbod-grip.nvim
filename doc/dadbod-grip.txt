@@ -780,7 +780,18 @@ Multi-level undo: every edit operation pushes the previous state onto a
 history. Press `U` to reset to the original state in one step.
 
 Read-only mode is auto-detected when no primary key exists on the table
-(grip needs PKs for WHERE clauses in UPDATE/DELETE statements).
+(grip needs PKs for WHERE clauses in UPDATE/DELETE statements). SELECT
+projections with column aliases, including unchanged names such as `id AS id`,
+or expressions such as `total * 2` and bare `CURRENT_TIMESTAMP` open read-only.
+Supported direct column references and wildcards remain eligible for editing
+when the normal primary-key requirements are met. This includes unquoted
+Unicode column names and quoted or qualified columns named CURRENT_TIMESTAMP.
+MySQL/MariaDB support backtick and double-quoted identifiers because the
+adapter enables ANSI_QUOTES; executable comments in projections stay read-only.
+PostgreSQL nested comments are skipped when checking columns and locating the
+source table. Qualified columns and wildcards must match that table or its
+alias. Struct projections such as DuckDB's details.* and details.status stay
+read-only because their output names do not identify base-table columns.
 
 Full-buffer cell editor ~
                                                         *grip-cell-buffer*
