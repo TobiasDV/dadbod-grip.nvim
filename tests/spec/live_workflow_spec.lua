@@ -279,6 +279,25 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     db.execute("DROP TABLE IF EXISTS grip_live_ddl", URL)
     if not ok then error(err) end
   end)
+
+  test("SQL Server geography columns load as editable text", function()
+    local probe = "grip_live_places"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, loc GEOGRAPHY)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, geography::Point(52.37, 4.89, 4326))", URL))
+      local spec = query.new_table(probe, 50)
+      local page = assert(db.query(query.build_sql(spec), URL))
+      eq(page.rows[1][2], "POINT (4.89 52.37)", "WKT")
+      eq(page.readonly, nil, "editable")
+      assert(db.execute(sql.wrap_transaction({
+        sql.build_update(probe, { id = "1" }, { loc = "POINT (5 53)" }, "sqlserver"),
+      }, "sqlserver"), URL))
+      eq(assert(db.query(query.build_sql(spec), URL)).rows[1][2], "POINT (5 53)", "WKT written back")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
 end
 
 print(string.format("\nlive_workflow_spec: %d passed, %d failed", pass, fail))

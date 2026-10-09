@@ -214,6 +214,13 @@ local function parse_sqlcmd_table(raw)
     if not (sep_probe == "" and lines[i]:find("-", 1, true)) then
       local row = split(lines[i])
       if #row ~= #columns then lossy = lossy or "tab or newline in a value" end
+      -- sqlcmd prints a CLR value such as geography as its raw bytes.
+      for k, field in ipairs(row) do
+        if field:find("%z") then
+          row[k] = field:gsub("%z", "")
+          lossy = lossy or "binary value in text output"
+        end
+      end
       for _, field in ipairs(row) do
         if #field >= MAX_VALUE_WIDTH and char_count(field) >= MAX_VALUE_WIDTH then
           lossy = "value over " .. MAX_VALUE_WIDTH .. " characters"
@@ -272,10 +279,25 @@ local function quoted_name_at(s, pos)
   return s:sub(pos, stop - 1)
 end
 
+local DESCRIBE_SQL = "SELECT name, system_type_name"
+  .. " FROM sys.dm_exec_describe_first_result_set(N'%s', NULL, 0) ORDER BY column_ordinal;"
+
+--- Types FOR JSON refuses to serialize. json_page_sql casts them to text:
+--- WKT for geography and geometry, /1/2/ for hierarchyid.
+local CLR_TYPES = { geography = true, geometry = true, hierarchyid = true }
+
+--- "nvarchar" for "nvarchar(max)".
+local function base_type(type_name)
+  return (type_name:match("^%a+") or ""):lower()
+end
+
 --- Rewrite a query.build_sql statement (SELECT * over a quoted table or over
 --- the `(...) AS _grip` wrapper) into the describe + JSON batch. Its WHERE,
---- ORDER BY and paging stay as they are. Returns nil for any other statement.
-local function json_page_sql(sql_str)
+--- ORDER BY and paging stay as they are. Each row object is `<source>.*`,
+--- or with `columns` (from described_columns) an explicit list that casts
+--- CLR columns to text. Returns the batch and its describe statement alone,
+--- or nil for any other statement.
+local function json_page_sql(sql_str, columns)
   local body = sql_str:gsub("[%s;]+$", "")
   local from_kw, source_pos = body:match(
     "^%s*[Ss][Ee][Ll][Ee][Cc][Tt]%s+%*%s+()[Ff][Rr][Oo][Mm]%s+()")
@@ -290,11 +312,22 @@ local function json_page_sql(sql_str)
     if not source then return nil end
   end
 
-  return string.format(
-    "SELECT name, system_type_name"
-      .. " FROM sys.dm_exec_describe_first_result_set(N'%s', NULL, 0) ORDER BY column_ordinal;\n"
-      .. "SELECT (SELECT %s.* FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) AS %s %s",
-    esc(body), source, JSON_COLUMN, body:sub(from_kw))
+  local row_list = source .. ".*"
+  if columns then
+    local parts = {}
+    for i, col in ipairs(columns) do
+      local name = '"' .. col.name:gsub('"', '""') .. '"'
+      local ref = source .. "." .. name
+      if CLR_TYPES[base_type(col.type)] then ref = "CAST(" .. ref .. " AS nvarchar(max))" end
+      parts[i] = ref .. " AS " .. name
+    end
+    row_list = table.concat(parts, ", ")
+  end
+
+  local describe = string.format(DESCRIBE_SQL, esc(body))
+  return describe .. "\n" .. string.format(
+    "SELECT (SELECT %s FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) AS %s %s",
+    row_list, JSON_COLUMN, body:sub(from_kw)), describe
 end
 
 --- Index of the quote closing the JSON string that opens at `pos`.
@@ -364,7 +397,7 @@ local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp 
 --- show them as 0x hex and the shortest decimal that reads back the same.
 local function json_cell(value, type_name)
   if value == "" then return value end
-  local base = (type_name:match("^%a+") or ""):lower()
+  local base = base_type(type_name)
   if BINARY_TYPES[base] then
     local ok, bytes = pcall(vim.base64.decode, value)
     if not ok then return nil end
@@ -381,6 +414,18 @@ local function json_cell(value, type_name)
   return value
 end
 
+--- The { name, type } list a DESCRIBE_SQL result printed, or nil.
+local function described_columns(raw)
+  local described = parse_sqlcmd_table(raw)
+  if described.lossy or #described.rows == 0 then return nil end
+  local columns = {}
+  for i, row in ipairs(described.rows) do
+    if row[1] == "" then return nil end
+    columns[i] = { name = row[1], type = row[2] or "" }
+  end
+  return columns
+end
+
 --- Parse the output of a json_page_sql batch into { columns, rows }.
 --- Returns nil when any row does not decode into exactly the described
 --- columns; the caller then falls back to the text output.
@@ -388,12 +433,11 @@ local function parse_json_page(raw)
   local split = (raw or ""):find("\n" .. JSON_COLUMN .. "\r?\n%-")
   if not split then return nil end
 
-  local described = parse_sqlcmd_table(raw:sub(1, split))
-  if described.lossy or #described.rows == 0 then return nil end
+  local described = described_columns(raw:sub(1, split))
+  if not described then return nil end
   local columns, types = {}, {}
-  for i, row in ipairs(described.rows) do
-    if row[1] == "" then return nil end
-    columns[i], types[i] = row[1], row[2] or ""
+  for i, col in ipairs(described) do
+    columns[i], types[i] = col.name, col.type
   end
 
   -- Every row is one line starting with "{": JSON escapes the newlines inside
@@ -426,17 +470,25 @@ local function run_query(sql_str, url, timeout_ms)
   if not parsed then return nil, parse_err end
 
   local query_sql = normalize_query_sql(sql_str)
-  local page_sql = json_page_sql(query_sql)
+  local page_sql, describe_sql = json_page_sql(query_sql)
   if page_sql then
     local stdout, stderr, code = sqlcmd(parsed, page_sql, timeout_ms)
+    if code ~= 0 then
+      local err = sqlcmd_error(stdout, stderr, code)
+      -- Any other error would fail on the text path too.
+      if not err:find("FOR JSON", 1, true) then return nil, err end
+      -- FOR JSON refuses CLR columns such as geography, and says so before
+      -- the describe half runs. Describe the page on its own and retry with
+      -- those columns cast to text.
+      local described, _, describe_code = sqlcmd(parsed, describe_sql, timeout_ms)
+      local columns = describe_code == 0 and described_columns(described)
+      if columns then
+        stdout, _, code = sqlcmd(parsed, json_page_sql(query_sql, columns), timeout_ms)
+      end
+    end
     if code == 0 then
       local page = parse_json_page(stdout)
       if page then return page, nil end
-    else
-      local err = sqlcmd_error(stdout, stderr, code)
-      -- FOR JSON refuses CLR columns such as geography, which the text
-      -- output can still show; any other error would fail there too.
-      if not err:find("FOR JSON", 1, true) then return nil, err end
     end
   end
 

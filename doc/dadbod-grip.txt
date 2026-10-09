@@ -1312,8 +1312,9 @@ based on the connection URL scheme.
 
 SQL Server grids fetch each row as JSON, so tabs and newlines inside values
 stay editable. A page JSON cannot carry falls back to sqlcmd's plain text: a
-row longer than 8000 characters (the widest value sqlcmd prints), a dotted
-column alias, or a geography or geometry column. Plain text has no quoting, so
+row longer than 8000 characters (the widest value sqlcmd prints) or a dotted
+column alias. geography, geometry and hierarchyid columns are shown as text
+(`POINT (4.9 52.4)`), which is also what an edit writes back. Plain text has no quoting, so
 that page opens read-only when any value contains a tab or a newline, or
 reaches 8000 characters.
 

@@ -401,25 +401,69 @@ test("sqlserver query: an empty JSON page still has its columns", function()
   end)
 end)
 
+--- Answer successive sqlcmd calls from `replies` ({stdout, code} each) and
+--- return the stdin of every call.
+local function with_replies(replies, fn)
+  local calls = {}
+  local orig = vim.system
+  vim.system = function(_args, opts, cb)
+    calls[#calls + 1] = opts.stdin
+    local reply = replies[#calls] or replies[#replies]
+    cb({ stdout = reply[1], stderr = "", code = reply[2] })
+  end
+  local ok, err = pcall(fn)
+  vim.system = orig
+  if not ok then error(err) end
+  return calls
+end
+
+local CLR_ERROR = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n"
+local PLACES_DESCRIBED = lines({
+  "name\tsystem_type_name", "----\t----------------", "id\tint", "loc\tgeography",
+})
+
+test("sqlserver query: CLR columns are retried cast to text", function()
+  with_executable(function()
+    local r
+    local calls = with_replies({
+      { CLR_ERROR, 1 },
+      { PLACES_DESCRIBED, 0 },
+      { PLACES_DESCRIBED .. lines({ "", "_grip_json", "----------", [[{"id":1,"loc":"POINT (4.9 52.4)"}]] }), 0 },
+    }, function()
+      r = assert(sqlserver.query('SELECT * FROM "dbo"."places" LIMIT 100', URL))
+    end)
+    eq(#calls, 3, "JSON, describe, JSON with casts")
+    contains(calls[3], [[CAST("dbo"."places"."loc" AS nvarchar(max)) AS "loc"]], "geography cast")
+    contains(calls[3], [["dbo"."places"."id" AS "id"]], "other columns listed as they are")
+    eq(r.rows[1][2], "POINT (4.9 52.4)")
+    eq(r.readonly, nil)
+  end)
+end)
+
 test("sqlserver query: a page JSON cannot carry falls back to the text output", function()
   with_executable(function()
-    local calls = {}
-    local orig = vim.system
-    vim.system = function(_args, opts, cb)
-      calls[#calls + 1] = opts.stdin
-      local r = #calls == 1
-        and { stdout = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n", stderr = "", code = 1 }
-        or { stdout = lines({ "id\tshape", "--\t-----", "1\tPOINT (4 52)" }), stderr = "", code = 0 }
-      cb(r)
-    end
-    local ok, r, err = pcall(sqlserver.query, 'SELECT * FROM "places" LIMIT 100', URL)
-    vim.system = orig
-    assert(ok, r)
-    assert(r, err)
-    eq(#calls, 2, "text query after the JSON one")
-    contains(calls[1], "FOR JSON", "first call")
-    assert(not calls[2]:find("FOR JSON", 1, true), "second call is plain")
+    local r
+    local calls = with_replies({
+      { CLR_ERROR, 1 },
+      { "Msg 11529, Level 16, State 1\nThe metadata could not be determined.\n", 1 },
+      { lines({ "id\tshape", "--\t-----", "1\tPOINT (4 52)" }), 0 },
+    }, function()
+      r = assert(sqlserver.query('SELECT * FROM "places" LIMIT 100', URL))
+    end)
+    eq(#calls, 3, "JSON, describe, text")
+    assert(not calls[3]:find("FOR JSON", 1, true), "last call is plain")
     eq(r.rows[1][2], "POINT (4 52)")
+  end)
+end)
+
+test("sqlserver text output: raw bytes make the grid read-only instead of breaking it", function()
+  with_executable(function()
+    with_system_mock(lines({ "id\tloc", "--\t---", "1\t\230\16\0\0\1" }), "", 0, function()
+      local r = sqlserver.query("SELECT * FROM dbo.places", URL)
+      eq(r.readonly, true)
+      eq(r.readonly_reason, "binary value in text output")
+      assert(not r.rows[1][2]:find("%z"), "NUL bytes stripped")
+    end)
   end)
 end)
 
