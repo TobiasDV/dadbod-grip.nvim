@@ -176,8 +176,9 @@ local function char_count(s)
   return select(2, s:gsub("[^\128-\191]", ""))
 end
 
---- `lossy` is set when the rows cannot be trusted to match the server's values,
---- which makes the grid read-only (see M.query). sqlcmd does not quote fields:
+--- `lossy` names why the rows cannot be trusted to match the server's values
+--- (false when they can), which makes the grid read-only (see M.query).
+--- sqlcmd does not quote fields:
 --- a tab or newline inside a value shifts or splits its row, so an edit could
 --- put the wrong value in the WHERE clause. A value at the -y width may have
 --- been cut off, and writing it back would truncate it.
@@ -212,10 +213,10 @@ local function parse_sqlcmd_table(raw)
     local sep_probe = lines[i]:gsub("[\t%s%-]", "")
     if not (sep_probe == "" and lines[i]:find("-", 1, true)) then
       local row = split(lines[i])
-      if #row ~= #columns then lossy = true end
+      if #row ~= #columns then lossy = lossy or "tab or newline in a value" end
       for _, field in ipairs(row) do
         if #field >= MAX_VALUE_WIDTH and char_count(field) >= MAX_VALUE_WIDTH then
-          lossy = true
+          lossy = "value over " .. MAX_VALUE_WIDTH .. " characters"
         end
       end
       while #row < #columns do table.insert(row, "") end
@@ -484,7 +485,8 @@ function M.query(sql_str, url)
     rows = parsed.rows,
     columns = parsed.columns,
     primary_keys = {},
-    readonly = parsed.lossy or nil,
+    readonly = parsed.lossy and true or nil,
+    readonly_reason = parsed.lossy or nil,
   }, nil
 end
 
