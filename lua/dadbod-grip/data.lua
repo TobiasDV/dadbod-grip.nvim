@@ -85,11 +85,13 @@ local function edit_copy(state)
     inserted         = deep_copy(state.inserted),
     _next_insert_idx = state._next_insert_idx,
     readonly         = state.readonly,
+    readonly_reason  = state.readonly_reason,
   }
 end
 
 -- M.new(query_result) → State
--- query_result = { rows, columns, primary_keys, table_name, url, sql, readonly }
+-- query_result = { rows, columns, primary_keys, table_name, url, sql, readonly,
+--                  readonly_reason }
 -- query_result.readonly is the caller saying so outright (a read-only adapter,
 -- a connection saved with "mode": "ro"). Those callers also hand over an empty
 -- primary_keys, which already produced a read-only state on its own -- this
@@ -111,6 +113,9 @@ function M.new(query_result)
     inserted = {},
     _next_insert_idx = #(query_result.rows or {}) + 1000,
     readonly = readonly,
+    -- Shown in the grid's "read-only: <reason>" badge.
+    readonly_reason = readonly and (query_result.readonly_reason
+      or (query_result.readonly == true and "connection" or "no PK")) or nil,
   }
 end
 

@@ -58,6 +58,18 @@ test("new: readonly when no table_name", function()
   eq(st.readonly, true, "no table_name should be readonly")
 end)
 
+test("new: readonly_reason says why the grid is read-only", function()
+  eq(make_state({}).readonly_reason, nil, "editable grid has no reason")
+  eq(make_state({ primary_keys = {} }).readonly_reason, "no PK")
+  local cut = data.new({ rows = {}, columns = { "id" }, primary_keys = {}, table_name = "docs",
+    readonly = true, readonly_reason = "value over 8000 characters" })
+  eq(cut.readonly_reason, "value over 8000 characters", "adapter reason kept")
+  local ro = data.new({ rows = {}, columns = { "id" }, primary_keys = {}, table_name = "docs", readonly = true })
+  eq(ro.readonly_reason, "connection", "read-only connection")
+  eq(data.add_change(make_state({ primary_keys = {} }), 1, "name", "x").readonly_reason, "no PK",
+    "survives edits")
+end)
+
 test("new: rows are deep-copied", function()
   local original = { { "1", "alice" } }
   local st = make_state({ rows = original, columns = { "id", "name" } })

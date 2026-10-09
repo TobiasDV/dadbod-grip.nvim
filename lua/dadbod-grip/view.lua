@@ -428,7 +428,7 @@ local function title_line(session, columns, widths, total_width)
     }
     table.insert(badges, full_labels[vn] or vn)
   elseif not is_editable(session) then
-    table.insert(badges, "read-only: no PK")
+    table.insert(badges, "read-only: " .. (session.state.readonly_reason or "no PK"))
   end
   if session.query_spec and qmod.has_filters(session.query_spec) then
     table.insert(badges, "filtered")
