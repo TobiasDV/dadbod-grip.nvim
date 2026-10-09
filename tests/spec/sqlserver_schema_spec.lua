@@ -255,6 +255,13 @@ test("sqlserver: sqlcmd runs with -y 8000 (the default cuts (max) values to 256)
   end)
 end)
 
+test("sqlserver: sqlcmd runs with -x (no $(var) substitution inside values)", function()
+  with_executable(function()
+    local args = capture_system_args("id\n--\n1\n", function() sqlserver.execute("SELECT 1", URL) end)
+    assert(vim.tbl_contains(args, "-x"), "-x missing: " .. table.concat(args, " "))
+  end)
+end)
+
 -- ── editable grids ──────────────────────────────────────────────────────────
 
 test("sqlserver: grids are editable (no adapter-wide readonly)", function()

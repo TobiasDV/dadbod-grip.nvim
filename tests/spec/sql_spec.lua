@@ -231,6 +231,12 @@ test("quote_value: sqlserver strings are N-prefixed", function()
   eq(sql.quote_value("it's", "sqlserver"), "N'it''s'")
 end)
 
+test("quote_value: sqlserver splices CRs in as NCHAR(13)", function()
+  eq(sql.quote_value("a\r\nb's", "sqlserver"), "CAST(N'a' AS nvarchar(max)) + NCHAR(13) + N'\nb''s'")
+  eq(sql.quote_value("a\nb", "sqlserver"), "N'a\nb'", "LF alone is left as is")
+  eq(sql.quote_value("a\r\nb", "postgresql"), "'a\r\nb'", "other adapters unchanged")
+end)
+
 test("quote_value: sqlserver booleans are 1/0", function()
   eq(sql.quote_value(true, "sqlserver"), "1")
   eq(sql.quote_value(false, "sqlserver"), "0")
