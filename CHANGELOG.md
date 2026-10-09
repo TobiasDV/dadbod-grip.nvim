@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Edit SQL Server grids. Edits, inserts, and deletes apply in one
   `SET XACT_ABORT ON` transaction and can be undone. Values are written as
-  `N'...'`, so text outside the database code page is not stored as `?`, and
+  `N'...'`, so text outside the database code page is not stored as `?`;
+  CRs are written as `NCHAR(13)` because sqlcmd drops them from its input, and
   undoing a delete restores an IDENTITY key. Grid rows are fetched as JSON,
   so tabs and newlines inside values stay editable; a page that falls back to
   sqlcmd's plain text (a row over 8000 characters, or a geography column)
@@ -21,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Send SQL Server statements containing `$(` as written. sqlcmd took them for
+  scripting variables and substituted or rejected them.
 - Guard query-grid edits against aliased columns, computed projections, and
   bare SQL value expressions such as `CURRENT_TIMESTAMP` that can target an
   unrelated same-named column (#77). Preserve direct Unicode column references

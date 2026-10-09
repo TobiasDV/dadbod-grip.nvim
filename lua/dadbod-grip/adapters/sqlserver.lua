@@ -84,6 +84,8 @@ local function sqlcmd_args(parsed)
     -- go-sqlcmd accepts; -y 0 would also drop the header row the parser reads.
     "-y", tostring(MAX_VALUE_WIDTH),
     "-s", "\t",
+    -- No $(var) substitution: a value containing "$(" is sent as written.
+    "-x",
     -- Without -b sqlcmd exits 0 even when the server rejects the statement, so
     -- every `code ~= 0` guard below would be dead and a refused DROP would be
     -- reported as a success.

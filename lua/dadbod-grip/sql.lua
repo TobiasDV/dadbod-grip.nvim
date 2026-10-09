@@ -29,7 +29,14 @@ function M.quote_value(v, adapter_kind)
   elseif type(v) == "number" then
     return tostring(v)
   elseif adapter_kind == "sqlserver" then
-    return "N'" .. escape_literal(v) .. "'"
+    -- sqlcmd drops the CR of every CRLF it reads from stdin, so CRs are
+    -- spliced in as NCHAR(13). The nvarchar(max) cast stops the concatenation
+    -- from cutting a long value to 4000 characters.
+    local parts = vim.split(tostring(v), "\r", { plain = true })
+    for i, part in ipairs(parts) do parts[i] = "N'" .. escape_literal(part) .. "'" end
+    if #parts == 1 then return parts[1] end
+    parts[1] = "CAST(" .. parts[1] .. " AS nvarchar(max))"
+    return table.concat(parts, " + NCHAR(13) + ")
   else
     return "'" .. escape_literal(v) .. "'"
   end

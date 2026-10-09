@@ -239,6 +239,20 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       }, "sqlserver"), URL))
       eq(assert(db.query(query.build_sql(spec), URL)).rows[1][2], edited, "edit round-trips")
 
+      -- sqlcmd reads its stdin line by line: a CRLF must keep its CR and
+      -- "$(" must not be taken for a scripting variable.
+      local long = string.rep("x", 5000) .. "\r\n" .. string.rep("y", 100)
+      for _, value in ipairs({ "windows\r\nline", "costs $(amount)", long }) do
+        assert(db.execute(sql.wrap_transaction({
+          sql.build_update(probe, { id = "2" }, { note = value }, "sqlserver"),
+        }, "sqlserver"), URL))
+        local stored = assert(db.query(query.build_sql(spec), URL)).rows[2][2]
+        eq(stored, value, "round-trip of " .. #value .. " characters")
+        local hit = assert(db.query("SELECT COUNT(*) FROM " .. probe .. " WHERE note = "
+          .. sql.quote_value(value, "sqlserver"), URL))
+        eq(hit.rows[1][1], "1", "the value matches itself as a key")
+      end
+
       local empty = assert(db.query(query.build_sql(query.add_filter(spec, '"id" < 0')), URL))
       eq(table.concat(empty.columns, ","), "id,note,blob", "empty page keeps its columns")
     end)
