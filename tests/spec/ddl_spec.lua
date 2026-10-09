@@ -404,6 +404,41 @@ test("add column SQL: with DEFAULT clause", function()
   contains(ddl_sql, "DEFAULT 'active'", "default value")
 end)
 
+-- ── per-adapter DDL builders ─────────────────────────────────────────────────
+
+test("rename column builder: ALTER TABLE ... RENAME COLUMN outside SQL Server", function()
+  for _, kind in ipairs({ "postgresql", "mysql", "sqlite", "duckdb" }) do
+    eq(ddl._build_rename_column_sql("users", "name", "full_name", kind),
+      'ALTER TABLE "users" RENAME COLUMN "name" TO "full_name"', kind)
+  end
+end)
+
+test("rename column builder: sqlserver uses sp_rename with a quoted source", function()
+  eq(ddl._build_rename_column_sql("dbo.users", "name", "full_name", "sqlserver"),
+    [[EXEC sp_rename N'"dbo"."users"."name"', N'full_name', N'COLUMN']])
+end)
+
+test("rename column builder: sqlserver escapes quotes in both names", function()
+  eq(ddl._build_rename_column_sql("users", "it's", "o'neil", "sqlserver"),
+    [[EXEC sp_rename N'"users"."it''s"', N'o''neil', N'COLUMN']])
+end)
+
+test("rename table builder: ALTER TABLE ... RENAME TO outside SQL Server", function()
+  eq(ddl._build_rename_table_sql("users", "people", "postgresql"), 'ALTER TABLE "users" RENAME TO "people"')
+end)
+
+test("rename table builder: sqlserver uses sp_rename", function()
+  eq(ddl._build_rename_table_sql("dbo.users", "people", "sqlserver"),
+    [[EXEC sp_rename N'"dbo"."users"', N'people']])
+end)
+
+test("add column builder: ADD COLUMN outside SQL Server, ADD on it", function()
+  eq(ddl._build_add_column_sql("users", "bio", "text", "", "postgresql"),
+    'ALTER TABLE "users" ADD COLUMN "bio" text')
+  eq(ddl._build_add_column_sql("users", "bio", "nvarchar(200)", "none", "sqlserver"),
+    [[ALTER TABLE "users" ADD "bio" nvarchar(200) DEFAULT 'none']])
+end)
+
 -- ── summary ──────────────────────────────────────────────────────────────────
 
 print(string.format("\nddl_spec: %d passed, %d failed", pass, fail))

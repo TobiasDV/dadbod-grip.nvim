@@ -211,16 +211,35 @@ end
 
 -- ── column rename ───────────────────────────────────────────────────────────
 
-function M.rename_column(table_name, old_name, url, on_done)
-  local new_name = ui.input({ prompt = "Rename '" .. old_name .. "' to: " })
-  if not new_name or new_name == old_name then return end
+-- T-SQL has no RENAME clause; sp_rename takes the current name as a quoted
+-- multi-part string and the new name verbatim (quotes there become part of
+-- the name).
+local function sp_rename(object_name, new_name, object_type)
+  local call = string.format("EXEC sp_rename N'%s', N'%s'",
+    sql.escape_literal(object_name), sql.escape_literal(new_name))
+  if object_type then call = call .. ", N'" .. object_type .. "'" end
+  return call
+end
 
-  local ddl_sql = string.format(
+-- Pure SQL builder; adapter_kind as from adapters.kind.
+local function build_rename_column_sql(table_name, old_name, new_name, adapter_kind)
+  if adapter_kind == "sqlserver" then
+    return sp_rename(sql.quote_ident(table_name) .. "." .. sql.quote_ident(old_name), new_name, "COLUMN")
+  end
+  return string.format(
     'ALTER TABLE %s RENAME COLUMN %s TO %s',
     sql.quote_ident(table_name),
     sql.quote_ident(old_name),
     sql.quote_ident(new_name)
   )
+end
+
+function M.rename_column(table_name, old_name, url, on_done)
+  local new_name = ui.input({ prompt = "Rename '" .. old_name .. "' to: " })
+  if not new_name or new_name == old_name then return end
+
+  local adapter_kind = adapters.kind(db.resolved_url(url))
+  local ddl_sql = build_rename_column_sql(table_name, old_name, new_name, adapter_kind)
 
   confirm_ddl("Rename Column", ddl_sql, function()
     local _, err = db.execute(ddl_sql, url)
@@ -235,15 +254,24 @@ end
 
 -- ── table rename ────────────────────────────────────────────────────────────
 
-function M.rename_table(old_name, url, on_done)
-  local new_name = ui.input({ prompt = "Rename table '" .. old_name .. "' to: " })
-  if not new_name or new_name == old_name then return end
-
-  local ddl_sql = string.format(
+-- Pure SQL builder; adapter_kind as from adapters.kind.
+local function build_rename_table_sql(old_name, new_name, adapter_kind)
+  if adapter_kind == "sqlserver" then
+    return sp_rename(sql.quote_ident(old_name), new_name)
+  end
+  return string.format(
     'ALTER TABLE %s RENAME TO %s',
     sql.quote_ident(old_name),
     sql.quote_ident(new_name)
   )
+end
+
+function M.rename_table(old_name, url, on_done)
+  local new_name = ui.input({ prompt = "Rename table '" .. old_name .. "' to: " })
+  if not new_name or new_name == old_name then return end
+
+  local adapter_kind = adapters.kind(db.resolved_url(url))
+  local ddl_sql = build_rename_table_sql(old_name, new_name, adapter_kind)
 
   confirm_ddl("Rename Table", ddl_sql, function()
     local _, err = db.execute(ddl_sql, url)
@@ -258,6 +286,17 @@ end
 
 -- ── column add ──────────────────────────────────────────────────────────────
 
+-- Pure SQL builder; adapter_kind as from adapters.kind. T-SQL spells the
+-- clause ADD, without COLUMN.
+local function build_add_column_sql(table_name, col_name, col_type, default_val, adapter_kind)
+  local add = adapter_kind == "sqlserver" and "ADD " or "ADD COLUMN "
+  local col_def = add .. sql.quote_ident(col_name) .. " " .. col_type
+  if default_val ~= "" then
+    col_def = col_def .. " DEFAULT " .. sql.quote_value(default_val)
+  end
+  return "ALTER TABLE " .. sql.quote_ident(table_name) .. " " .. col_def
+end
+
 function M.add_column(table_name, url, on_done)
   local col_name = ui.input({ prompt = "Column name: " })
   if not col_name then return end
@@ -269,14 +308,8 @@ function M.add_column(table_name, url, on_done)
   local default_val = ui.input({ prompt = "Default value (blank for none): ", allow_empty = true })
   if not default_val then return end
 
-  local parts = { "ALTER TABLE " .. sql.quote_ident(table_name) }
-  local col_def = "ADD COLUMN " .. sql.quote_ident(col_name) .. " " .. col_type
-  if default_val ~= "" then
-    col_def = col_def .. " DEFAULT " .. sql.quote_value(default_val)
-  end
-  table.insert(parts, col_def)
-
-  local ddl_sql = table.concat(parts, " ")
+  local adapter_kind = adapters.kind(db.resolved_url(url))
+  local ddl_sql = build_add_column_sql(table_name, col_name, col_type, default_val, adapter_kind)
 
   confirm_ddl("Add Column", ddl_sql, function()
     local _, err = db.execute(ddl_sql, url)
@@ -424,6 +457,9 @@ end
 -- Exposed for testing
 M._build_create_sql = build_create_sql
 M._build_drop_sql = build_drop_sql
+M._build_rename_column_sql = build_rename_column_sql
+M._build_rename_table_sql = build_rename_table_sql
+M._build_add_column_sql = build_add_column_sql
 M._filter_referencing = filter_referencing
 
 return M

@@ -187,6 +187,26 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     assert(not next_result, "temporary table survived a new sqlcmd invocation")
     assert(next_err and next_err ~= "", "missing-object error was not reported")
   end)
+
+  test("SQL Server DDL renames and adds columns through sp_rename and ADD", function()
+    local ddl = require("dadbod-grip.ddl")
+    db.execute("DROP TABLE IF EXISTS grip_live_ddl_renamed", URL)
+    db.execute("DROP TABLE IF EXISTS grip_live_ddl", URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE grip_live_ddl (id INT PRIMARY KEY, name NVARCHAR(40))", URL))
+      assert(db.execute(ddl._build_rename_column_sql("grip_live_ddl", "name", "full_name", "sqlserver"), URL))
+      assert(db.execute(ddl._build_add_column_sql("grip_live_ddl", "bio", "NVARCHAR(100)", "none", "sqlserver"), URL))
+      assert(db.execute(ddl._build_rename_table_sql("grip_live_ddl", "grip_live_ddl_renamed", "sqlserver"), URL))
+      local names = {}
+      for _, col in ipairs(assert(db.get_column_info("grip_live_ddl_renamed", URL))) do
+        names[#names + 1] = col.column_name
+      end
+      eq(table.concat(names, ","), "id,full_name,bio", "columns after DDL")
+    end)
+    db.execute("DROP TABLE IF EXISTS grip_live_ddl_renamed", URL)
+    db.execute("DROP TABLE IF EXISTS grip_live_ddl", URL)
+    if not ok then error(err) end
+  end)
 end
 
 print(string.format("\nlive_workflow_spec: %d passed, %d failed", pass, fail))

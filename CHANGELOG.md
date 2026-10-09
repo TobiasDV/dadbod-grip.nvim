@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations from the editability check.
 - Avoid copying the remaining SQL for each dollar-quoted string while
   checking query editability, avoiding quadratic copying for large lists.
+- Rename columns and tables and add columns on SQL Server. T-SQL has no
+  `RENAME` clause and spells `ADD COLUMN` as `ADD`, so these now go through
+  `sp_rename` and `ADD`.
 
 ## [3.11.0] - 2026-08-31
 
