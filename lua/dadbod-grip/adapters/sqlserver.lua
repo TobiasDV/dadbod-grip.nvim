@@ -112,7 +112,9 @@ local function sqlcmd_stdin(sql_str, opts)
   opts = opts or {}
   local session = "SET QUOTED_IDENTIFIER ON;\n"
   if opts.nocount ~= false then session = session .. "SET NOCOUNT ON;\n" end
-  return session .. sql_str
+  -- go-sqlcmd ignores a last stdin line with no newline, so without it the
+  -- statement never runs and the query comes back as an empty grid.
+  return session .. sql_str .. "\n"
 end
 
 --- opts.env for one sqlcmd invocation: SQLCMDPASSWORD carrying the password so

@@ -232,6 +232,18 @@ test("sqlserver: sqlcmd runs with -b (without it the server exits 0 on errors)",
   end)
 end)
 
+test("sqlserver: sqlcmd stdin ends with a newline (go-sqlcmd skips an unterminated line)", function()
+  with_executable(function()
+    for _, case in ipairs({
+      { "query", function() sqlserver.query("SELECT 1", URL) end },
+      { "execute", function() sqlserver.execute("UPDATE dbo.users SET age = 1", URL) end },
+    }) do
+      local args = capture_system_args("id\n--\n1\n", case[2])
+      eq(args._stdin:sub(-1), "\n", case[1] .. " stdin is newline-terminated")
+    end
+  end)
+end)
+
 -- ── get_column_info ─────────────────────────────────────────────────────────
 
 local COLUMN_INFO_OUT = lines({
