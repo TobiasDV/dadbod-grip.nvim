@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Send SQL Server statements containing `$(` as written. sqlcmd took them for
   scripting variables and substituted or rejected them.
+- Open JSON cells exactly as stored in the float editor and in `gB`. Both
+  pretty-printed the value and saved the reformatted text, so editing one field
+  rewrote the whole document with sorted keys and numbers rounded through a
+  Lua double (`12345678901234567890` became `9.223372036854776e+18`).
 - Guard query-grid edits against aliased columns, computed projections, and
   bare SQL value expressions such as `CURRENT_TIMESTAMP` that can target an
   unrelated same-named column (#77). Preserve direct Unicode column references

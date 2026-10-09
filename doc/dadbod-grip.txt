@@ -587,7 +587,7 @@ EDITING ~
                   a taller float. Long values wrap at word boundaries.
                   Footer updates live: INSERT hint vs NORMAL hint.
   gB              Open cell value in a full split buffer
-                  JSON is pretty-printed with ft=json; :w stages the
+                  JSON opens as stored with ft=json; :w stages the
                   change. Read-only grids open in view mode (q closes).
                   See |grip-cell-buffer|.
   x               Set cell to NULL
@@ -799,16 +799,18 @@ Press `gB` on a cell to open its value in a real split buffer (named
 grip://cell/<table>/<row>/<column>) instead of the small float editor.
 Built for large values: big JSON documents, long text.
 
-  - JSON values are pretty-printed with 2-space indent and ft=json
-    (syntax highlighting and folding work as usual).
+  - JSON values open exactly as stored, with ft=json (syntax highlighting
+    and folding work as usual). They are not pretty-printed, because :w
+    writes the buffer back and a reformat would sort the keys and round
+    large numbers. To reformat on purpose, run a formatter such as
+    `:%!jq .` before saving.
   - Prose columns (body, description, notes, content, text, bio) open
     with ft=markdown; everything else stays plain.
   - Multiline values round-trip exactly: the grid displays newlines as a
     return symbol, the buffer edits the real thing.
   - :w stages the buffer content as a change to that cell (nothing
     touches the database until `a`). Saving without textual changes
-    stages nothing ("No changes"), so pretty-printed JSON never produces
-    whitespace-only diffs.
+    stages nothing ("No changes").
   - NULL cells open empty. Save non-empty text to stage it; to keep the
     cell NULL just close without saving (:q).
   - On read-only grids the buffer opens in view mode and `q` closes it.
