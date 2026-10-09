@@ -9,6 +9,7 @@ local esc = sql_util.escape_literal
 local M = { readonly = true }
 
 local DEFAULT_TIMEOUT = 30000
+local MAX_VALUE_WIDTH = 8000
 
 local function decode_query_value(value)
   return (value:gsub("+", " "):gsub("%%(%x%x)", function(hex)
@@ -79,6 +80,9 @@ local function sqlcmd_args(parsed)
     -- URL explicitly opts into -C. Mandatory is the secure default.
     "-N" .. ({ optional = "o", mandatory = "m", strict = "s" })[parsed.encrypt or "mandatory"],
     "-W",
+    -- Without -y, (max) columns are cut to 256 characters. 8000 is the most
+    -- go-sqlcmd accepts; -y 0 would also drop the header row the parser reads.
+    "-y", tostring(MAX_VALUE_WIDTH),
     "-s", "\t",
     -- Without -b sqlcmd exits 0 even when the server rejects the statement, so
     -- every `code ~= 0` guard below would be dead and a refused DROP would be

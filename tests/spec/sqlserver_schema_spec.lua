@@ -244,6 +244,17 @@ test("sqlserver: sqlcmd stdin ends with a newline (go-sqlcmd skips an unterminat
   end)
 end)
 
+test("sqlserver: sqlcmd runs with -y 8000 (the default cuts (max) values to 256)", function()
+  with_executable(function()
+    local args = capture_system_args("id\n--\n1\n", function() sqlserver.query("SELECT 1", URL) end)
+    local width
+    for i, a in ipairs(args) do
+      if a == "-y" then width = args[i + 1] end
+    end
+    eq(width, "8000", "-y width: " .. table.concat(args, " "))
+  end)
+end)
+
 -- ── get_column_info ─────────────────────────────────────────────────────────
 
 local COLUMN_INFO_OUT = lines({
