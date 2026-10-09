@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Edit SQL Server grids. Edits, inserts, and deletes apply in one
+  `SET XACT_ABORT ON` transaction and can be undone. Values are written as
+  `N'...'`, so text outside the database code page is not stored as `?`, and
+  undoing a delete restores an IDENTITY key. A grid holding a tab, a newline,
+  or an 8000-character value opens read-only. With `"mode": "ro"`, grip
+  refuses its own writes and warns that SQL Server cannot back that with a
+  read-only session.
+
 ### Fixed
 
 - Guard query-grid edits against aliased columns, computed projections, and

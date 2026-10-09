@@ -99,7 +99,7 @@ function M.setup(bufnr, ctx)
       res.primary_keys = db.get_primary_keys(fk_info.ref_table, session_fk.state.url) or {}
       -- Same connection as the grid we jumped from: a read-only one stays
       -- read-only on the referenced table too.
-      res.readonly = db.is_readonly(session_fk.state.url)
+      res.readonly = res.readonly == true or db.is_readonly(session_fk.state.url)
       res.table_name = fk_info.ref_table
       res.url = session_fk.state.url
       res.sql = ref_sql

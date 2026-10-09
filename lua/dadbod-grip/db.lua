@@ -458,8 +458,7 @@ function M.get_constraints(table_name, url)
 end
 
 --- Returns true when the grid must not be editable: either the adapter
---- intentionally exposes read-only grids (sqlserver), or the connection is
---- saved with `"mode": "ro"`.
+--- declares `readonly = true`, or the connection is saved with `"mode": "ro"`.
 ---
 --- `url` is passed through as given -- the stored, possibly templated form --
 --- because that is the key connection entries live under; see

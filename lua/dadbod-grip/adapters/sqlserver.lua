@@ -1,12 +1,12 @@
 -- adapters/sqlserver.lua: SQL Server adapter (sqlcmd CLI).
--- Read-only grid support for v1. All functions return (result, err).
+-- All functions return (result, err).
 
 local adapters = require("dadbod-grip.adapters")
 local db_util  = require("dadbod-grip.db")
 local sql_util = require("dadbod-grip.sql")
 local esc = sql_util.escape_literal
 
-local M = { readonly = true }
+local M = {}
 
 local DEFAULT_TIMEOUT = 30000
 local MAX_VALUE_WIDTH = 8000
@@ -169,6 +169,16 @@ local function sqlcmd_error(stdout, stderr, code)
   return "sqlcmd exited with code " .. tostring(code)
 end
 
+--- Number of UTF-8 characters in s: every byte that is not a continuation byte.
+local function char_count(s)
+  return select(2, s:gsub("[^\128-\191]", ""))
+end
+
+--- `lossy` is set when the rows cannot be trusted to match the server's values,
+--- which makes the grid read-only (see M.query). sqlcmd does not quote fields:
+--- a tab or newline inside a value shifts or splits its row, so an edit could
+--- put the wrong value in the WHERE clause. A value at the -y width may have
+--- been cut off, and writing it back would truncate it.
 local function parse_sqlcmd_table(raw)
   if not raw or raw == "" then
     return { columns = {}, rows = {} }
@@ -195,16 +205,23 @@ local function parse_sqlcmd_table(raw)
 
   local columns = split(lines[1])
   local rows = {}
+  local lossy = false
   for i = 2, #lines do
     local sep_probe = lines[i]:gsub("[\t%s%-]", "")
     if not (sep_probe == "" and lines[i]:find("-", 1, true)) then
       local row = split(lines[i])
+      if #row ~= #columns then lossy = true end
+      for _, field in ipairs(row) do
+        if #field >= MAX_VALUE_WIDTH and char_count(field) >= MAX_VALUE_WIDTH then
+          lossy = true
+        end
+      end
       while #row < #columns do table.insert(row, "") end
       table.insert(rows, row)
     end
   end
 
-  return { columns = columns, rows = rows }
+  return { columns = columns, rows = rows, lossy = lossy }
 end
 
 --- Translate the LIMIT/OFFSET tail emitted by the shared query builder into
@@ -283,12 +300,26 @@ function M.query(sql_str, url)
     rows = parsed.rows,
     columns = parsed.columns,
     primary_keys = {},
+    readonly = parsed.lossy or nil,
   }, nil
+end
+
+--- SQL Server has no read-only session for a client to request, so
+--- `"mode": "ro"` is enforced on grip's side only: the grid, the DDL guards,
+--- and execute() below. A statement that reaches the server through query()
+--- instead, such as EXEC or a GO-separated batch, is limited only by the
+--- login's permissions. See adapters.readonly_caveat.
+function M.readonly_caveat(_url)
+  return "SQL Server has no read-only session, so EXEC or a batch from the"
+    .. " query pad still runs"
 end
 
 function M.execute(sql_str, url)
   if vim.fn.executable("sqlcmd") == 0 then
     return nil, "sqlcmd not found. Install Microsoft sqlcmd tools."
+  end
+  if adapters.session_opts().readonly then
+    return nil, "read-only connection: statement not run"
   end
   local parsed, parse_err = parse_url(url)
   if not parsed then return nil, parse_err end

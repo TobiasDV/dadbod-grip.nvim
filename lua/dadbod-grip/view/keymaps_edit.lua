@@ -195,7 +195,7 @@ function M.setup(bufnr, ctx)
         "&Yes\n&No", 2)
       if choice ~= 1 then return end
       local txn = sql.wrap_transaction(reverse,
-        require("dadbod-grip.adapters").kind(session.url))
+        require("dadbod-grip.adapters").kind(db.resolved_url(session.url)))
       local _, err = db.execute(txn, session.url)
       if err then
         vim.notify("Undo failed: " .. err, vim.log.levels.ERROR)

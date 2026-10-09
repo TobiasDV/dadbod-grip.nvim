@@ -617,22 +617,24 @@ local function do_apply(bufnr, url)
     return
   end
 
-  -- Build all statements
+  -- Build all statements. The dialect needs the real scheme, so a templated
+  -- URL is resolved first (see ddl.drop_table).
   local stmts = {}
+  local adapter_kind = adapters.kind(db.resolved_url(url))
 
   -- Deletes first (avoids FK conflicts with inserts)
   for _, del in ipairs(deletes) do
-    table.insert(stmts, sql.build_delete(st.table_name, del.pk_values))
+    table.insert(stmts, sql.build_delete(st.table_name, del.pk_values, adapter_kind))
   end
   for _, upd in ipairs(updates) do
-    table.insert(stmts, sql.build_update(st.table_name, upd.pk_values, upd.changes))
+    table.insert(stmts, sql.build_update(st.table_name, upd.pk_values, upd.changes, adapter_kind))
   end
   for _, ins in ipairs(inserts) do
-    table.insert(stmts, sql.build_insert(st.table_name, ins.values, ins.columns))
+    table.insert(stmts, sql.build_insert(st.table_name, ins.values, ins.columns, adapter_kind))
   end
 
   -- Wrap in transaction for atomicity (all or nothing)
-  local txn_sql = sql.wrap_transaction(stmts, require("dadbod-grip.adapters").kind(url))
+  local txn_sql = sql.wrap_transaction(stmts, adapter_kind)
   local t_apply = vim.uv.hrtime()
   local _, err = db.execute(txn_sql, url)
   local apply_ms = math.floor((vim.uv.hrtime() - t_apply) / 1e6)
@@ -660,7 +662,7 @@ local function do_apply(bufnr, url)
     for _, col in ipairs(st.columns) do
       row_values[col] = data.from_csv_raw(st.rows[del.row_idx][col_idx[col]])
     end
-    table.insert(reverse_stmts, sql.build_insert(st.table_name, row_values, st.columns))
+    table.insert(reverse_stmts, sql.build_reinsert(st.table_name, row_values, st.columns, adapter_kind))
   end
 
   -- Reverse of UPDATE = UPDATE with original pre-change values
@@ -669,7 +671,7 @@ local function do_apply(bufnr, url)
     for col, _ in pairs(upd.changes) do
       orig_values[col] = data.from_csv_raw(st.rows[upd.row_idx][col_idx[col]])
     end
-    table.insert(reverse_stmts, sql.build_update(st.table_name, upd.pk_values, orig_values))
+    table.insert(reverse_stmts, sql.build_update(st.table_name, upd.pk_values, orig_values, adapter_kind))
   end
 
   -- Reverse of INSERT = DELETE by PK.
@@ -689,7 +691,8 @@ local function do_apply(bufnr, url)
       local where_parts = {}
       for col, val in pairs(ins.values) do
         if not pk_set[col] and val and val ~= "" and val ~= data.NULL_SENTINEL then
-          table.insert(where_parts, sql.quote_ident(col) .. " = " .. sql.quote_value(tostring(val)))
+          table.insert(where_parts,
+            sql.quote_ident(col) .. " = " .. sql.quote_value(tostring(val), adapter_kind))
         end
       end
       if #where_parts > 0 then
@@ -711,7 +714,7 @@ local function do_apply(bufnr, url)
     end
 
     if next(ins_pk_values) then
-      table.insert(reverse_stmts, sql.build_delete(st.table_name, ins_pk_values))
+      table.insert(reverse_stmts, sql.build_delete(st.table_name, ins_pk_values, adapter_kind))
     end
   end
 
@@ -777,8 +780,8 @@ local function fetch_refresh(url, query_sql, table_name)
     end
   end
 
-  -- Re-fetch primary keys
-  result.readonly = db.is_readonly(url)
+  -- Re-fetch primary keys. Keep a result the adapter already marked read-only.
+  result.readonly = result.readonly == true or db.is_readonly(url)
   if table_name and not result.readonly then
     local pks, pk_err = db.get_primary_keys(table_name, url)
     result.primary_keys = (pk_err == nil) and pks or {}
@@ -1058,8 +1061,8 @@ function M._mutation_preview(mutation_sql, url, stmt_type, caller_opts)
     end
   end
 
-  -- Fetch PKs
-  result.readonly = db.is_readonly(url)
+  -- Fetch PKs. Keep a result the adapter already marked read-only.
+  result.readonly = result.readonly == true or db.is_readonly(url)
   local pks = result.readonly and {} or (db.get_primary_keys(table_name, url) or {})
   result.primary_keys = pks
   result.table_name = table_name

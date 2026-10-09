@@ -37,7 +37,7 @@ CONTENTS                                                    *grip-contents*
 1. INTRODUCTION                                          *grip-introduction*
 
 dadbod-grip.nvim is a database client for Neovim with support for
-PostgreSQL, MySQL, SQLite, DuckDB, MotherDuck, and read-only SQL Server.
+PostgreSQL, MySQL, SQLite, DuckDB, MotherDuck, and SQL Server.
 Each engine gets schema browsing and metadata inspection; writable engines
 also support inline cell editing.
 
@@ -62,7 +62,7 @@ Quick start: >
   SQLite ............. sqlite3
   MySQL/MariaDB ...... mysql (both use compatible --batch output)
   DuckDB ............. duckdb
-  SQL Server ......... sqlcmd (read-only grid support in v1)
+  SQL Server ......... sqlcmd
 
 ==============================================================================
 3. INSTALLATION                                              *grip-install*
@@ -1160,7 +1160,8 @@ With `"mode": "ro"` grip connects using the client's own read-only switch:
   mysql        SET SESSION TRANSACTION READ ONLY through stdin
   sqlite       sqlite3 -readonly
   duckdb       duckdb -readonly
-  sqlserver    already read-only; `mode` does not apply
+  sqlserver    none exists; grip refuses its own writes, but EXEC or a
+               GO batch from the query pad still runs
 
 Grid editing is disabled, and the DDL entry points (|:GripCreate|,
 |:GripDrop|, |:GripRename|, |:GripFill|, the sidebar's create/drop, and the
@@ -1304,8 +1305,13 @@ based on the connection URL scheme.
   mysql:// ......... MySQL via mysql CLI
   mariadb:// ....... MariaDB via the compatible mysql CLI
   duckdb: .......... DuckDB via duckdb CLI
-  sqlserver:// ..... SQL Server via sqlcmd CLI (read-only grids)
+  sqlserver:// ..... SQL Server via sqlcmd CLI
   mssql:// ......... SQL Server via sqlcmd CLI (alias)
+
+sqlcmd prints fields without quoting, so a SQL Server grid opens read-only
+when any value contains a tab or a newline, or reaches 8000 characters (the
+widest value sqlcmd prints). Such rows cannot be split or written back
+reliably.
 
 Each adapter implements: query, execute, get_primary_keys, get_column_info,
 get_foreign_keys, get_indexes, get_table_stats, list_tables, and explain.

@@ -190,8 +190,8 @@ end
 --- a password.
 ---
 --- Optional per adapter: an adapter without a `readonly_caveat` has none, so
---- an unknown scheme and a fully-guarded one answer the same. Only postgres
---- defines one today. sqlite and duckdb have a comparable hole -- no
+--- an unknown scheme and a fully-guarded one answer the same. postgres and
+--- sqlserver define one today. sqlite and duckdb have a comparable hole -- no
 --- `-readonly` for a file that does not exist yet -- but a database that has
 --- never existed has nothing to protect, so warning there would only teach
 --- people to ignore the warning.

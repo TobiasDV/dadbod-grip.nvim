@@ -5,9 +5,11 @@ local M = {}
 
 -- Quote a value for use in SQL.
 -- nil    → NULL
--- string → 'value' with single-quote escaping
+-- string → 'value' with single-quote escaping (N'value' on sqlserver)
 -- number → n
--- bool   → TRUE / FALSE
+-- bool   → TRUE / FALSE (1 / 0 on sqlserver)
+-- On SQL Server a plain '...' literal is varchar in the database code page,
+-- so characters outside it are stored as '?'; N'...' keeps them.
 -- Escape a value for embedding in a single-quoted SQL string literal.
 -- Only the quote doubling: callers add the surrounding quotes themselves,
 -- which is what every catalog query in the adapters needs.
@@ -18,13 +20,16 @@ function M.escape_literal(v)
 end
 local escape_literal = M.escape_literal
 
-function M.quote_value(v)
+function M.quote_value(v, adapter_kind)
   if v == nil then
     return "NULL"
   elseif type(v) == "boolean" then
+    if adapter_kind == "sqlserver" then return v and "1" or "0" end
     return v and "TRUE" or "FALSE"
   elseif type(v) == "number" then
     return tostring(v)
+  elseif adapter_kind == "sqlserver" then
+    return "N'" .. escape_literal(v) .. "'"
   else
     return "'" .. escape_literal(v) .. "'"
   end
@@ -205,14 +210,14 @@ function M.parse_dadbod_url(url, default_port)
   }
 end
 
--- M.build_update(table_name, pk_values, changes) → string
+-- M.build_update(table_name, pk_values, changes, adapter_kind) → string
 -- pk_values: { col = "val", ... }
 -- changes:   { col = new_val, ... }  (data.NULL_SENTINEL means SQL NULL)
-function M.build_update(table_name, pk_values, changes)
+function M.build_update(table_name, pk_values, changes, adapter_kind)
   local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
   local set_parts = {}
   for col, val in pairs(changes) do
-    local sql_val = (val == NULL_SENTINEL) and "NULL" or M.quote_value(val)
+    local sql_val = (val == NULL_SENTINEL) and "NULL" or M.quote_value(val, adapter_kind)
     table.insert(set_parts, quote_ident(col) .. " = " .. sql_val)
   end
   -- Sort for deterministic output
@@ -223,7 +228,7 @@ function M.build_update(table_name, pk_values, changes)
     if val == nil or val == "" then
       table.insert(where_parts, quote_ident(col) .. " IS NULL")
     else
-      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(val))
+      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(val, adapter_kind))
     end
   end
   table.sort(where_parts)
@@ -236,10 +241,10 @@ function M.build_update(table_name, pk_values, changes)
   )
 end
 
--- M.build_insert(table_name, values, columns) → string
+-- M.build_insert(table_name, values, columns, adapter_kind) → string
 -- values:  { col = val, ... }  (data.NULL_SENTINEL means SQL NULL)
 -- columns: ordered list of column names (defines INSERT column order)
-function M.build_insert(table_name, values, columns)
+function M.build_insert(table_name, values, columns, adapter_kind)
   local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
   local col_parts = {}
   local val_parts = {}
@@ -250,7 +255,7 @@ function M.build_insert(table_name, values, columns)
     -- NULL_SENTINEL is non-nil and emits SQL NULL explicitly
     if val ~= nil then
       table.insert(col_parts, quote_ident(col))
-      local sql_val = (val == NULL_SENTINEL) and "NULL" or M.quote_value(val)
+      local sql_val = (val == NULL_SENTINEL) and "NULL" or M.quote_value(val, adapter_kind)
       table.insert(val_parts, sql_val)
     end
   end
@@ -268,15 +273,29 @@ function M.build_insert(table_name, values, columns)
   )
 end
 
--- M.build_delete(table_name, pk_values) → string
+-- M.build_reinsert(table_name, values, columns, adapter_kind) → string
+-- The INSERT that undoes a DELETE, original key included. SQL Server refuses
+-- an explicit IDENTITY value unless IDENTITY_INSERT is on, and refuses to turn
+-- that on for a table without an IDENTITY column, hence the OBJECTPROPERTY test.
+function M.build_reinsert(table_name, values, columns, adapter_kind)
+  local insert = M.build_insert(table_name, values, columns, adapter_kind)
+  if adapter_kind ~= "sqlserver" then return insert end
+  local ident = quote_ident(table_name)
+  local toggle = string.format(
+    "IF OBJECTPROPERTY(OBJECT_ID(N'%s'), 'TableHasIdentity') = 1 SET IDENTITY_INSERT %s",
+    escape_literal(ident), ident)
+  return toggle .. " ON;\n" .. insert .. ";\n" .. toggle .. " OFF"
+end
+
+-- M.build_delete(table_name, pk_values, adapter_kind) → string
 -- pk_values: { col = "val", ... }
-function M.build_delete(table_name, pk_values)
+function M.build_delete(table_name, pk_values, adapter_kind)
   local where_parts = {}
   for col, val in pairs(pk_values) do
     if val == nil or val == "" then
       table.insert(where_parts, quote_ident(col) .. " IS NULL")
     else
-      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(val))
+      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(val, adapter_kind))
     end
   end
   table.sort(where_parts)
@@ -288,19 +307,19 @@ function M.build_delete(table_name, pk_values)
   )
 end
 
--- M.preview_staged(table_name, updates, deletes, inserts) → string
+-- M.preview_staged(table_name, updates, deletes, inserts, adapter_kind) → string
 -- Generates a multi-line SQL preview of all staged changes.
 -- updates: from data.get_updates(), deletes: from data.get_deletes(), inserts: from data.get_inserts()
-function M.preview_staged(table_name, updates, deletes, inserts)
+function M.preview_staged(table_name, updates, deletes, inserts, adapter_kind)
   local stmts = {}
   for _, del in ipairs(deletes) do
-    table.insert(stmts, M.build_delete(table_name, del.pk_values) .. ";")
+    table.insert(stmts, M.build_delete(table_name, del.pk_values, adapter_kind) .. ";")
   end
   for _, upd in ipairs(updates) do
-    table.insert(stmts, M.build_update(table_name, upd.pk_values, upd.changes) .. ";")
+    table.insert(stmts, M.build_update(table_name, upd.pk_values, upd.changes, adapter_kind) .. ";")
   end
   for _, ins in ipairs(inserts) do
-    table.insert(stmts, M.build_insert(table_name, ins.values, ins.columns) .. ";")
+    table.insert(stmts, M.build_insert(table_name, ins.values, ins.columns, adapter_kind) .. ";")
   end
   if #stmts == 0 then return "-- no staged changes" end
   return table.concat(stmts, "\n")

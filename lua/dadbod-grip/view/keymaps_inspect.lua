@@ -50,7 +50,8 @@ function M.setup(bufnr, ctx)
       st.table_name,
       data.get_updates(st),
       data.get_deletes(st),
-      data.get_inserts(st)
+      data.get_inserts(st),
+      require("dadbod-grip.adapters").kind(db.resolved_url(st.url))
     )
     local lines = {}
     for line in (preview .. "\n"):gmatch("([^\n]*)\n") do
@@ -77,7 +78,8 @@ function M.setup(bufnr, ctx)
       st.table_name,
       data.get_updates(st),
       data.get_deletes(st),
-      data.get_inserts(st)
+      data.get_inserts(st),
+      require("dadbod-grip.adapters").kind(db.resolved_url(st.url))
     )
     vim.fn.setreg("+", preview)
     vim.notify("Copied SQL to clipboard", vim.log.levels.INFO)

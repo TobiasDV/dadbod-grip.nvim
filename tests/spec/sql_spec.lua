@@ -224,6 +224,57 @@ test("unquote_ident: roundtrip with quote_ident", function()
   eq(sql.unquote_ident(sql.quote_ident("public.users")), "public.users")
 end)
 
+-- ── sqlserver dialect ───────────────────────────────────────────────────────
+
+test("quote_value: sqlserver strings are N-prefixed", function()
+  eq(sql.quote_value("Zoë 李", "sqlserver"), "N'Zoë 李'")
+  eq(sql.quote_value("it's", "sqlserver"), "N'it''s'")
+end)
+
+test("quote_value: sqlserver booleans are 1/0", function()
+  eq(sql.quote_value(true, "sqlserver"), "1")
+  eq(sql.quote_value(false, "sqlserver"), "0")
+end)
+
+test("quote_value: other adapters are unchanged", function()
+  eq(sql.quote_value("x", "postgresql"), "'x'")
+  eq(sql.quote_value(true, "postgresql"), "TRUE")
+  eq(sql.quote_value("x"), "'x'")
+end)
+
+test("build_update: sqlserver N-prefixes values and keys", function()
+  -- A plain '...' key never matches an nvarchar value outside the code page,
+  -- which would turn the UPDATE into a silent no-op.
+  eq(sql.build_update("dbo.tags", { code = "李" }, { label = "x" }, "sqlserver"),
+    [[UPDATE "dbo"."tags" SET "label" = N'x' WHERE "code" = N'李']])
+end)
+
+test("build_insert: sqlserver N-prefixes values", function()
+  eq(sql.build_insert("orders", { product = "Mouse", customer_id = "1" }, { "customer_id", "product" }, "sqlserver"),
+    [[INSERT INTO "orders" ("customer_id", "product") VALUES (N'1', N'Mouse')]])
+end)
+
+test("build_delete: sqlserver N-prefixes keys", function()
+  eq(sql.build_delete("tags", { code = "李" }, "sqlserver"), [[DELETE FROM "tags" WHERE "code" = N'李']])
+end)
+
+test("build_reinsert: other adapters get the plain INSERT", function()
+  eq(sql.build_reinsert("t", { id = "1" }, { "id" }, "postgresql"), [[INSERT INTO "t" ("id") VALUES ('1')]])
+end)
+
+test("build_reinsert: sqlserver toggles IDENTITY_INSERT around the INSERT", function()
+  eq(sql.build_reinsert("dbo.orders", { id = "7" }, { "id" }, "sqlserver"), table.concat({
+    [[IF OBJECTPROPERTY(OBJECT_ID(N'"dbo"."orders"'), 'TableHasIdentity') = 1 SET IDENTITY_INSERT "dbo"."orders" ON;]],
+    [[INSERT INTO "dbo"."orders" ("id") VALUES (N'7');]],
+    [[IF OBJECTPROPERTY(OBJECT_ID(N'"dbo"."orders"'), 'TableHasIdentity') = 1 SET IDENTITY_INSERT "dbo"."orders" OFF]],
+  }, "\n"))
+end)
+
+test("preview_staged: shows the adapter's SQL", function()
+  local preview = sql.preview_staged("t", { { pk_values = { id = "1" }, changes = { a = "é" } } }, {}, {}, "sqlserver")
+  contains(preview, "N'é'")
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\nsql_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

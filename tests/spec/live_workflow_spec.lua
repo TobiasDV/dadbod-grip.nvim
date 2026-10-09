@@ -187,6 +187,42 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     assert(not next_result, "temporary table survived a new sqlcmd invocation")
     assert(next_err and next_err ~= "", "missing-object error was not reported")
   end)
+
+  test("SQL Server staged writes keep Unicode keys and undo IDENTITY deletes", function()
+    local probe = "grip_live_nprobe"
+    local function apply(stmts)
+      return db.execute(sql.wrap_transaction(stmts, "sqlserver"), URL)
+    end
+    local function rows()
+      return assert(db.query("SELECT id, code, label FROM " .. probe .. " ORDER BY id", URL)).rows
+    end
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe
+        .. " (id INT IDENTITY(1,1) PRIMARY KEY, code NVARCHAR(20) UNIQUE, label NVARCHAR(40))", URL))
+      local columns = { "id", "code", "label" }
+      assert(apply({ sql.build_insert(probe, { code = "李", label = "first" }, columns, "sqlserver") }))
+      eq(rows()[1][2], "李", "Unicode value stored, not '?'")
+
+      -- A Unicode key must match, or the UPDATE is a silent no-op.
+      assert(apply({ sql.build_update(probe, { code = "李" }, { label = "Zoë" }, "sqlserver") }))
+      eq(rows()[1][3], "Zoë", "update matched the Unicode key")
+
+      local before = rows()[1]
+      assert(apply({ sql.build_delete(probe, { id = before[1] }, "sqlserver") }))
+      eq(#rows(), 0, "row deleted")
+      local values = { id = before[1], code = before[2], label = before[3] }
+      assert(apply({ sql.build_reinsert(probe, values, columns, "sqlserver") }))
+      eq(rows()[1][1], before[1], "undo restored the original IDENTITY key")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server grids with a multi-line value open read-only", function()
+    local result = assert(db.query("SELECT 1 AS id, N'line one' + CHAR(10) + N'line two' AS note", URL))
+    eq(result.readonly, true, "a split row must not be editable")
+  end)
 end
 
 print(string.format("\nlive_workflow_spec: %d passed, %d failed", pass, fail))

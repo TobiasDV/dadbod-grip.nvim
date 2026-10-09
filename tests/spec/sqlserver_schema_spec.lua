@@ -255,6 +255,75 @@ test("sqlserver: sqlcmd runs with -y 8000 (the default cuts (max) values to 256)
   end)
 end)
 
+-- ── editable grids ──────────────────────────────────────────────────────────
+
+test("sqlserver: grids are editable (no adapter-wide readonly)", function()
+  eq(sqlserver.readonly, nil)
+  eq(require("dadbod-grip.db").is_readonly(URL), false)
+end)
+
+test("sqlserver query: clean output stays editable", function()
+  with_executable(function()
+    with_system_mock(lines({ "id\tname", "--\t----", "1\tAlice", "2\tNULL" }), "", 0, function()
+      local r = sqlserver.query("SELECT id, name FROM dbo.users", URL)
+      eq(#r.rows, 2)
+      eq(r.rows[2][2], "", "NULL is an empty cell")
+      eq(r.readonly, nil)
+    end)
+  end)
+end)
+
+test("sqlserver query: a newline inside a value makes the grid read-only", function()
+  with_executable(function()
+    with_system_mock(lines({ "id\tnote\tqty", "--\t----\t---", "1\tline one", "line two\t5" }), "", 0, function()
+      eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, true)
+    end)
+  end)
+end)
+
+test("sqlserver query: a tab inside a value makes the grid read-only", function()
+  with_executable(function()
+    with_system_mock(lines({ "id\tnote", "--\t----", "1\ta\tb" }), "", 0, function()
+      eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, true)
+    end)
+  end)
+end)
+
+test("sqlserver query: a value at the -y width makes the grid read-only", function()
+  with_executable(function()
+    local cut = string.rep("x", 8000)
+    with_system_mock(lines({ "id\tnote", "--\t----", "1\t" .. cut }), "", 0, function()
+      eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, true)
+    end)
+    -- 4000 two-byte characters is 8000 bytes but well under the width.
+    local wide = string.rep("é", 4000)
+    with_system_mock(lines({ "id\tnote", "--\t----", "1\t" .. wide }), "", 0, function()
+      eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, nil)
+    end)
+  end)
+end)
+
+test("sqlserver execute: a read-only connection never reaches sqlcmd", function()
+  local adapters = require("dadbod-grip.adapters")
+  with_executable(function()
+    local spawned = false
+    local orig = vim.system
+    vim.system = function() spawned = true end
+    local previous = adapters.set_call_readonly(true)
+    local ok, result, err = pcall(sqlserver.execute, "DELETE FROM dbo.users", URL)
+    adapters.set_call_readonly(previous)
+    vim.system = orig
+    assert(ok, result)
+    eq(result, nil)
+    contains(err, "read-only")
+    eq(spawned, false, "sqlcmd spawned")
+  end)
+end)
+
+test("sqlserver: declares a readonly_caveat", function()
+  contains(sqlserver.readonly_caveat(URL), "no read-only session")
+end)
+
 -- ── get_column_info ─────────────────────────────────────────────────────────
 
 local COLUMN_INFO_OUT = lines({

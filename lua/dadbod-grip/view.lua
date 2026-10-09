@@ -972,7 +972,8 @@ function M._update_live_sql_float(session)
       st.table_name,
       data.get_updates(st),
       data.get_deletes(st),
-      data.get_inserts(st)
+      data.get_inserts(st),
+      require("dadbod-grip.adapters").kind(db.resolved_url(st.url))
     )
     content_lines = {}
     for line in (preview .. "\n"):gmatch("([^\n]*)\n") do
@@ -2360,7 +2361,7 @@ function M._fk_referencing(bufnr)
       res.primary_keys = db.get_primary_keys(ref.table, session.state.url) or {}
       -- FK navigation lands on a different table but the same connection, so a
       -- read-only one stays read-only here too.
-      res.readonly = db.is_readonly(session.state.url)
+      res.readonly = res.readonly == true or db.is_readonly(session.state.url)
       res.table_name = ref.table
       res.url = session.state.url
       res.sql = ref_sql
