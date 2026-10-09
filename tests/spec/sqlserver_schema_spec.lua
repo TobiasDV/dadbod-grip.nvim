@@ -368,6 +368,17 @@ test("sqlserver query: a JSON page keeps tabs, newlines, exact numbers and hex b
   end)
 end)
 
+test("sqlserver query: a server warning after a JSON page is not a row", function()
+  with_executable(function()
+    local out = JSON_PAGE_OUT .. "Warning: Null value is eliminated by an aggregate or other SET operation.\n"
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "notes" LIMIT 100', URL))
+      eq(#r.rows, 2)
+      eq(r.readonly, nil)
+    end)
+  end)
+end)
+
 test("sqlserver query: an empty JSON page still has its columns", function()
   with_executable(function()
     local out = lines({ "name\tsystem_type_name", "----\t----------------", "id\tint", "", "_grip_json", "----------" })

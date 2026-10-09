@@ -393,13 +393,13 @@ local function parse_json_page(raw)
     columns[i], types[i] = row[1], row[2] or ""
   end
 
+  -- Every row is one line starting with "{": JSON escapes the newlines inside
+  -- values. Other lines are the column header, its dashes, and server
+  -- messages such as "Warning: Null value is eliminated by an aggregate".
   local rows = {}
-  local line_no = 0
   for line in raw:sub(split + 1):gmatch("[^\r\n]+") do
-    line_no = line_no + 1
     line = vim.trim(line)
-    -- The first two lines are the JSON column's header and its dashes.
-    if line_no > 2 and line ~= "" then
+    if line:sub(1, 1) == "{" then
       local keys, values = decode_json_row(line)
       if not keys or #keys ~= #columns then return nil end
       local row = {}
