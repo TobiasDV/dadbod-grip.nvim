@@ -832,19 +832,14 @@ local function do_edit(bufnr, cell, url)
   local edited_row_idx = cell.row_idx
   local edited_col    = cell.col_name
 
-  -- JSON-aware edit: pretty-print JSON/jsonb before opening the editor.
-  -- On save, the (still-valid JSON) value is written back as-is.
+  -- JSON cells open as stored, not pretty-printed: the editor's text is what
+  -- gets saved, and a decode/re-encode would sort the keys and round numbers
+  -- through a Lua double.
   local initial_val = cell.value
   local is_json = false
   if initial_val and #initial_val > 1 then
     local json_ok, json_decoded = pcall(vim.fn.json_decode, initial_val)
-    if json_ok and type(json_decoded) == "table" then
-      is_json = true
-      local json_lines = view._json_to_lines and view._json_to_lines(json_decoded)
-      if json_lines and #json_lines > 0 then
-        initial_val = table.concat(json_lines, "\n")
-      end
-    end
+    is_json = json_ok and type(json_decoded) == "table"
   end
 
   -- JSON cells get a taller/wider float with JSON syntax highlighting

@@ -1,8 +1,8 @@
 -- cell_buffer.lua: open a cell value in a full split buffer (issue #18).
 --
 -- gB on a grid cell opens the value in a real window split instead of the
--- small float editor: large JSON gets pretty-printed with ft=json (syntax,
--- folding), prose columns get ft=markdown. :w stages the buffer content back
+-- small float editor: JSON opens as stored with ft=json (syntax, folding),
+-- prose columns get ft=markdown. :w stages the buffer content back
 -- into the grid session via data.add_change — it never writes to the DB.
 -- Read-only grids open the buffer in view mode (q closes).
 --
@@ -97,19 +97,21 @@ local function try_json(value)
 end
 
 --- Render a cell value into buffer lines plus a filetype.
---- JSON objects/arrays are pretty-printed (2-space indent, ft=json);
---- prose-named columns get ft=markdown; everything else stays plain.
+--- The text is the stored value as-is: :w writes the whole buffer back, and a
+--- pretty-printed JSON would come back with sorted keys and numbers rounded
+--- through a Lua double. JSON objects/arrays get ft=json; prose-named columns
+--- get ft=markdown; everything else stays plain.
 --- @param value string|nil  cell value (nil = NULL)
 --- @param col_name string|nil
 --- @return table lines, string|nil ft
 function M.render_value(value, col_name)
   if value == nil then return { "" }, nil end
-  local decoded = try_json(value)
-  if decoded then
-    return pretty_lines(decoded, 0), "json"
-  end
   local ft
-  if col_name and PROSE_COLUMNS[col_name:lower()] then ft = "markdown" end
+  if try_json(value) then
+    ft = "json"
+  elseif col_name and PROSE_COLUMNS[col_name:lower()] then
+    ft = "markdown"
+  end
   return vim.split(value, "\n", { plain = true }), ft
 end
 
@@ -168,10 +170,9 @@ function M.open(grid_bufnr)
   vim.api.nvim_set_option_value("buftype", "acwrite", { buf = buf })
   vim.api.nvim_set_option_value("modified", false, { buf = buf })
 
-  -- Baseline text: what the buffer opened with (pretty-printed for JSON).
-  -- :w with content identical to the baseline stages nothing — this keeps
-  -- pretty-printing from producing whitespace-only diffs. Updated after each
-  -- successful stage so repeated :w stays quiet.
+  -- Baseline text: what the buffer opened with. :w with content identical to
+  -- the baseline stages nothing. Updated after each successful stage so
+  -- repeated :w stays quiet.
   local baseline = table.concat(lines, "\n")
 
   vim.api.nvim_create_autocmd("BufWriteCmd", {
