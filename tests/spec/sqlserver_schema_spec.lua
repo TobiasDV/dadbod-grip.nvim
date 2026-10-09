@@ -273,7 +273,7 @@ test("sqlserver query: clean output stays editable", function()
   end)
 end)
 
-test("sqlserver query: a newline inside a value makes the grid read-only", function()
+test("sqlserver text output: a newline inside a value makes the grid read-only", function()
   with_executable(function()
     with_system_mock(lines({ "id\tnote\tqty", "--\t----\t---", "1\tline one", "line two\t5" }), "", 0, function()
       eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, true)
@@ -281,7 +281,7 @@ test("sqlserver query: a newline inside a value makes the grid read-only", funct
   end)
 end)
 
-test("sqlserver query: a tab inside a value makes the grid read-only", function()
+test("sqlserver text output: a tab inside a value makes the grid read-only", function()
   with_executable(function()
     with_system_mock(lines({ "id\tnote", "--\t----", "1\ta\tb" }), "", 0, function()
       eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, true)
@@ -289,7 +289,7 @@ test("sqlserver query: a tab inside a value makes the grid read-only", function(
   end)
 end)
 
-test("sqlserver query: a value at the -y width makes the grid read-only", function()
+test("sqlserver text output: a value at the -y width makes the grid read-only", function()
   with_executable(function()
     local cut = string.rep("x", 8000)
     with_system_mock(lines({ "id\tnote", "--\t----", "1\t" .. cut }), "", 0, function()
@@ -300,6 +300,122 @@ test("sqlserver query: a value at the -y width makes the grid read-only", functi
     with_system_mock(lines({ "id\tnote", "--\t----", "1\t" .. wide }), "", 0, function()
       eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, nil)
     end)
+  end)
+end)
+
+-- ── JSON pages ──────────────────────────────────────────────────────────────
+
+local JSON_PAGE_OUT = lines({
+  "name\tsystem_type_name",
+  "----\t----------------",
+  "id\tint",
+  "note\tnvarchar(max)",
+  "blob\tvarbinary(max)",
+  "ratio\tfloat",
+  "",
+  "_grip_json",
+  "----------",
+  [[{"id":1,"note":"line one\nline two\ttabbed","blob":"3q2+7w==","ratio":1.500000000000000e+000}]],
+  [[{"id":9223372036854775807,"note":null,"blob":null,"ratio":null}]],
+})
+
+test("sqlserver json_page_sql: grid queries are rewritten, everything else is not", function()
+  local table_sql = sqlserver._json_page_sql(
+    'SELECT * FROM "dbo"."my ""t""" WHERE ("id" > 1) ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY')
+  contains(table_sql, [[SELECT (SELECT "dbo"."my ""t""".* FOR JSON PATH]], "table rows")
+  contains(table_sql, [[FROM "dbo"."my ""t""" WHERE ("id" > 1) ORDER BY]], "original tail kept")
+  contains(table_sql, [[dm_exec_describe_first_result_set(N'SELECT * FROM "dbo"]], "described first")
+
+  local raw_sql = sqlserver._json_page_sql("SELECT * FROM (SELECT 'a' AS x) AS _grip ORDER BY (SELECT NULL)")
+  contains(raw_sql, "SELECT (SELECT _grip.* FOR JSON PATH", "raw wrapper rows")
+  contains(raw_sql, "N'SELECT * FROM (SELECT ''a'' AS x) AS _grip", "describe literal escaped")
+
+  eq(sqlserver._json_page_sql("SELECT id FROM dbo.users"), nil, "explicit column list")
+  eq(sqlserver._json_page_sql("SELECT * FROM dbo.users"), nil, "unquoted name")
+  eq(sqlserver._json_page_sql("SELECT * FROM (SELECT 1 AS x) AS t"), nil, "foreign wrapper")
+  eq(sqlserver._json_page_sql("EXEC sp_who"), nil, "not a SELECT")
+end)
+
+test("sqlserver decode_json_row: values keep their exact text", function()
+  local keys, values = sqlserver._decode_json_row(
+    [[{"a":"x\"y\\z\/","b":-12.3400,"c":true,"d":false,"e":null,"f":"é"}]])
+  eq(table.concat(keys, ","), "a,b,c,d,e,f")
+  eq(values[1], [[x"y\z/]], "escapes")
+  eq(values[2], "-12.3400", "number text")
+  eq(values[3], "1", "true")
+  eq(values[4], "0", "false")
+  eq(values[5], "", "null")
+  eq(values[6], "é", "unicode escape")
+
+  eq(sqlserver._decode_json_row([[{"a":{"b":1}}]]), nil, "nested object")
+  eq(sqlserver._decode_json_row([[{"a":"cut off]]), nil, "truncated row")
+  eq(sqlserver._decode_json_row([[{"a":1}x]]), nil, "trailing text")
+end)
+
+test("sqlserver query: a JSON page keeps tabs, newlines, exact numbers and hex binaries", function()
+  with_executable(function()
+    with_system_mock(JSON_PAGE_OUT, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "notes" LIMIT 100', URL))
+      eq(table.concat(r.columns, ","), "id,note,blob,ratio")
+      eq(#r.rows, 2)
+      eq(r.rows[1][2], "line one\nline two\ttabbed", "value intact")
+      eq(r.rows[1][3], "0xDEADBEEF", "base64 shown as hex")
+      eq(r.rows[1][4], "1.5", "float shortened")
+      eq(r.rows[2][1], "9223372036854775807", "bigint exact")
+      eq(r.rows[2][2], "", "NULL is an empty cell")
+      eq(r.readonly, nil, "editable")
+    end)
+  end)
+end)
+
+test("sqlserver query: an empty JSON page still has its columns", function()
+  with_executable(function()
+    local out = lines({ "name\tsystem_type_name", "----\t----------------", "id\tint", "", "_grip_json", "----------" })
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "notes" LIMIT 100', URL))
+      eq(table.concat(r.columns, ","), "id")
+      eq(#r.rows, 0)
+    end)
+  end)
+end)
+
+test("sqlserver query: a page JSON cannot carry falls back to the text output", function()
+  with_executable(function()
+    local calls = {}
+    local orig = vim.system
+    vim.system = function(_args, opts, cb)
+      calls[#calls + 1] = opts.stdin
+      local r = #calls == 1
+        and { stdout = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n", stderr = "", code = 1 }
+        or { stdout = lines({ "id\tshape", "--\t-----", "1\tPOINT (4 52)" }), stderr = "", code = 0 }
+      cb(r)
+    end
+    local ok, r, err = pcall(sqlserver.query, 'SELECT * FROM "places" LIMIT 100', URL)
+    vim.system = orig
+    assert(ok, r)
+    assert(r, err)
+    eq(#calls, 2, "text query after the JSON one")
+    contains(calls[1], "FOR JSON", "first call")
+    assert(not calls[2]:find("FOR JSON", 1, true), "second call is plain")
+    eq(r.rows[1][2], "POINT (4 52)")
+  end)
+end)
+
+test("sqlserver query: an ordinary error is not retried as text", function()
+  with_executable(function()
+    local calls = 0
+    local orig = vim.system
+    vim.system = function(_args, _opts, cb)
+      calls = calls + 1
+      local r = { stdout = "Msg 208, Level 16, State 1\nInvalid object name 'nope'.\n", stderr = "", code = 1 }
+      cb(r)
+    end
+    local ok, r, err = pcall(sqlserver.query, 'SELECT * FROM "nope" LIMIT 100', URL)
+    vim.system = orig
+    assert(ok, r)
+    eq(r, nil)
+    contains(err, "Invalid object name")
+    eq(calls, 1)
   end)
 end)
 

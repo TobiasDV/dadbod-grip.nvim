@@ -219,9 +219,31 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
-  test("SQL Server grids with a multi-line value open read-only", function()
-    local result = assert(db.query("SELECT 1 AS id, N'line one' + CHAR(10) + N'line two' AS note", URL))
-    eq(result.readonly, true, "a split row must not be editable")
+  test("SQL Server grids keep multi-line values editable", function()
+    local probe = "grip_live_multiline"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, note NVARCHAR(MAX), blob VARBINARY(8))", URL))
+      assert(db.execute("INSERT INTO " .. probe
+        .. " VALUES (1, N'line one' + CHAR(10) + N'line two' + CHAR(9) + N'tab', 0xDEADBEEF), (2, NULL, NULL)", URL))
+      local spec = query.new_table(probe, 50)
+      local page = assert(db.query(query.build_sql(spec), URL))
+      eq(page.readonly, nil, "grid editable")
+      eq(#page.rows, 2, "one row per record")
+      eq(page.rows[1][2], "line one\nline two\ttab", "value intact")
+      eq(page.rows[1][3], "0xDEADBEEF", "binary as hex")
+
+      local edited = "first\nsecond\tthird"
+      assert(db.execute(sql.wrap_transaction({
+        sql.build_update(probe, { id = page.rows[1][1] }, { note = edited }, "sqlserver"),
+      }, "sqlserver"), URL))
+      eq(assert(db.query(query.build_sql(spec), URL)).rows[1][2], edited, "edit round-trips")
+
+      local empty = assert(db.query(query.build_sql(query.add_filter(spec, '"id" < 0')), URL))
+      eq(table.concat(empty.columns, ","), "id,note,blob", "empty page keeps its columns")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
   end)
 end
 
