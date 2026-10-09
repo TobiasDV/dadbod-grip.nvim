@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CRs are written as `NCHAR(13)` because sqlcmd drops them from its input, and
   undoing a delete restores an IDENTITY key. Grid rows are fetched as JSON,
   so tabs and newlines inside values stay editable; a page that falls back to
-  sqlcmd's plain text (a row over 8000 characters, or a geography column)
-  opens read-only when it holds such a value. With `"mode": "ro"`, grip
+  sqlcmd's plain text (a row over 8000 characters) opens read-only when it
+  holds such a value. geography, geometry and hierarchyid columns show as
+  text (`POINT (4.9 52.4)`) and take that text back on save. With `"mode": "ro"`, grip
   refuses its own writes and warns that SQL Server cannot back that with a
   read-only session.
 
