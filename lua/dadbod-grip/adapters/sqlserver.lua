@@ -247,6 +247,173 @@ local function normalize_query_sql(sql_str)
   return string.format("%s OFFSET %s ROWS FETCH NEXT %s ROWS ONLY", base, offset, limit)
 end
 
+-- ── JSON pages ───────────────────────────────────────────────────────────
+-- A grid page is fetched as one FOR JSON object per row instead of sqlcmd's
+-- unquoted text, so a tab or newline inside a value arrives escaped and the
+-- grid stays editable. The same batch first describes the result set, which
+-- gives the column order, the columns of an empty page, and the types needed
+-- to print values the way the text output does.
+
+local JSON_COLUMN = "_grip_json"
+
+--- The quote_ident-style name at `pos` ("dbo"."my ""table"""), or nil.
+local function quoted_name_at(s, pos)
+  local stop = pos
+  while true do
+    local _, e = s:find('^"[^"]*"', stop)
+    if not e then _, e = s:find("^%.", stop) end
+    if not e then break end
+    stop = e + 1
+  end
+  if stop == pos then return nil end
+  return s:sub(pos, stop - 1)
+end
+
+--- Rewrite a query.build_sql statement (SELECT * over a quoted table or over
+--- the `(...) AS _grip` wrapper) into the describe + JSON batch. Its WHERE,
+--- ORDER BY and paging stay as they are. Returns nil for any other statement.
+local function json_page_sql(sql_str)
+  local body = sql_str:gsub("[%s;]+$", "")
+  local from_kw, source_pos = body:match(
+    "^%s*[Ss][Ee][Ll][Ee][Cc][Tt]%s+%*%s+()[Ff][Rr][Oo][Mm]%s+()")
+  if not from_kw then return nil end
+
+  local source
+  if body:sub(source_pos, source_pos) == "(" then
+    if not body:find("%)%s+[Aa][Ss]%s+_grip%f[^%w_]") then return nil end
+    source = "_grip"
+  else
+    source = quoted_name_at(body, source_pos)
+    if not source then return nil end
+  end
+
+  return string.format(
+    "SELECT name, system_type_name"
+      .. " FROM sys.dm_exec_describe_first_result_set(N'%s', NULL, 0) ORDER BY column_ordinal;\n"
+      .. "SELECT (SELECT %s.* FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) AS %s %s",
+    esc(body), source, JSON_COLUMN, body:sub(from_kw))
+end
+
+--- Index of the quote closing the JSON string that opens at `pos`.
+local function json_string_end(s, pos)
+  local i = pos + 1
+  while true do
+    local c = s:find('["\\]', i)
+    if not c then return nil end
+    if s:sub(c, c) == '"' then return c end
+    i = c + 2
+  end
+end
+
+--- Decode one FOR JSON row: a flat object with no whitespace between tokens.
+--- Numbers keep their exact text (a bigint or decimal would not survive a Lua
+--- number), bits become 1/0 and null becomes "", as in the text output.
+--- Returns keys, values; nil for anything else, such as the nested object a
+--- dotted column alias produces or a row cut off at the -y width.
+local function decode_json_row(line)
+  if line:sub(1, 1) ~= "{" then return nil end
+  local keys, values = {}, {}
+  local pos = 2
+  while true do
+    if line:sub(pos, pos) ~= '"' then return nil end
+    local key_end = json_string_end(line, pos)
+    if not key_end or line:sub(key_end + 1, key_end + 1) ~= ":" then return nil end
+    local ok, key = pcall(vim.json.decode, line:sub(pos, key_end))
+    if not ok then return nil end
+
+    pos = key_end + 2
+    local value, value_end
+    local c = line:sub(pos, pos)
+    if c == '"' then
+      value_end = json_string_end(line, pos)
+      if not value_end then return nil end
+      ok, value = pcall(vim.json.decode, line:sub(pos, value_end))
+      if not ok then return nil end
+    else
+      local literal = line:match("^%a+", pos)
+      if literal == "null" then value = ""
+      elseif literal == "true" then value = "1"
+      elseif literal == "false" then value = "0"
+      elseif not literal then
+        literal = line:match("^%-?%d[%d%.eE+%-]*", pos)
+        value = literal
+      end
+      if not value then return nil end
+      value_end = pos + #literal - 1
+    end
+
+    keys[#keys + 1] = key
+    values[#values + 1] = value
+    pos = value_end + 1
+    local sep = line:sub(pos, pos)
+    if sep == "}" then
+      if pos ~= #line then return nil end
+      return keys, values
+    end
+    if sep ~= "," then return nil end
+    pos = pos + 1
+  end
+end
+
+local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
+
+--- FOR JSON prints binaries as base64 and floats as 1.500000000000000e+000;
+--- show them as 0x hex and the shortest decimal that reads back the same.
+local function json_cell(value, type_name)
+  if value == "" then return value end
+  local base = (type_name:match("^%a+") or ""):lower()
+  if BINARY_TYPES[base] then
+    local ok, bytes = pcall(vim.base64.decode, value)
+    if not ok then return nil end
+    return "0x" .. bytes:gsub(".", function(b) return string.format("%02X", b:byte()) end)
+  end
+  if base == "float" or base == "real" then
+    local n = tonumber(value)
+    if not n then return nil end
+    for _, fmt in ipairs({ "%.15g", "%.16g", "%.17g" }) do
+      local s = string.format(fmt, n)
+      if tonumber(s) == n then return s end
+    end
+  end
+  return value
+end
+
+--- Parse the output of a json_page_sql batch into { columns, rows }.
+--- Returns nil when any row does not decode into exactly the described
+--- columns; the caller then falls back to the text output.
+local function parse_json_page(raw)
+  local split = (raw or ""):find("\n" .. JSON_COLUMN .. "\r?\n%-")
+  if not split then return nil end
+
+  local described = parse_sqlcmd_table(raw:sub(1, split))
+  if described.lossy or #described.rows == 0 then return nil end
+  local columns, types = {}, {}
+  for i, row in ipairs(described.rows) do
+    if row[1] == "" then return nil end
+    columns[i], types[i] = row[1], row[2] or ""
+  end
+
+  local rows = {}
+  local line_no = 0
+  for line in raw:sub(split + 1):gmatch("[^\r\n]+") do
+    line_no = line_no + 1
+    line = vim.trim(line)
+    -- The first two lines are the JSON column's header and its dashes.
+    if line_no > 2 and line ~= "" then
+      local keys, values = decode_json_row(line)
+      if not keys or #keys ~= #columns then return nil end
+      local row = {}
+      for i, key in ipairs(keys) do
+        if key ~= columns[i] then return nil end
+        row[i] = json_cell(values[i], types[i])
+        if not row[i] then return nil end
+      end
+      rows[#rows + 1] = row
+    end
+  end
+  return { columns = columns, rows = rows }
+end
+
 local function run_query(sql_str, url, timeout_ms)
   if vim.fn.executable("sqlcmd") == 0 then
     return nil, "sqlcmd not found. Install Microsoft sqlcmd tools."
@@ -255,7 +422,22 @@ local function run_query(sql_str, url, timeout_ms)
   local parsed, parse_err = parse_url(url)
   if not parsed then return nil, parse_err end
 
-  local stdout, stderr, code = sqlcmd(parsed, normalize_query_sql(sql_str), timeout_ms)
+  local query_sql = normalize_query_sql(sql_str)
+  local page_sql = json_page_sql(query_sql)
+  if page_sql then
+    local stdout, stderr, code = sqlcmd(parsed, page_sql, timeout_ms)
+    if code == 0 then
+      local page = parse_json_page(stdout)
+      if page then return page, nil end
+    else
+      local err = sqlcmd_error(stdout, stderr, code)
+      -- FOR JSON refuses CLR columns such as geography, which the text
+      -- output can still show; any other error would fail there too.
+      if not err:find("FOR JSON", 1, true) then return nil, err end
+    end
+  end
+
+  local stdout, stderr, code = sqlcmd(parsed, query_sql, timeout_ms)
   if code ~= 0 then
     return nil, sqlcmd_error(stdout, stderr, code)
   end
@@ -672,5 +854,8 @@ M._sqlcmd_args = sqlcmd_args
 M._sqlcmd_env = sqlcmd_env
 M._sqlcmd_stdin = sqlcmd_stdin
 M._normalize_query_sql = normalize_query_sql
+M._json_page_sql = json_page_sql
+M._decode_json_row = decode_json_row
+M._parse_json_page = parse_json_page
 
 return M

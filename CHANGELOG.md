@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Edit SQL Server grids. Edits, inserts, and deletes apply in one
   `SET XACT_ABORT ON` transaction and can be undone. Values are written as
   `N'...'`, so text outside the database code page is not stored as `?`, and
-  undoing a delete restores an IDENTITY key. A grid holding a tab, a newline,
-  or an 8000-character value opens read-only. With `"mode": "ro"`, grip
+  undoing a delete restores an IDENTITY key. Grid rows are fetched as JSON,
+  so tabs and newlines inside values stay editable; a page that falls back to
+  sqlcmd's plain text (a row over 8000 characters, or a geography column)
+  opens read-only when it holds such a value. With `"mode": "ro"`, grip
   refuses its own writes and warns that SQL Server cannot back that with a
   read-only session.
 
