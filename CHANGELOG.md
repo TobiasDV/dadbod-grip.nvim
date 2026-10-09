@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every grid came back empty.
 - Show SQL Server `varchar(max)` and `nvarchar(max)` values up to 8000
   characters. sqlcmd cut them to 256 by default.
+- Rename columns and tables and add columns on SQL Server. T-SQL has no
+  `RENAME` clause and spells `ADD COLUMN` as `ADD`, so these now go through
+  `sp_rename` and `ADD`.
 
 ## [3.11.0] - 2026-08-31
 
