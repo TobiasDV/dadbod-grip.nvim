@@ -260,6 +260,27 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server values over 8000 characters stay whole and editable", function()
+    local probe = "grip_live_long"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, body NVARCHAR(MAX))", URL))
+      assert(db.execute("INSERT INTO " .. probe
+        .. " VALUES (1, REPLICATE(CAST(N'a' AS NVARCHAR(MAX)), 30000) + NCHAR(10) + N'end')", URL))
+      local spec = query.new_table(probe, 50)
+      local page = assert(db.query(query.build_sql(spec), URL))
+      eq(page.readonly, nil, "editable")
+      eq(#page.rows[1][2], 30004, "whole value")
+      local edited = page.rows[1][2] .. "!"
+      assert(db.execute(sql.wrap_transaction({
+        sql.build_update(probe, { id = "1" }, { body = edited }, "sqlserver"),
+      }, "sqlserver"), URL))
+      eq(assert(db.query(query.build_sql(spec), URL)).rows[1][2], edited, "round-trip")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server geography columns load as editable text", function()
     local probe = "grip_live_places"
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
