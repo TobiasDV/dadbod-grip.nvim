@@ -770,7 +770,7 @@ local WELCOME_GROUPS = {
   Statement    = function(text) return text:match("^:Grip%S*$") ~= nil end,
   -- Keymap keys and --flags: always one whitespace-free token.
   Identifier   = function(text) return text:match("^%S+$") ~= nil end,
-  GripModified = function(text) return text == "yellow = modified" end,
+  GripModified = function(text) return text == "violet = modified" end,
   GripInserted = function(text) return text == "green = inserted" end,
   GripDeleted  = function(text) return text == "red = deleted" end,
 }
@@ -908,7 +908,7 @@ test("open_welcome: title and legend marks carry the right range and priority", 
   -- Legend phrases sit at explicit priority 200 so they win over syntax
   -- highlighting on the same line (see hl_phrase() in init.lua).
   for _, spec in ipairs({
-    { group = "GripModified", phrase = "yellow = modified" },
+    { group = "GripModified", phrase = "violet = modified" },
     { group = "GripInserted", phrase = "green = inserted" },
     { group = "GripDeleted",  phrase = "red = deleted" },
   }) do

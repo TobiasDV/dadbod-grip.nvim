@@ -105,7 +105,17 @@ end
 -- ── highlight groups ────────────────────────────────────────────────────────
 
 local function ensure_diff_highlights()
-  require("dadbod-grip.theme").apply()
+  local groups = {
+    GripDiffChanged = "gui=bold ctermfg=229 guifg=#f9e2af",
+    GripDiffAdded   = "gui=bold ctermfg=113 guifg=#a6e3a1",
+    GripDiffDeleted = "gui=bold ctermfg=203 guifg=#f38ba8",
+    GripDiffSep     = "gui=bold ctermfg=243 guifg=#6c7086",
+  }
+  for name, attrs in pairs(groups) do
+    if vim.fn.hlID(name) == 0 then
+      vim.cmd("hi " .. name .. " " .. attrs)
+    end
+  end
 end
 
 -- ── wide (columnar) diff rendering ──────────────────────────────────────────

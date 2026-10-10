@@ -10,7 +10,6 @@
 :GripExport	dadbod-grip.txt	/*:GripExport*
 :GripFill	dadbod-grip.txt	/*:GripFill*
 :GripHome	dadbod-grip.txt	/*:GripHome*
-:GripImport	dadbod-grip.txt	/*:GripImport*
 :GripLoad	dadbod-grip.txt	/*:GripLoad*
 :GripOpen	dadbod-grip.txt	/*:GripOpen*
 :GripProfile	dadbod-grip.txt	/*:GripProfile*
@@ -70,7 +69,6 @@ grip-sort-filter	dadbod-grip.txt	/*grip-sort-filter*
 grip-sort-filter-page	dadbod-grip.txt	/*grip-sort-filter-page*
 grip-sticky-header	dadbod-grip.txt	/*grip-sticky-header*
 grip-tab-views	dadbod-grip.txt	/*grip-tab-views*
-grip-theme	dadbod-grip.txt	/*grip-theme*
 grip-visual-mode	dadbod-grip.txt	/*grip-visual-mode*
 grip-workflow	dadbod-grip.txt	/*grip-workflow*
 grip-yanking	dadbod-grip.txt	/*grip-yanking*

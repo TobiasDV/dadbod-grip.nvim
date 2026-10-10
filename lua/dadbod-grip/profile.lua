@@ -608,7 +608,9 @@ end
 -- ── buffer display ────────────────────────────────────────────────────────────
 
 local function ensure_profile_highlights()
-  require("dadbod-grip.theme").apply()
+  if vim.fn.hlID("GripProfileHeader") == 0 then
+    vim.cmd("hi GripProfileHeader gui=bold ctermfg=75 guifg=#89b4fa")
+  end
 end
 
 --- Open a profiling report for a table.
