@@ -312,7 +312,8 @@ end
 --- Build the data query SQL from a spec. opts.paginate=false preserves the
 --- active filters and sorts but omits LIMIT/OFFSET (used by all-row export).
 function M.build_sql(spec, opts)
-  if spec.passthrough then return spec.base_sql end
+  -- prefix (e.g. a row cap) shares the first line, keeping error lines right.
+  if spec.passthrough then return (spec.prefix or "") .. spec.base_sql end
   local parts = {}
 
   -- FROM clause
