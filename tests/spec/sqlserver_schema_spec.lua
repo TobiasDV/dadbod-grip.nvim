@@ -34,6 +34,15 @@ end
 
 -- ── mock helpers ─────────────────────────────────────────────────────────────
 
+--- What sqlcmd was given to run: the -i script file's contents, or stdin.
+--- Read inside the mock, since the adapter removes the file afterwards.
+local function script_of(args, opts)
+  for i, a in ipairs(args) do
+    if a == "-i" then return table.concat(vim.fn.readfile(args[i + 1], "b"), "\n") end
+  end
+  return opts and opts.stdin
+end
+
 local function with_system_mock(stdout, stderr, code, fn)
   local orig = vim.system
   vim.system = function(_args, _opts, cb)
@@ -50,7 +59,7 @@ local function capture_system_args(stdout, fn)
   local orig = vim.system
   vim.system = function(args, opts, cb)
     captured = args
-    captured._stdin = opts and opts.stdin
+    captured._stdin = script_of(args, opts)
     local r = { stdout = stdout or "", stderr = "", code = 0 }
     if cb then cb(r) else return { wait = function() return r end } end
   end
@@ -232,7 +241,32 @@ test("sqlserver: sqlcmd runs with -b (without it the server exits 0 on errors)",
   end)
 end)
 
-test("sqlserver: sqlcmd stdin ends with a newline (go-sqlcmd skips an unterminated line)", function()
+test("sqlserver: statements reach sqlcmd as a script file, never through stdin", function()
+  with_executable(function()
+    local args, script, path, piped
+    local orig = vim.system
+    vim.system = function(a, opts, cb)
+      args = a
+      for i, v in ipairs(a) do
+        if v == "-i" then path = a[i + 1] end
+      end
+      script = path and table.concat(vim.fn.readfile(path, "b"), "\n")
+      piped = opts and opts.stdin
+      cb({ stdout = "(1 row affected)\n", stderr = "", code = 0 })
+    end
+    -- Microsoft's ODBC sqlcmd breaks a line read from a pipe every ~4096 bytes.
+    local long = string.rep("x", 5000)
+    local ok, err = pcall(sqlserver.execute, "UPDATE t SET v = N'" .. long .. "'", URL)
+    vim.system = orig
+    assert(ok, err)
+    assert(path, "-i missing: " .. table.concat(args, " "))
+    eq(piped, nil, "nothing on stdin")
+    contains(script, long, "the statement, its line unbroken")
+    eq(vim.fn.filereadable(path), 0, "script file removed afterwards")
+  end)
+end)
+
+test("sqlserver: sqlcmd script ends with a newline (go-sqlcmd skips an unterminated line on stdin)", function()
   with_executable(function()
     for _, case in ipairs({
       { "query", function() sqlserver.query("SELECT 1", URL) end },
@@ -290,8 +324,8 @@ end)
 local function with_replies(replies, fn)
   local calls = {}
   local orig = vim.system
-  vim.system = function(_args, opts, cb)
-    calls[#calls + 1] = opts.stdin
+  vim.system = function(args, opts, cb)
+    calls[#calls + 1] = script_of(args, opts)
     local reply = replies[#calls] or replies[#replies]
     cb({ stdout = reply[1], stderr = "", code = reply[2] })
   end

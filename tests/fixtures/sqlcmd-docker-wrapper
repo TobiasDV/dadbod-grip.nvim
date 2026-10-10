@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # sqlcmd runs inside the container, so a host path supplied with `-i` is not
-# visible there. Remove that pair and stream the file over the already-open
-# stdin channel instead. `-e SQLCMDPASSWORD` inherits the value without putting
-# it in Docker's argv.
+# visible there. Copy the file in and point -i at the copy: streaming it over
+# stdin instead would let sqlcmd break every line longer than ~4096 bytes.
+# `-e SQLCMDPASSWORD` inherits the value without putting it in Docker's argv.
 input_file=""
 args=()
 while (($#)); do
@@ -19,8 +19,13 @@ while (($#)); do
 done
 
 if [[ -n "$input_file" ]]; then
-  exec docker exec -i -e SQLCMDPASSWORD grip-sqlserver \
-    /opt/mssql-tools18/bin/sqlcmd "${args[@]}" < "$input_file"
+  target="/tmp/grip-script-$$.sql"
+  docker cp "$input_file" "grip-sqlserver:$target" >/dev/null
+  status=0
+  docker exec -i -e SQLCMDPASSWORD grip-sqlserver \
+    /opt/mssql-tools18/bin/sqlcmd "${args[@]}" -i "$target" || status=$?
+  docker exec -u 0 grip-sqlserver rm -f "$target"
+  exit "$status"
 fi
 
 exec docker exec -i -e SQLCMDPASSWORD grip-sqlserver \
