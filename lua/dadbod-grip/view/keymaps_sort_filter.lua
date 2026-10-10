@@ -9,6 +9,24 @@ local ui     = require("dadbod-grip.ui")
 
 local M = {}
 
+--- The adapter kind of a grid's connection, for kind-specific SQL literals.
+local function kind_of(session)
+  local db = require("dadbod-grip.db")
+  return require("dadbod-grip.adapters").kind(db.resolved_url(session.url or session.state.url))
+end
+
+--- Refuse sorting a column SQL Server cannot sort (text, xml, geography, ...).
+local function sortable(session, col_name)
+  local st = session.state
+  if st.incomparable_columns and st.incomparable_columns[col_name] then
+    local ty = st.column_types and st.column_types[col_name] or "this type"
+    vim.notify("Cannot sort " .. col_name .. ": the database cannot order " .. ty .. " values",
+      vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
 --- Sorting, filtering, filter presets, export-to-file and pagination.
 function M.setup(bufnr, ctx)
   local view = ctx.view
@@ -36,6 +54,7 @@ function M.setup(bufnr, ctx)
       vim.notify("Move cursor to a column to sort", vim.log.levels.INFO)
       return
     end
+    if not sortable(session_s, col_name) then return end
     if not confirm_discard_changes("Sort") then return end
     local new_spec = qmod.toggle_sort(session_s.query_spec, col_name)
     if session_s.on_requery then session_s.on_requery(bufnr, new_spec) end
@@ -50,6 +69,7 @@ function M.setup(bufnr, ctx)
       vim.notify("Move cursor to a column to sort", vim.log.levels.INFO)
       return
     end
+    if not sortable(session_s, col_name) then return end
     if not confirm_discard_changes("Sort") then return end
     local new_spec = qmod.add_sort(session_s.query_spec, col_name)
     if session_s.on_requery then session_s.on_requery(bufnr, new_spec) end
@@ -65,7 +85,10 @@ function M.setup(bufnr, ctx)
       return
     end
     if not confirm_discard_changes("Filter") then return end
-    local new_spec = qmod.quick_filter(session_f.query_spec, cell.col_name, cell.value)
+    local new_spec = qmod.quick_filter(session_f.query_spec, cell.col_name, cell.value, {
+      kind = kind_of(session_f),
+      type = session_f.state.column_types and session_f.state.column_types[cell.col_name],
+    })
     if session_f.on_requery then session_f.on_requery(bufnr, new_spec) end
     local display = cell.value and (cell.col_name .. " = " .. tostring(cell.value):sub(1, 30)) or (cell.col_name .. " IS NULL")
     vim.notify("Filtered: " .. display, vim.log.levels.INFO)
@@ -142,7 +165,7 @@ function M.setup(bufnr, ctx)
       value = val
     end
 
-    local ok3, clause = pcall(qmod.build_filter_clause, col_name, op, value)
+    local ok3, clause = pcall(qmod.build_filter_clause, col_name, op, value, kind_of(session_gF))
     if not ok3 then
       vim.notify("Invalid filter: " .. tostring(clause), vim.log.levels.WARN)
       return

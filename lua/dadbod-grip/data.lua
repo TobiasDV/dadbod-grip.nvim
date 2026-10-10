@@ -9,6 +9,12 @@ local M = {}
 local NULL_SENTINEL = "\0NULL\0"
 M.NULL_SENTINEL = NULL_SENTINEL  -- exposed so sql.lua / view.lua can check
 
+-- A staged or original real empty string. Only adapters that can tell '' from
+-- NULL (SQL Server's JSON pages, through state.empty_cells) produce it; for
+-- the others "" keeps meaning NULL.
+local EMPTY = "\0EMPTY\0"
+M.EMPTY = EMPTY
+
 -- M.from_csv_raw(raw) → value ready for sql.build_*() functions
 -- Normalizes a raw CSV cell value for use in undo SQL generation.
 -- All adapters (PostgreSQL, MySQL, SQLite, DuckDB) represent NULL as ""
@@ -87,6 +93,10 @@ local function edit_copy(state)
     readonly         = state.readonly,
     readonly_reason  = state.readonly_reason,
     incomparable_columns = state.incomparable_columns,
+    column_types     = state.column_types,
+    generated_columns = state.generated_columns,
+    required_text_columns = state.required_text_columns,
+    empty_cells      = state.empty_cells,
   }
 end
 
@@ -119,6 +129,14 @@ function M.new(query_result)
       or (query_result.readonly == true and "connection" or "no PK")) or nil,
     -- Columns the database cannot compare with =, kept out of value lookups.
     incomparable_columns = query_result.incomparable_columns,
+    -- { col = type name } where the adapter knows it (binary values need it).
+    column_types = query_result.column_types,
+    -- Columns no INSERT or UPDATE may name: computed, rowversion, period.
+    generated_columns = query_result.generated_columns,
+    -- NOT NULL character columns: clearing one there means ''.
+    required_text_columns = query_result.required_text_columns,
+    -- { [row_idx] = { [col_idx] = true } }: which "" cells hold a real ''.
+    empty_cells = query_result.empty_cells,
   }
 end
 
@@ -127,7 +145,7 @@ end
 -- key survives in the Lua table (assigning nil would remove it).
 function M.add_change(state, row_idx, field, value)
   local s = edit_copy(state)
-  -- Empty string and explicit nil both become NULL
+  -- Empty string and explicit nil both become NULL; EMPTY stays a real ''
   local stored = (value == nil or value == "") and NULL_SENTINEL or value
   -- Inserted rows: write directly into inserted.values (not changes table)
   if s.inserted[row_idx] then
@@ -193,8 +211,14 @@ function M.clone_row(state, row_idx)
   for _, col in ipairs(s.columns) do
     if not pk_set[col] then
       local v = M.effective_value(state, row_idx, col)
-      -- Skip nil and "": both represent NULL in original rows (psql --csv quirk)
-      if v ~= nil and v ~= "" then values[col] = v end
+      -- nil is NULL: leave it out. "" only comes back for a real empty string.
+      if s.generated_columns and s.generated_columns[col] then -- luacheck: ignore 542
+        -- computed, rowversion, period: the database fills these
+      elseif v == "" then
+        values[col] = EMPTY
+      elseif v ~= nil then
+        values[col] = v
+      end
     end
     -- PK columns: omit so DB SERIAL/AUTO_INCREMENT generates a new ID on commit
   end
@@ -233,6 +257,7 @@ function M.get_updates(state)
       for _, pk in ipairs(state.pks) do
         local idx = col_idx[pk]
         pk_values[pk] = idx and state.rows[row_idx][idx] or nil
+        if pk_values[pk] == "" and M.original_value(state, row_idx, pk) == EMPTY then pk_values[pk] = EMPTY end
       end
 
       -- Keep NULL_SENTINEL as-is; sql.lua checks for it and emits NULL
@@ -278,6 +303,7 @@ function M.get_deletes(state)
       for _, pk in ipairs(state.pks) do
         local idx = col_idx[pk]
         pk_values[pk] = idx and state.rows[row_idx][idx] or nil
+        if pk_values[pk] == "" and M.original_value(state, row_idx, pk) == EMPTY then pk_values[pk] = EMPTY end
       end
       table.insert(deletes, { row_idx = row_idx, pk_values = pk_values })
     end
@@ -308,6 +334,7 @@ function M.effective_value(state, row_idx, field)
   if state.inserted[row_idx] then
     local v = state.inserted[row_idx].values[field]
     if v == NULL_SENTINEL then return nil end
+    if v == EMPTY then return "" end
     return v
   end
 
@@ -316,6 +343,7 @@ function M.effective_value(state, row_idx, field)
     local staged = state.changes[row_idx][field]
     if staged ~= nil then
       if staged == NULL_SENTINEL then return nil end
+      if staged == EMPTY then return "" end
       return staged
     end
   end
@@ -329,8 +357,40 @@ function M.effective_value(state, row_idx, field)
   -- distinction is not recoverable here, so "" uniformly means NULL.
   -- NOTE: must be an explicit if — `raw == "" and nil or raw` is the classic
   -- and/or trap: (true and nil) short-circuits to the or-branch and returns "".
-  if raw == "" then return nil end
+  if raw == "" then
+    local marks = state.empty_cells and state.empty_cells[row_idx]
+    if marks and marks[idx] then return "" end
+    return nil
+  end
   return raw
+end
+
+-- M.original_value(state, row_idx, field) → the loaded value, ready for
+-- sql.value_sql: NULL_SENTINEL for NULL, EMPTY for a real '', else the text.
+function M.original_value(state, row_idx, field)
+  local idx = col_index_map(state.columns)[field]
+  local raw = idx and state.rows[row_idx] and state.rows[row_idx][idx]
+  if raw == nil or raw == "" then
+    local marks = state.empty_cells and state.empty_cells[row_idx]
+    if raw == "" and marks and marks[idx] then return EMPTY end
+    return NULL_SENTINEL
+  end
+  return raw
+end
+
+-- M.cleared_value(state, row_idx, field) → what an emptied editor saves:
+-- '' (EMPTY) in a NOT NULL character column or a cell that already held '',
+-- else nil for NULL.
+function M.cleared_value(state, row_idx, field)
+  if state.required_text_columns and state.required_text_columns[field] then return EMPTY end
+  if M.effective_value(state, row_idx, field) == "" then return EMPTY end
+  return nil
+end
+
+-- M.column_writable(state, field) → false for computed, rowversion and period
+-- columns, which no INSERT or UPDATE may name.
+function M.column_writable(state, field)
+  return not (state.generated_columns and state.generated_columns[field])
 end
 
 -- M.count_staged(state) → int (total staged operations)

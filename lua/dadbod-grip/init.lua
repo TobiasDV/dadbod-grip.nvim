@@ -449,6 +449,23 @@ local function resolve_query(arg, page_size, adapter_kind)
     return query.new_raw(file_sql, page_size), nil, path
   end
 
+  -- SQL Server refuses much of what people type inside the paging wrapper:
+  -- its adapter says what can be wrapped and what must run as written.
+  if adapter_kind == "sqlserver" then
+    local plan = require("dadbod-grip.adapters.sqlserver").plan_query(arg)
+    if plan and plan.kind == "passthrough" then
+      local spec = query.new_passthrough(arg, page_size)
+      spec.writes = plan.writes
+      return spec, nil
+    elseif plan then
+      local spec = query.new_raw(plan.sql, page_size)
+      spec.sorts = plan.sorts
+      -- What to run as written if the server rejects the wrapped query.
+      spec.source_sql = arg
+      return spec, select_editable_table(plan.sql, adapter_kind)
+    end
+  end
+
   -- Detect statement type
   local upper = arg:upper():match("^%s*(%u+)")
   if upper == "SELECT" or upper == "TABLE" then
@@ -488,6 +505,8 @@ local function resolve_query(arg, page_size, adapter_kind)
   -- Otherwise treat as table name
   return query.new_table(arg, page_size), arg
 end
+
+M._resolve_query = resolve_query
 
 -- ── file write-back ───────────────────────────────────────────────────────
 -- Applies staged changes to a local file by creating a temp table, mutating it,
@@ -619,18 +638,14 @@ local function do_apply(bufnr, url)
 
   -- Build all statements. The dialect needs the real scheme, so a templated
   -- URL is resolved first (see ddl.drop_table).
-  local stmts = {}
   local adapter_kind = adapters.kind(db.resolved_url(url))
-
-  -- Deletes first (avoids FK conflicts with inserts)
-  for _, del in ipairs(deletes) do
-    table.insert(stmts, sql.build_delete(st.table_name, del.pk_values, adapter_kind))
-  end
-  for _, upd in ipairs(updates) do
-    table.insert(stmts, sql.build_update(st.table_name, upd.pk_values, upd.changes, adapter_kind))
-  end
-  for _, ins in ipairs(inserts) do
-    table.insert(stmts, sql.build_insert(st.table_name, ins.values, ins.columns, adapter_kind))
+  local stmts = sql.build_apply(st, adapter_kind)
+  -- Computed before the apply, from the rows as loaded.
+  local reverse_stmts, irreversible = sql.build_undo(st, adapter_kind)
+  if #irreversible > 0 and vim.fn.confirm(string.format(
+      "%d deleted row(s) hold a binary value over 8000 bytes that the grid never loaded,\n"
+      .. "so u cannot put them back. Apply anyway?", #irreversible), "&Yes\n&No", 2) ~= 1 then
+    return
   end
 
   -- Wrap in transaction for atomicity (all or nothing)
@@ -651,28 +666,8 @@ local function do_apply(bufnr, url)
     return
   end
 
-  -- Success: compute reverse SQL for transaction undo before clearing staging
-  local reverse_stmts = {}
-  local col_idx = {}
-  for i, col in ipairs(st.columns) do col_idx[col] = i end
-
-  -- Reverse of DELETE = INSERT with full original row data
-  for _, del in ipairs(deletes) do
-    local row_values = {}
-    for _, col in ipairs(st.columns) do
-      row_values[col] = data.from_csv_raw(st.rows[del.row_idx][col_idx[col]])
-    end
-    table.insert(reverse_stmts, sql.build_reinsert(st.table_name, row_values, st.columns, adapter_kind))
-  end
-
-  -- Reverse of UPDATE = UPDATE with original pre-change values
-  for _, upd in ipairs(updates) do
-    local orig_values = {}
-    for col, _ in pairs(upd.changes) do
-      orig_values[col] = data.from_csv_raw(st.rows[upd.row_idx][col_idx[col]])
-    end
-    table.insert(reverse_stmts, sql.build_update(st.table_name, upd.pk_values, orig_values, adapter_kind))
-  end
+  -- Success: the reverse of the deletes and updates is in reverse_stmts
+  -- (built above, from the rows as loaded).
 
   -- Reverse of INSERT = DELETE by PK.
   -- If the user typed an explicit PK (plain INSERT), use it directly.
@@ -687,7 +682,7 @@ local function do_apply(bufnr, url)
     if not next(ins_pk_values) and #st.pks > 0 then
       -- Auto-assigned PK: locate the row by non-PK values (best-effort)
       local find_sql = sql.build_insert_lookup(st.table_name, st.pks, ins.values,
-        st.incomparable_columns, adapter_kind)
+        st.incomparable_columns, adapter_kind, sql.state_opts(st))
       if find_sql then
         local r, _ = db.query(find_sql, url)
         if r and r.rows and r.rows[1] then
@@ -699,7 +694,7 @@ local function do_apply(bufnr, url)
     end
 
     if next(ins_pk_values) then
-      table.insert(reverse_stmts, sql.build_delete(st.table_name, ins_pk_values, adapter_kind))
+      table.insert(reverse_stmts, sql.build_delete(st.table_name, ins_pk_values, adapter_kind, sql.state_opts(st)))
     end
   end
 
@@ -782,6 +777,17 @@ end
 
 --- Render what fetch_refresh returned. Kept outside the spinner float so the
 --- grid repaints after it is torn down, the same order init.open() uses.
+--- Fetch a grid's first page. A wrapped raw query the server rejects (an
+--- unnamed column, an ORDER BY the wrapper cannot hold, ...) runs again as
+--- written, read-only; if that fails too, its error is the one to show.
+--- Returns fetched, the spec used, the table name used.
+function M._fetch_grid(url, spec, table_name)
+  local fetched = fetch_refresh(url, query.build_sql(spec), table_name)
+  if fetched.result or not spec.source_sql then return fetched, spec, table_name end
+  local as_written = query.new_passthrough(spec.source_sql, spec.page_size)
+  return fetch_refresh(url, query.build_sql(as_written), nil), as_written, nil
+end
+
 local function apply_refresh(bufnr, fetched)
   if not fetched or not fetched.result then
     vim.notify("Grip: query failed: " .. tostring((fetched and fetched.err) or "unknown error"),
@@ -813,6 +819,11 @@ local function do_edit(bufnr, cell, url)
   local val = cell.value or ""
   if val:sub(1, #"<binary") == "<binary" then
     vim.notify("Binary column: not editable", vim.log.levels.INFO)
+    return
+  end
+
+  if not data.column_writable(session.state, cell.col_name) then
+    vim.notify(cell.col_name .. " is computed by the database: not editable", vim.log.levels.INFO)
     return
   end
 
@@ -868,6 +879,21 @@ local function do_edit(bufnr, cell, url)
     if new_val == nil then  -- cancelled
       _restore(_pre_cursor)
       return
+    end
+
+    -- An emptied editor means '' where the column or the cell says so
+    -- (data.cleared_value), else NULL.
+    if new_val == editor.NULL_VALUE then
+      local cleared = data.cleared_value(session.state, cell.row_idx, cell.col_name)
+      if cleared == data.EMPTY then
+        if cell.value == "" then
+          _restore(_pre_cursor)
+          return
+        end
+        view.apply_edit(bufnr, data.add_change(session.state, cell.row_idx, cell.col_name, data.EMPTY))
+        _restore(_pre_cursor)
+        return
+      end
     end
 
     -- Skip staging if nothing actually changed
@@ -1246,6 +1272,12 @@ function M.open(arg, url, opts)
     return
   end
 
+  if spec.passthrough and spec.writes and vim.fn.confirm(
+      "This batch changes data or schema. Run it?\n\n" .. spec.base_sql:sub(1, 300),
+      "&Run\n&Cancel", 2) ~= 1 then
+    return
+  end
+
   local query_sql = query.build_sql(spec)
 
   -- Run query with loading indicator + timing
@@ -1259,9 +1291,11 @@ function M.open(arg, url, opts)
   -- before the grid ever appeared -- which reads as the plugin hanging.
   local fetched, total_rows
   ui.blocking("  querying " .. short_label .. "...", function()
-    fetched = fetch_refresh(conn, query_sql, table_name_arg)
+    fetched, spec, table_name_arg = M._fetch_grid(conn, spec, table_name_arg)
+    query_sql = query.build_sql(spec)
     if not fetched.result then return end
-    local count_result = db.query(query.build_count_sql(spec), conn)
+    local count_sql = query.build_count_sql(spec)
+    local count_result = count_sql and db.query(count_sql, conn)
     if count_result and count_result.rows[1] then
       total_rows = tonumber(count_result.rows[1][1]) or 0
     end
@@ -1274,6 +1308,11 @@ function M.open(arg, url, opts)
   end
   local elapsed_ms = fetched.elapsed_ms
   result.elapsed_ms = elapsed_ms
+  if #result.columns == 0 and result.messages then
+    -- A batch that printed but returned no rows (EXEC of a procedure, PRINT).
+    vim.notify(table.concat(result.messages, "\n"), vim.log.levels.INFO)
+    return
+  end
 
   local history = require("dadbod-grip.history")
   history.record({ sql = query_sql, url = conn, table_name = table_name_arg, type = "query", elapsed_ms = elapsed_ms })
@@ -1330,6 +1369,10 @@ function M.open(arg, url, opts)
     on_refresh = function(bid)
       local s = view._sessions[bid]
       if not s then return end
+      if s.query_spec and s.query_spec.passthrough and s.query_spec.writes then
+        vim.notify("Refreshing would run this batch again; run it from the query pad", vim.log.levels.WARN)
+        return
+      end
       -- Read current table name from session state (may have been updated by rename)
       local current_table = (s.state and s.state.table_name) or table_name_arg
       local sql_str = s.query_spec and query.build_sql(s.query_spec) or query_sql
@@ -1338,6 +1381,11 @@ function M.open(arg, url, opts)
     on_requery = function(bid, new_spec)
       local s = view._sessions[bid]
       if not s then return end
+      if new_spec.passthrough then
+        vim.notify("Sort, filter and pages need a single SELECT; this grid shows a batch as it ran",
+          vim.log.levels.WARN)
+        return
+      end
 
       -- Sort / filter / page changes are two round-trips (COUNT then the page
       -- itself). Both run inside one spinner: do_refresh's own float would

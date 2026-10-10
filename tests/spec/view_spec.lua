@@ -200,6 +200,22 @@ test("get_cell: value is nil for NULL original cell (fk-follow NULL guard)", fun
   cleanup()
 end)
 
+test("render: a filter on a multi-line value renders on one line", function()
+  cleanup()
+  local st = data.new({
+    columns = { "id", "body" }, rows = { { "1", "a\nb" } }, primary_keys = { "id" },
+    table_name = "notes", url = "sqlserver://localhost/db",
+  })
+  local spec = require("dadbod-grip.query").add_filter(require("dadbod-grip.query").new_table("notes", 10),
+    [["body" = N'a]] .. "\r\n" .. [[b']])
+  local bufnr = view.open(st, st.url, "SELECT 1", { query_spec = spec })
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local found = false
+  for _, l in ipairs(lines) do if l:find("a↵b", 1, true) then found = true end end
+  assert(found, "filter line shows ↵: " .. table.concat(lines, "|"))
+  cleanup()
+end)
+
 -- ── summary ──────────────────────────────────────────────────────────────────
 
 print(string.format("\nview_spec: %d passed, %d failed", pass, fail))

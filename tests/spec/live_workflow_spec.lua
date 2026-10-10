@@ -360,6 +360,249 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  -- A grid over `probe` as the editor builds it, and the apply/undo the a and u
+  -- keys run, so these tests go through the same statements.
+  local function grid(probe)
+    local page = assert(db.query(query.build_sql(query.new_table(probe, 50)), URL))
+    page.primary_keys = db.get_primary_keys(probe, URL)
+    page.table_name = probe
+    return data.new(page)
+  end
+  local function run(stmts)
+    if #stmts == 0 then return end
+    local _, run_err = db.execute(sql.wrap_transaction(stmts, "sqlserver"), URL)
+    assert(not run_err, run_err)
+  end
+  local function apply_grid(st)
+    local undo, irreversible = sql.build_undo(st, "sqlserver")
+    run(sql.build_apply(st, "sqlserver"))
+    return undo, irreversible
+  end
+  local function dump(q)
+    local out = {}
+    for _, row in ipairs(assert(db.query(q, URL)).rows) do out[#out + 1] = table.concat(row, "|") end
+    return table.concat(out, "\n")
+  end
+
+  test("SQL Server keeps empty strings apart from NULL through edit, delete and undo", function()
+    local probe = "grip_live_empties"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe
+        .. " (id INT PRIMARY KEY, req NVARCHAR(10) NOT NULL, opt NVARCHAR(10) NULL)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'', NULL), (2, N'x', N'')", URL))
+      local function snap()
+        return dump("SELECT id, ISNULL(req, '<null>'), ISNULL(opt, '<null>') FROM " .. probe .. " ORDER BY id")
+      end
+      local before = snap()
+      local st = grid(probe)
+      eq(data.effective_value(st, 1, "req"), "", "'' reads as ''")
+      eq(data.effective_value(st, 1, "opt"), nil, "NULL reads as NULL")
+
+      local undo = apply_grid(data.toggle_delete(st, 1))
+      eq(dump("SELECT COUNT(*) FROM " .. probe), "1", "deleted")
+      run(undo)
+      eq(snap(), before, "undo of the delete")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server undo restores '' after an edit, and clearing NOT NULL text writes ''", function()
+    local probe = "grip_live_empties2"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe
+        .. " (id INT PRIMARY KEY, req NVARCHAR(10) NOT NULL, opt NVARCHAR(10) NULL)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'', NULL), (2, N'x', N'')", URL))
+      local function snap()
+        return dump("SELECT id, ISNULL(req, '<null>'), ISNULL(opt, '<null>') FROM " .. probe .. " ORDER BY id")
+      end
+      local before = snap()
+      run((apply_grid(data.add_change(grid(probe), 2, "opt", "y"))))
+      eq(snap(), before, "undo of an edit to a '' cell")
+
+      local st = grid(probe)
+      apply_grid(data.add_change(st, 2, "req", data.cleared_value(st, 2, "req")))
+      eq(dump("SELECT COUNT(*) FROM " .. probe .. " WHERE id = 2 AND req = ''"), "1", "req is ''")
+
+      st = data.clone_row(grid(probe), 1)
+      st = data.add_change(st, st._next_insert_idx - 1, "id", "3")
+      apply_grid(st)
+      eq(dump("SELECT ISNULL(req, '<null>') FROM " .. probe .. " WHERE id = 3"), "", "clone kept ''")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server clones and undoes deletes past computed, rowversion and period columns", function()
+    local probe, temporal = "grip_live_generated", "grip_live_temporal"
+    local function drop()
+      db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+      db.execute("IF OBJECT_ID('" .. temporal .. "') IS NOT NULL ALTER TABLE " .. temporal
+        .. " SET (SYSTEM_VERSIONING = OFF)", URL)
+      db.execute("DROP TABLE IF EXISTS " .. temporal, URL)
+      db.execute("DROP TABLE IF EXISTS " .. temporal .. "_history", URL)
+    end
+    drop()
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe
+        .. " (id INT IDENTITY(1,1) PRIMARY KEY, qty INT NOT NULL, total AS qty * 2, rv ROWVERSION)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " (qty) VALUES (5)", URL))
+      local st = grid(probe)
+      eq(st.generated_columns.total, true, "computed reported")
+      eq(st.generated_columns.rv, true, "rowversion reported")
+      apply_grid(data.clone_row(st, 1))
+      eq(dump("SELECT COUNT(*) FROM " .. probe .. " WHERE qty = 5"), "2", "clone inserted")
+      local undo = apply_grid(data.toggle_delete(grid(probe), 1))
+      run(undo)
+      eq(dump("SELECT id, qty, total FROM " .. probe .. " ORDER BY id"), "1|5|10\n2|5|10", "undo of the delete")
+
+      assert(db.execute("CREATE TABLE " .. temporal .. " (id INT PRIMARY KEY, name NVARCHAR(20) NOT NULL,"
+        .. " vf DATETIME2 GENERATED ALWAYS AS ROW START NOT NULL, vt DATETIME2 GENERATED ALWAYS AS ROW END NOT NULL,"
+        .. " PERIOD FOR SYSTEM_TIME (vf, vt)) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo."
+        .. temporal .. "_history))", URL))
+      assert(db.execute("INSERT INTO " .. temporal .. " (id, name) VALUES (1, N'first')", URL))
+      st = data.clone_row(grid(temporal), 1)
+      apply_grid(data.add_change(st, st._next_insert_idx - 1, "id", "2"))
+      run((apply_grid(data.toggle_delete(grid(temporal), 1))))
+      eq(dump("SELECT id, name FROM " .. temporal .. " ORDER BY id"), "1|first\n2|first", "temporal clone and undo")
+    end)
+    drop()
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server writes binary values as hex and restores them on undo", function()
+    local probe = "grip_live_binary"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, b VARBINARY(16), img IMAGE, big VARBINARY(MAX))", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, 0xDEADBEEF, 0x0102, NULL),"
+        .. " (2, NULL, NULL, CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 9000) AS VARBINARY(MAX)))", URL))
+      local function snap()
+        return dump("SELECT id, CONVERT(varchar(50), b, 1), CONVERT(varchar(50), CAST(img AS varbinary(max)), 1) FROM "
+          .. probe .. " ORDER BY id")
+      end
+      local before = snap()
+      local st = data.add_change(grid(probe), 1, "b", "0xCAFE")
+      run((apply_grid(data.add_change(st, 1, "img", "0xABCD"))))
+      eq(snap(), before, "edit and undo")
+      st = grid(probe)
+      apply_grid(data.add_change(data.add_change(st, 1, "b", "0xCAFE"), 1, "img", "0xABCD"))
+      eq(dump("SELECT CONVERT(varchar(50), b, 1) FROM " .. probe .. " WHERE id = 1"), "0xCAFE", "edit applied")
+      run((apply_grid(data.toggle_delete(grid(probe), 1))))
+      eq(dump("SELECT CONVERT(varchar(50), b, 1), CONVERT(varchar(50), CAST(img AS varbinary(max)), 1) FROM "
+        .. probe .. " WHERE id = 1"), "0xCAFE|0xABCD", "undo of the delete")
+
+      local _, irreversible = sql.build_undo(data.toggle_delete(grid(probe), 2), "sqlserver")
+      eq(irreversible[1], 2, "a row with a binary over 8000 bytes is reported, not half-restored")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server query pad runs the SQL people type", function()
+    local grip = require("dadbod-grip")
+    -- { sql, rows, first cell of the last column of row 1, editable }
+    local cases = {
+      { "SELECT * FROM users ORDER BY name", 15, nil, true },
+      { "SELECT name FROM users ORDER BY name DESC", 15, nil, true },
+      { "SELECT u.name, COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id GROUP BY u.name", nil, nil, false },
+      { "WITH x AS (SELECT * FROM users) SELECT name FROM x WHERE name = N'Alice'", 1, "Alice", false },
+      { "SELECT 1 AS a; SELECT 2 AS b", 1, "2", false },
+      { "PRINT 'hi'; SELECT 3 AS a", 1, "3", false },
+      { "DECLARE @n int = 2; SELECT TOP (@n) name FROM users ORDER BY id", 2, "Alice", false },
+      { "EXEC sp_executesql N'SELECT 4 AS a'", 1, "4", false },
+      { "SELECT 5 AS a\nGO\nSELECT 6 AS b", 1, "6", false },
+      { "SELECT * FROM users -- every user", 15, nil, true },
+      { "/* who */ SELECT name FROM users WHERE name = N'Bob'", 1, "Bob", true },
+      { "SELECT name FROM users ORDER BY LEN(name), name", 15, nil, false },
+    }
+    for _, c in ipairs(cases) do
+      local spec, table_name = grip._resolve_query(c[1], 50, "sqlserver")
+      assert(spec, c[1] .. ": no spec (" .. tostring(table_name) .. ")")
+      local fetched, used_spec, used_table = grip._fetch_grid(URL, spec, table_name)
+      assert(fetched.result, c[1] .. ": " .. tostring(fetched.err))
+      local r = fetched.result
+      if c[2] then eq(#r.rows, c[2], c[1] .. " rows") else assert(#r.rows > 0, c[1] .. " rows") end
+      if c[3] then eq(r.rows[1][#r.columns], c[3], c[1] .. " value") end
+      eq(used_table ~= nil and not r.readonly, c[4], c[1] .. " editable")
+      if used_spec.passthrough then eq(query.build_count_sql(used_spec), nil, "no count") end
+    end
+    local bad = grip._fetch_grid(URL, (grip._resolve_query("SELECT nope FROM users", 50, "sqlserver")))
+    assert(not bad.result and tostring(bad.err):find("Invalid column name 'nope'", 1, true),
+      "the server's own error: " .. tostring(bad.err))
+  end)
+
+  test("SQL Server profiles (gR, gS) tables with bit, image, text, xml and geography", function()
+    local profile = require("dadbod-grip.profile")
+    local probe = "grip_live_profile"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, flag BIT, img IMAGE, txt TEXT,"
+        .. " doc XML, loc GEOGRAPHY, g UNIQUEIDENTIFIER, name NVARCHAR(20))", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, 1, 0x01, 'a', '<a/>', geography::Point(1, 2, 4326), NEWID(), N'x'),"
+        .. " (2, 0, NULL, NULL, NULL, NULL, NULL, NULL)", URL))
+      local data_report, report_err = profile.gather(probe, URL)
+      assert(data_report, "gR: " .. tostring(report_err))
+      eq(#data_report.profiles, 8, "every column profiled")
+      for _, p in ipairs(data_report.profiles) do
+        if p.name == "img" then eq(p.nulls, 1, "img nulls") end
+        if p.name == "flag" then eq(p.max, "1", "bit max") end
+      end
+      for _, ci in ipairs(db.get_column_info(probe, URL)) do
+        local cs, cs_err = profile.gather_column(probe, ci.column_name, ci.data_type, URL)
+        assert(cs, "gS " .. ci.column_name .. ": " .. tostring(cs_err))
+      end
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server quick filter finds the row for every kind of cell", function()
+    local probe = "grip_live_filter"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, u NVARCHAR(20), ml NVARCHAR(MAX),"
+        .. " b VARBINARY(8), img IMAGE, txt TEXT, nt NTEXT, doc XML, v SQL_VARIANT, loc GEOGRAPHY)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'李 😀', N'a' + CHAR(13) + CHAR(10) + N'b',"
+        .. " 0xDEAD, 0x0102, 'old', N'ñ', N'<a b=\"1\"/>', CAST(42 AS INT), geography::Point(52, 4, 4326)),"
+        .. " (2, N'other', N'x', 0x01, 0x03, 'new', N'n', N'<b/>', CAST(7 AS INT), NULL)", URL))
+      local spec = query.new_table(probe, 50)
+      local page = assert(db.query(query.build_sql(spec), URL))
+      for i, col in ipairs(page.columns) do
+        if col ~= "id" then
+          local filtered = query.quick_filter(spec, col, page.rows[1][i],
+            { kind = "sqlserver", type = page.column_types[col] })
+          local hit, hit_err = db.query(query.build_sql(filtered), URL)
+          assert(hit, col .. ": " .. tostring(hit_err))
+          eq(#hit.rows, 1, col .. " rows")
+          eq(hit.rows[1][1], "1", col .. " row")
+        end
+      end
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server can undo an insert whose values are all text or ntext", function()
+    local probe = "grip_live_textonly"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT IDENTITY(1,1) PRIMARY KEY, txt TEXT, ntxt NTEXT)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " (txt, ntxt) VALUES ('old', N'old')", URL))
+      local st = grid(probe)
+      local values = { txt = "new", ntxt = "nieuw ✓" }
+      assert(db.execute(sql.build_insert(probe, values, st.columns, "sqlserver"), URL))
+      local find_sql = sql.build_insert_lookup(probe, st.pks, values, st.incomparable_columns, "sqlserver",
+        sql.state_opts(st))
+      assert(find_sql, "a lookup, not none")
+      eq(assert(db.query(find_sql, URL)).rows[1][1], "2", "the inserted row")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server reports the server's error for a view it cannot describe", function()
     local probe, broken = "grip_live_base", "grip_live_broken"
     db.execute("DROP VIEW IF EXISTS " .. broken, URL)

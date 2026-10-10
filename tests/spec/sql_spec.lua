@@ -292,6 +292,85 @@ test("preview_staged: shows the adapter's SQL", function()
   contains(preview, "N'é'")
 end)
 
+-- ── typed values, apply and undo ──────────────────────────────────────────
+
+local data_mod = require("dadbod-grip.data")
+
+test("value_sql: NULL, '' and SQL Server binary hex", function()
+  eq(sql.value_sql(data_mod.NULL_SENTINEL, "sqlserver", "nvarchar(10)"), "NULL")
+  eq(sql.value_sql(data_mod.EMPTY, "sqlserver", "nvarchar(10)"), "N''")
+  eq(sql.value_sql(data_mod.EMPTY, "postgresql", "text"), "''")
+  eq(sql.value_sql("0xCAFE", "sqlserver", "varbinary(16)"), "0xCAFE")
+  eq(sql.value_sql("0xcafe", "sqlserver", "image"), "0xcafe")
+  eq(sql.value_sql("0xCAFE", "sqlserver", "nvarchar(10)"), "N'0xCAFE'", "text that looks like hex stays text")
+  eq(sql.value_sql("0xC'; DROP", "sqlserver", "varbinary(16)"), "N'0xC''; DROP'", "not hex: quoted")
+  eq(sql.value_sql("0xCAFE", "postgresql", "bytea"), "'0xCAFE'", "other adapters unchanged")
+end)
+
+local function sqlserver_grid()
+  return data_mod.new({
+    rows = { { "1", "", "0xDEAD", "" }, { "2", "x", "", "<binary 9000 bytes>" } },
+    columns = { "id", "code", "blob", "big" },
+    primary_keys = { "id" },
+    table_name = "t",
+    empty_cells = { [1] = { [2] = true } },
+    column_types = { id = "int", code = "varchar(10)", blob = "varbinary(16)", big = "varbinary(max)" },
+    generated_columns = { rv = true },
+  })
+end
+
+test("build_apply: deletes, updates and inserts with typed values", function()
+  local st = sqlserver_grid()
+  st = data_mod.add_change(st, 2, "blob", "0xBEEF")
+  st = data_mod.toggle_delete(st, 1)
+  local stmts = sql.build_apply(st, "sqlserver")
+  eq(#stmts, 2)
+  contains(stmts[1], "DELETE FROM")
+  contains(stmts[2], '"blob" = 0xBEEF')
+end)
+
+test("build_undo: a deleted row comes back with '' and hex", function()
+  local st = data_mod.toggle_delete(sqlserver_grid(), 1)
+  local reverse, irreversible = sql.build_undo(st, "sqlserver")
+  eq(#irreversible, 0)
+  contains(reverse[1], "N''")
+  contains(reverse[1], "0xDEAD")
+  assert(not reverse[1]:find("N'0xDEAD'", 1, true), "hex not quoted")
+end)
+
+test("build_undo: an edit of a '' cell restores ''", function()
+  local st = data_mod.add_change(sqlserver_grid(), 1, "code", "now set")
+  local reverse = sql.build_undo(st, "sqlserver")
+  contains(reverse[1], [["code" = N'']])
+end)
+
+test("build_undo: a row with a large binary placeholder cannot be restored", function()
+  local st = data_mod.toggle_delete(sqlserver_grid(), 2)
+  local reverse, irreversible = sql.build_undo(st, "sqlserver")
+  eq(#reverse, 0)
+  eq(irreversible[1], 2)
+end)
+
+test("build_insert: skips the columns in opts.skip", function()
+  local s = sql.build_insert("t", { id = "1", total = "4" }, { "id", "total" }, "sqlserver", { skip = { total = true } })
+  eq(s, [[INSERT INTO "t" ("id") VALUES (N'1')]])
+end)
+
+test("equals_sql: SQL Server compares by the column's type", function()
+  eq(sql.equals_sql("c", nil, "sqlserver"), [["c" IS NULL]])
+  eq(sql.equals_sql("c", "李", "sqlserver", "nvarchar(10)"), [["c" = N'李']])
+  eq(sql.equals_sql("c", "a\r\nb", "sqlserver", "nvarchar(max)"),
+    [["c" = CAST(N'a' AS nvarchar(max)) + NCHAR(13) + N'
+b']])
+  eq(sql.equals_sql("c", "0xDEAD", "sqlserver", "varbinary(16)"), [["c" = 0xDEAD]])
+  eq(sql.equals_sql("c", "0xDEAD", "sqlserver", "image"), [[CAST("c" AS varbinary(max)) = 0xDEAD]])
+  eq(sql.equals_sql("c", "old", "sqlserver", "text"), [[CAST("c" AS nvarchar(max)) = N'old']])
+  eq(sql.equals_sql("c", "<a/>", "sqlserver", "xml"), [[CAST("c" AS nvarchar(max)) = N'<a/>']])
+  eq(sql.equals_sql("c", "42", "sqlserver", "sql_variant"), [[CAST("c" AS nvarchar(max)) = N'42']])
+  eq(sql.equals_sql("c", "POINT (1 2)", "sqlserver", "geography"), [[CAST("c" AS nvarchar(max)) = N'POINT (1 2)']])
+  eq(sql.equals_sql("c", "x", "postgresql", "text"), [["c" = 'x']], "other adapters unchanged")
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\nsql_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

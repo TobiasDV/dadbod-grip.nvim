@@ -45,6 +45,15 @@ function M.new_raw(sql_str, page_size)
   }
 end
 
+--- A batch that runs exactly as written: no wrapper, so no sort, filter,
+--- paging or count (see the SQL Server adapter's plan_query).
+function M.new_passthrough(sql_str, page_size)
+  local spec = M.new_raw(sql_str, page_size)
+  spec.base_sql = sql_str
+  spec.passthrough = true
+  return spec
+end
+
 -- ── sort modifiers ───────────────────────────────────────────────────────
 
 --- Toggle sort on a column (replaces existing sorts).
@@ -132,7 +141,7 @@ end
 --- For "BETWEEN": value is "low,high": two comma-separated values.
 --- For "LIKE": auto-wraps value with %…% if no % present (substring intent assumed).
 --- For "NULL" / "NOT NULL": value is ignored.
-function M.build_filter_clause(col, op, value)
+function M.build_filter_clause(col, op, value, adapter_kind)
   local col_q = sql_mod.quote_ident(col)
 
   -- IS NULL / IS NOT NULL: no value needed
@@ -148,6 +157,8 @@ function M.build_filter_clause(col, op, value)
     if tonumber(v) then
       return v  -- raw numeric string, e.g. "42", "3.14", "-1"
     end
+    -- SQL Server needs N'' for anything outside the code page.
+    if adapter_kind == "sqlserver" then return sql_mod.quote_value(tostring(v), adapter_kind) end
     return "'" .. esc(tostring(v)) .. "'"
   end
 
@@ -186,14 +197,11 @@ function M.build_filter_clause(col, op, value)
 end
 
 --- Quick-filter: "column = value" or "column IS NULL".
-function M.quick_filter(spec, column, value)
-  local clause
-  if value == nil then
-    clause = sql_mod.quote_ident(column) .. " IS NULL"
-  else
-    clause = sql_mod.quote_ident(column) .. " = " .. sql_mod.quote_value(value)
-  end
-  return M.add_filter(spec, clause)
+--- opts.kind / opts.type: the adapter kind and column type, for literals and
+--- comparisons that depend on them (see sql.equals_sql).
+function M.quick_filter(spec, column, value, opts)
+  opts = opts or {}
+  return M.add_filter(spec, sql_mod.equals_sql(column, value, opts.kind, opts.type))
 end
 
 --- Return the pinned filters of a spec, in order. Local helper: callers outside
@@ -304,12 +312,14 @@ end
 --- Build the data query SQL from a spec. opts.paginate=false preserves the
 --- active filters and sorts but omits LIMIT/OFFSET (used by all-row export).
 function M.build_sql(spec, opts)
+  if spec.passthrough then return spec.base_sql end
   local parts = {}
 
   -- FROM clause
   local from
   if spec.is_raw then
-    from = "(" .. spec.base_sql .. ") AS _grip"
+    -- On its own line: a trailing -- comment would swallow the wrapper.
+    from = "(" .. spec.base_sql .. "\n) AS _grip"
   else
     from = sql_mod.quote_ident(spec.table_name)
   end
@@ -342,10 +352,12 @@ end
 
 --- Build COUNT query (for pagination total).
 function M.build_count_sql(spec)
+  if spec.passthrough then return nil end
   local parts = {}
   local from
   if spec.is_raw then
-    from = "(" .. spec.base_sql .. ") AS _grip"
+    -- On its own line: a trailing -- comment would swallow the wrapper.
+    from = "(" .. spec.base_sql .. "\n) AS _grip"
   else
     from = sql_mod.quote_ident(spec.table_name)
   end

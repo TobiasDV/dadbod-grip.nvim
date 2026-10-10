@@ -491,6 +491,41 @@ end)
 
 local CLR_ERROR = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n"
 
+test("sqlserver query: reports types, generated and required text columns, and empty strings", function()
+  with_executable(function()
+    local describe = vim.json.encode({
+      { name = "id", system_type_name = "int", is_nullable = false, is_updateable = false, is_identity_column = true },
+      { name = "code", system_type_name = "varchar(10)", is_nullable = false, is_updateable = true, is_identity_column = false },
+      { name = "note", system_type_name = "nvarchar(50)", is_nullable = true, is_updateable = true, is_identity_column = false },
+      { name = "total", system_type_name = "decimal(21,2)", is_nullable = true, is_updateable = false, is_identity_column = false },
+      { name = "rv", system_type_name = "timestamp", is_nullable = false, is_updateable = false, is_identity_column = false },
+    })
+    local out = lines({ describe,
+      [[{"id":1,"code":"","note":null,"total":2.00,"rv":"0x00000000000007D1"}]],
+      [[{"id":2,"code":"x","note":"","total":null,"rv":"0x00000000000007D2"}]] })
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "versioned" LIMIT 100', URL))
+      eq(r.column_types.code, "varchar(10)")
+      eq(r.generated_columns.total, true, "computed")
+      eq(r.generated_columns.rv, true, "rowversion")
+      eq(r.generated_columns.id, nil, "identity is written back on undo")
+      eq(r.required_text_columns.code, true, "NOT NULL text")
+      eq(r.required_text_columns.note, nil, "nullable")
+      eq(r.empty_cells[1][2], true, "'' in row 1")
+      eq((r.empty_cells[1] or {})[3], nil, "NULL is not ''")
+      eq(r.empty_cells[2][3], true, "'' in row 2")
+      eq(r.rows[1][2], "", "rows still hold ''")
+    end)
+  end)
+end)
+
+test("sqlserver query: the page batch describes nullability and writability", function()
+  local batch = sqlserver._json_page_sql('SELECT * FROM "t" ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY')
+  contains(batch, "is_nullable")
+  contains(batch, "is_updateable")
+  contains(batch, "is_identity_column")
+end)
+
 test("sqlserver query: binaries and CLR columns arrive formatted, in one call", function()
   with_executable(function()
     local r
@@ -761,6 +796,81 @@ test("sqlserver get_referencing_foreign_keys: query failure returns {} and err",
   eq(#refs, 0, "no entries on failure")
   assert(err, "err must be set")
   contains(err, "Msg 262", "err carries the server message")
+end)
+
+-- ── query pad: what can be wrapped and paged, what runs as written ─────────
+
+test("plan_query: classifies query pad SQL", function()
+  local cases = {
+    { "customers", nil },
+    { "UPDATE customers SET vip = 1", nil },
+    { "SELECT * FROM customers WHERE vip = 1", "select" },
+    { "SELECT 1;", "select" },
+    { "/* lead */ SELECT * FROM customers", "select" },
+    { "SELECT * FROM customers -- trailing", "select" },
+    { "SELECT 'a;b' AS x", "select" },
+    { "SELECT * FROM t WHERE x = 'ORDER BY y'", "select" },
+    { "SELECT TOP 5 * FROM many ORDER BY id", "select" },
+    { "SELECT * FROM t ORDER BY LEN(name)", "passthrough" },
+    { "SELECT * FROM t ORDER BY 1", "passthrough" },
+    { "SELECT 1 AS a; SELECT 2 AS b", "passthrough" },
+    { "WITH x AS (SELECT 1 AS a) SELECT * FROM x", "passthrough" },
+    { "EXEC sp_help 'customers'", "passthrough" },
+    { "exec sp_who", "passthrough" },
+    { "DECLARE @n int = 3; SELECT @n", "passthrough" },
+    { "PRINT 'hi'; SELECT 1 AS a", "passthrough" },
+    { "SELECT 1 AS a\nGO\nSELECT 2 AS b", "passthrough" },
+    { "SELECT * INTO #t FROM customers", "passthrough" },
+    { "SELECT * FROM t FOR JSON PATH", "passthrough" },
+    { "SELEKT 1", nil },
+    { "order lines", nil },
+    { "my table", nil },
+    { "SET NOCOUNT OFF; SELECT 1", "passthrough" },
+    { "IF 1 = 1 SELECT 1", "passthrough" },
+    { "TRUNCATE TABLE t", "passthrough" },
+  }
+  for _, c in ipairs(cases) do
+    local plan = sqlserver.plan_query(c[1])
+    eq(plan and plan.kind, c[2], c[1])
+  end
+end)
+
+test("plan_query: a plain trailing ORDER BY becomes the grid's sort", function()
+  local plan = sqlserver.plan_query("SELECT c.name, c.id FROM customers c ORDER BY c.name DESC, [id]")
+  eq(plan.kind, "select")
+  eq(plan.sql, "SELECT c.name, c.id FROM customers c")
+  eq(#plan.sorts, 2)
+  eq(plan.sorts[1].column, "name")
+  eq(plan.sorts[1].dir, "DESC")
+  eq(plan.sorts[2].column, "id")
+  eq(plan.sorts[2].dir, "ASC")
+  local top = sqlserver.plan_query("SELECT TOP 5 * FROM many ORDER BY id")
+  eq(#top.sorts, 0, "ORDER BY with TOP is legal inside the wrapper")
+  eq(top.sql, "SELECT TOP 5 * FROM many ORDER BY id")
+end)
+
+test("plan_query: a batch that writes is flagged", function()
+  eq(sqlserver.plan_query("PRINT 'x'; DELETE FROM t").writes, true)
+  eq(sqlserver.plan_query("DECLARE @t TABLE (a int); INSERT INTO @t VALUES (1); SELECT * FROM @t").writes, true)
+  eq(sqlserver.plan_query("EXEC sp_help 'customers'").writes, false)
+  eq(sqlserver.plan_query("SELECT 'DROP TABLE x' AS s; SELECT 1").writes, false, "inside a literal")
+end)
+
+test("sqlserver text output: the last result set wins, PRINT lines are not rows", function()
+  local out = lines({ "hi", "a", "-", "1", "", "b\tc", "-\t-", "2\tx", "3\ty" })
+  local r = sqlserver._parse_sqlcmd_table(out)
+  eq(table.concat(r.columns, ","), "b,c")
+  eq(#r.rows, 2)
+  eq(r.rows[2][2], "y")
+  local msg = sqlserver._parse_sqlcmd_table(lines({ "only a message" }))
+  eq(#msg.columns, 0, "no result set")
+  eq(msg.messages[1], "only a message")
+end)
+
+test("sqlcmd script: the session setup shares the first line, so error lines match", function()
+  local script = sqlserver._sqlcmd_script("SELECT 1\nSELEKT 2")
+  eq(select(2, script:gsub("\n", "")), 2, "two lines in, two lines out")
+  assert(script:find("^SET QUOTED_IDENTIFIER ON; SET NOCOUNT ON; SELECT 1\n"), script)
 end)
 
 -- ── summary ─────────────────────────────────────────────────────────────────

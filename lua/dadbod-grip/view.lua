@@ -335,9 +335,10 @@ local function format_cell(value, width, is_null_staged)
     local s = pad_display(value, width, false)
     return s, "GripReadonly"
   end
-  local display = value ~= "" and value:gsub("\n", "↵"):gsub("\r", "") or NULL_DISPLAY
-  local hl = value == "" and "GripNull" or nil
-  return pad_display(display, width), hl
+  -- "" here is a real empty string: data.effective_value turns the ""
+  -- adapters use for NULL into nil.
+  local display = value:gsub("\n", "↵"):gsub("\r", "")
+  return pad_display(display, width), nil
 end
 
 --- Classify a cell value for conditional formatting.
@@ -738,7 +739,7 @@ local function build_render(session, opts)
             else
               cell_hl = "GripModified"
             end
-          elseif eff == nil or eff == "" then
+          elseif eff == nil then
             cell_hl = "GripNull"
           else
             cell_hl = classify_cell(eff, cond_type_map[col])
@@ -817,7 +818,8 @@ local function build_render(session, opts)
   -- ── Filter lines (one per active clause: always fully visible, never truncated) ──
   if session.query_spec and #session.query_spec.filters > 0 then
     for _, f in ipairs(session.query_spec.filters) do
-      local fline = " \xE2\x96\xBE " .. f.clause  -- ▾ clause
+      -- A buffer line cannot hold a newline: show it as the cells do.
+      local fline = " \xE2\x96\xBE " .. f.clause:gsub("\r?\n", "↵")  -- ▾ clause
       table.insert(lines, fline)
       -- Dim the ▾ bullet (space + ▾(3 bytes) + space = bytes 0–4)
       push_mark(#lines, 0, 5, "GripColType")
@@ -2334,7 +2336,8 @@ function M._fk_referencing(bufnr)
     -- so F/X must not drop it and the [filtered] badge must not claim the user
     -- filtered anything.
     ref_spec = qmod.add_filter(ref_spec,
-      sql.quote_ident(ref.column) .. " = " .. sql.quote_value(src_val),
+      sql.quote_ident(ref.column) .. " = "
+        .. sql.quote_value(src_val, require("dadbod-grip.adapters").kind(db.resolved_url(session.state.url))),
       { pinned = true })
     local ref_sql = qmod.build_sql(ref_spec)
 

@@ -73,7 +73,8 @@ function M.setup(bufnr, ctx)
     -- drop it and the [filtered] badge must not claim otherwise.
     local ref_spec = qmod.new_table(fk_info.ref_table, session_fk.query_spec.page_size)
     ref_spec = qmod.add_filter(ref_spec,
-      sql.quote_ident(fk_info.ref_column) .. " = " .. sql.quote_value(cell.value),
+      sql.quote_ident(fk_info.ref_column) .. " = "
+        .. sql.quote_value(cell.value, require("dadbod-grip.adapters").kind(db.resolved_url(session_fk.state.url))),
       { pinned = true })
     local ref_sql = qmod.build_sql(ref_spec)
 
