@@ -822,7 +822,12 @@ test("plan_query: classifies query pad SQL", function()
     { "SELECT 1 AS a\nGO\nSELECT 2 AS b", "passthrough" },
     { "SELECT * INTO #t FROM customers", "passthrough" },
     { "SELECT * FROM t FOR JSON PATH", "passthrough" },
-    { "SELEKT 1", "passthrough" },
+    { "SELEKT 1", nil },
+    { "order lines", nil },
+    { "my table", nil },
+    { "SET NOCOUNT OFF; SELECT 1", "passthrough" },
+    { "IF 1 = 1 SELECT 1", "passthrough" },
+    { "TRUNCATE TABLE t", "passthrough" },
   }
   for _, c in ipairs(cases) do
     local plan = sqlserver.plan_query(c[1])

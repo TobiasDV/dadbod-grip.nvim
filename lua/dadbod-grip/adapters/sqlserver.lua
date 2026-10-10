@@ -516,6 +516,14 @@ local ROUTED_ELSEWHERE = {
   UPDATE = true, DELETE = true, INSERT = true, ALTER = true, DROP = true, CREATE = true,
   BEGIN = true, COMMIT = true, ROLLBACK = true,
 }
+-- First words that make a statement rather than a table name: anything else
+-- ("order lines", a typo) stays a table name, as the sidebar passes them.
+local STATEMENT_WORDS = {
+  SELECT = true, WITH = true, EXEC = true, EXECUTE = true, DECLARE = true, PRINT = true,
+  SET = true, IF = true, WHILE = true, USE = true, RAISERROR = true, THROW = true,
+  TRUNCATE = true, MERGE = true, DBCC = true, WAITFOR = true, GRANT = true, REVOKE = true,
+  DENY = true, OPEN = true, FETCH = true, CLOSE = true, DEALLOCATE = true,
+}
 local WRITE_WORDS = {
   INSERT = true, UPDATE = true, DELETE = true, MERGE = true, TRUNCATE = true, DROP = true,
   ALTER = true, CREATE = true, GRANT = true, REVOKE = true, DENY = true,
@@ -577,7 +585,7 @@ function M.plan_query(sql_str)
   for _, t in ipairs(toks) do
     if t.kind == "word" and WRITE_WORDS[t.word] then writes = true end
   end
-  if ROUTED_ELSEWHERE[first.word] then return nil end
+  if ROUTED_ELSEWHERE[first.word] or not STATEMENT_WORDS[first.word] then return nil end
   if first.word == "WITH" and writes then return nil end
   local passthrough = { kind = "passthrough", writes = writes }
   if first.word ~= "SELECT" then return passthrough end
