@@ -356,6 +356,21 @@ test("build_insert: skips the columns in opts.skip", function()
   eq(s, [[INSERT INTO "t" ("id") VALUES (N'1')]])
 end)
 
+test("equals_sql: SQL Server compares by the column's type", function()
+  eq(sql.equals_sql("c", nil, "sqlserver"), [["c" IS NULL]])
+  eq(sql.equals_sql("c", "李", "sqlserver", "nvarchar(10)"), [["c" = N'李']])
+  eq(sql.equals_sql("c", "a\r\nb", "sqlserver", "nvarchar(max)"),
+    [["c" = CAST(N'a' AS nvarchar(max)) + NCHAR(13) + N'
+b']])
+  eq(sql.equals_sql("c", "0xDEAD", "sqlserver", "varbinary(16)"), [["c" = 0xDEAD]])
+  eq(sql.equals_sql("c", "0xDEAD", "sqlserver", "image"), [[CAST("c" AS varbinary(max)) = 0xDEAD]])
+  eq(sql.equals_sql("c", "old", "sqlserver", "text"), [[CAST("c" AS nvarchar(max)) = N'old']])
+  eq(sql.equals_sql("c", "<a/>", "sqlserver", "xml"), [[CAST("c" AS nvarchar(max)) = N'<a/>']])
+  eq(sql.equals_sql("c", "42", "sqlserver", "sql_variant"), [[CAST("c" AS nvarchar(max)) = N'42']])
+  eq(sql.equals_sql("c", "POINT (1 2)", "sqlserver", "geography"), [[CAST("c" AS nvarchar(max)) = N'POINT (1 2)']])
+  eq(sql.equals_sql("c", "x", "postgresql", "text"), [["c" = 'x']], "other adapters unchanged")
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\nsql_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

@@ -61,6 +61,30 @@ function M.value_sql(v, adapter_kind, type_name)
   return M.quote_value(v, adapter_kind)
 end
 
+-- SQL Server types = cannot compare directly: compared as their text.
+local COMPARED_AS_TEXT = {
+  text = true, ntext = true, xml = true, sql_variant = true, geography = true, geometry = true,
+}
+
+--- `col = value` for a filter on a cell, `col IS NULL` for a NULL one. On SQL
+--- Server the column's type decides the comparison: Unicode literals, binary
+--- literals, and text for the types = refuses (text, xml, geography, ...).
+function M.equals_sql(col, value, adapter_kind, type_name)
+  local col_q = M.quote_ident(col)
+  if value == nil then return col_q .. " IS NULL" end
+  if adapter_kind == "sqlserver" then
+    local base = ((type_name or ""):match("^[%a_]+") or ""):lower()
+    if COMPARED_AS_TEXT[base] then
+      return "CAST(" .. col_q .. " AS nvarchar(max)) = " .. M.quote_value(value, adapter_kind)
+    end
+    if base == "image" then
+      return "CAST(" .. col_q .. " AS varbinary(max)) = " .. M.value_sql(value, adapter_kind, "varbinary")
+    end
+    return col_q .. " = " .. M.value_sql(value, adapter_kind, type_name)
+  end
+  return col_q .. " = " .. M.quote_value(value, adapter_kind)
+end
+
 --- `col = value`, or `col IS NULL` for a NULL key.
 local function key_sql(col, val, adapter_kind, types)
   local data = require("dadbod-grip.data")

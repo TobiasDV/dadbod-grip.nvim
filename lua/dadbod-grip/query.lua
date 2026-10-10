@@ -141,7 +141,7 @@ end
 --- For "BETWEEN": value is "low,high": two comma-separated values.
 --- For "LIKE": auto-wraps value with %…% if no % present (substring intent assumed).
 --- For "NULL" / "NOT NULL": value is ignored.
-function M.build_filter_clause(col, op, value)
+function M.build_filter_clause(col, op, value, adapter_kind)
   local col_q = sql_mod.quote_ident(col)
 
   -- IS NULL / IS NOT NULL: no value needed
@@ -157,6 +157,8 @@ function M.build_filter_clause(col, op, value)
     if tonumber(v) then
       return v  -- raw numeric string, e.g. "42", "3.14", "-1"
     end
+    -- SQL Server needs N'' for anything outside the code page.
+    if adapter_kind == "sqlserver" then return sql_mod.quote_value(tostring(v), adapter_kind) end
     return "'" .. esc(tostring(v)) .. "'"
   end
 
@@ -195,14 +197,11 @@ function M.build_filter_clause(col, op, value)
 end
 
 --- Quick-filter: "column = value" or "column IS NULL".
-function M.quick_filter(spec, column, value)
-  local clause
-  if value == nil then
-    clause = sql_mod.quote_ident(column) .. " IS NULL"
-  else
-    clause = sql_mod.quote_ident(column) .. " = " .. sql_mod.quote_value(value)
-  end
-  return M.add_filter(spec, clause)
+--- opts.kind / opts.type: the adapter kind and column type, for literals and
+--- comparisons that depend on them (see sql.equals_sql).
+function M.quick_filter(spec, column, value, opts)
+  opts = opts or {}
+  return M.add_filter(spec, sql_mod.equals_sql(column, value, opts.kind, opts.type))
 end
 
 --- Return the pinned filters of a spec, in order. Local helper: callers outside

@@ -539,6 +539,32 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server quick filter finds the row for every kind of cell", function()
+    local probe = "grip_live_filter"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, u NVARCHAR(20), ml NVARCHAR(MAX),"
+        .. " b VARBINARY(8), img IMAGE, txt TEXT, nt NTEXT, doc XML, v SQL_VARIANT, loc GEOGRAPHY)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'李 😀', N'a' + CHAR(13) + CHAR(10) + N'b',"
+        .. " 0xDEAD, 0x0102, 'old', N'ñ', N'<a b=\"1\"/>', CAST(42 AS INT), geography::Point(52, 4, 4326)),"
+        .. " (2, N'other', N'x', 0x01, 0x03, 'new', N'n', N'<b/>', CAST(7 AS INT), NULL)", URL))
+      local spec = query.new_table(probe, 50)
+      local page = assert(db.query(query.build_sql(spec), URL))
+      for i, col in ipairs(page.columns) do
+        if col ~= "id" then
+          local filtered = query.quick_filter(spec, col, page.rows[1][i],
+            { kind = "sqlserver", type = page.column_types[col] })
+          local hit, hit_err = db.query(query.build_sql(filtered), URL)
+          assert(hit, col .. ": " .. tostring(hit_err))
+          eq(#hit.rows, 1, col .. " rows")
+          eq(hit.rows[1][1], "1", col .. " row")
+        end
+      end
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server reports the server's error for a view it cannot describe", function()
     local probe, broken = "grip_live_base", "grip_live_broken"
     db.execute("DROP VIEW IF EXISTS " .. broken, URL)

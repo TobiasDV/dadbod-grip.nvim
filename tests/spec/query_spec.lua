@@ -621,6 +621,19 @@ test("raw spec: a trailing line comment cannot swallow the wrapper", function()
   contains(sql, "-- note\n) AS _grip")
 end)
 
+test("quick_filter: uses the adapter and column type", function()
+  local spec = query.quick_filter(query.new_table("t", 10), "code", "李", { kind = "sqlserver", type = "nvarchar(10)" })
+  eq(spec.filters[1].clause, [["code" = N'李']])
+  eq(query.quick_filter(query.new_table("t", 10), "code", "x").filters[1].clause, [["code" = 'x']])
+end)
+
+test("build_filter_clause: SQL Server text values are N'' literals", function()
+  eq(query.build_filter_clause("name", "=", "Zoë 李", "sqlserver"), [["name" = N'Zoë 李']])
+  eq(query.build_filter_clause("name", "LIKE", "李", "sqlserver"), [["name" LIKE N'%李%']])
+  eq(query.build_filter_clause("n", "IN", "1,李", "sqlserver"), [["n" IN (1,N'李')]])
+  eq(query.build_filter_clause("name", "=", "x"), [["name" = 'x']])
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\nquery_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
