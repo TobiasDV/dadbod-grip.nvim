@@ -610,6 +610,89 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server SQL export loads back into an identical table", function()
+    local probe, copy = "grip_live_export", "grip_live_export_copy"
+    local function drop()
+      db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+      db.execute("DROP TABLE IF EXISTS " .. copy, URL)
+    end
+    drop()
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, u NVARCHAR(20), e VARCHAR(5) NOT NULL,"
+        .. " n INT, b VARBINARY(8), ml NVARCHAR(MAX))", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'李 😀', '', NULL, 0xDEAD, N'a' + CHAR(13) + CHAR(10) + N'b'),"
+        .. " (2, NULL, 'x', 5, NULL, N'')", URL))
+      assert(db.execute("SELECT * INTO " .. copy .. " FROM " .. probe .. " WHERE 1 = 0", URL))
+      local result = assert(db.query(query.build_sql(query.new_table(probe, 50), { paginate = false }), URL))
+      local path = vim.fn.tempname() .. ".sql"
+      assert(view._write_export_file(view._export_rows_from_result(result), result.columns, "sql", copy, path,
+        { kind = "sqlserver", types = result.column_types }))
+      assert(db.execute(table.concat(vim.fn.readfile(path), "\n"), URL))
+      vim.fn.delete(path)
+      local function snap(t)
+        return dump("SELECT id, ISNULL(u, '<null>'), e, ISNULL(CAST(n AS varchar), '<null>'),"
+          .. " ISNULL(CONVERT(varchar(20), b, 1), '<null>'), ml FROM " .. t .. " ORDER BY id")
+      end
+      eq(snap(copy), snap(probe), "same rows")
+    end)
+    drop()
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server SQL export loads back into an identical table", function()
+    local probe, copy = "grip_live_export", "grip_live_export_copy"
+    local function drop()
+      db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+      db.execute("DROP TABLE IF EXISTS " .. copy, URL)
+    end
+    drop()
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, u NVARCHAR(20), e VARCHAR(5) NOT NULL,"
+        .. " n INT, b VARBINARY(8), ml NVARCHAR(MAX))", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'李 😀', '', NULL, 0xDEAD, N'a' + CHAR(13) + CHAR(10) + N'b'),"
+        .. " (2, NULL, 'x', 5, NULL, N'')", URL))
+      assert(db.execute("SELECT * INTO " .. copy .. " FROM " .. probe .. " WHERE 1 = 0", URL))
+      local result = assert(db.query(query.build_sql(query.new_table(probe, 50), { paginate = false }), URL))
+      local path = vim.fn.tempname() .. ".sql"
+      assert(view._write_export_file(view._export_rows_from_result(result), result.columns, "sql", copy, path,
+        { kind = "sqlserver", types = result.column_types }))
+      assert(db.execute(table.concat(vim.fn.readfile(path), "\n"), URL))
+      vim.fn.delete(path)
+      local function snap(t)
+        return dump("SELECT id, ISNULL(u, '<null>'), e, ISNULL(CAST(n AS varchar), '<null>'),"
+          .. " ISNULL(CONVERT(varchar(20), b, 1), '<null>'), ml FROM " .. t .. " ORDER BY id")
+      end
+      eq(snap(copy), snap(probe), "same rows")
+    end)
+    drop()
+    if not ok then error(err) end
+  end)
+
+  test("SQL Server undo of a clone deletes the clone, never the original (GUID keys)", function()
+    local probe = "grip_live_guid"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe
+        .. " (id UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY, label NVARCHAR(20) NOT NULL)", URL))
+      for _ = 1, 10 do
+        db.execute("DELETE FROM " .. probe, URL)
+        assert(db.execute("INSERT INTO " .. probe .. " (label) VALUES (N'first')", URL))
+        local original = dump("SELECT id FROM " .. probe)
+        local st = data.clone_row(data.clone_row(grid(probe), 1), 1)
+        local plan = assert(sql.build_inserted_keys(st, "sqlserver"))
+        local before = assert(db.query(plan.sql, URL)).rows
+        run(sql.build_apply(st, "sqlserver"))
+        local after = assert(db.query(plan.sql, URL)).rows
+        local keys = sql.match_inserted_keys(plan, before, after, st.pks)
+        assert(keys[1] and keys[2], "both clones found")
+        run({ sql.build_delete(probe, keys[1], "sqlserver"), sql.build_delete(probe, keys[2], "sqlserver") })
+        eq(dump("SELECT id FROM " .. probe), original, "only the original is left")
+      end
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server reports the server's error for a view it cannot describe", function()
     local probe, broken = "grip_live_base", "grip_live_broken"
     db.execute("DROP VIEW IF EXISTS " .. broken, URL)

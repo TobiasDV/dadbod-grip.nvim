@@ -291,6 +291,24 @@ test("all-row export above 10000 requires confirmation before querying", functio
   eq(delivered, false, "cancel returns no export")
 end)
 
+test("format_export sql: SQL Server literals by column type", function()
+  local lines = fmt({ { "1", "李", "0xDEAD", nil, "" } }, { "id", "name", "b", "n", "e" }, "sql", "t",
+    { kind = "sqlserver", types = { id = "int", name = "nvarchar(10)", b = "varbinary(8)", n = "int", e = "varchar(5)" } })
+  eq(lines[1], [[INSERT INTO "t" ("id", "name", "b", "n", "e") VALUES (N'1', N'李', 0xDEAD, NULL, N'');]])
+end)
+
+test("format_export sql: without an adapter the output is unchanged", function()
+  eq(fmt({ { "1", "x" } }, { "id", "name" }, "sql", "t")[1], [[INSERT INTO "t" ("id", "name") VALUES ('1', 'x');]])
+end)
+
+test("export rows from a result: NULL and '' stay apart where the adapter knows", function()
+  local rows = view._export_rows_from_result({
+    columns = { "id", "a", "b" }, rows = { { "1", "", "" } }, empty_cells = { [1] = { [3] = true } },
+  })
+  eq(rows[1][2], nil, "NULL")
+  eq(rows[1][3], "", "''")
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 
 print(string.format("\nexport_spec: %d passed, %d failed", pass, fail))

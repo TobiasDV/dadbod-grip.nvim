@@ -1516,8 +1516,11 @@ M._json_to_lines = json_to_lines
 -- rather than iterating the row. Returns a list of strings (lines).
 -- The single formatter behind :GripExport / gX (file), gE (clipboard) and gy
 -- (markdown yank); `format` is one of csv, tsv, json, sql, markdown, grip.
-local function format_export(rows, cols, format, table_name)
+-- opts.kind / opts.types: the adapter kind and { col = type }, so the SQL
+-- format can write the adapter's literals (N'...', 0x... on SQL Server).
+local function format_export(rows, cols, format, table_name, opts)
   local tbl = table_name or "_grip_result"
+  opts = opts or {}
 
   if format == "csv" then
     local lines = { table.concat(cols, ",") }
@@ -1573,6 +1576,8 @@ local function format_export(rows, cols, format, table_name)
         local v = row[ci]
         if v == nil then
           table.insert(vals, "NULL")
+        elseif opts.kind then
+          table.insert(vals, sql_mod.value_sql(tostring(v), opts.kind, opts.types and opts.types[cols[ci]]))
         else
           table.insert(vals, "'" .. esc(tostring(v)) .. "'")
         end
@@ -1655,6 +1660,28 @@ end
 -- Expose for testing
 M._format_export = format_export
 
+--- A query result's rows as the grid reads them: nil for NULL, "" only for a
+--- real empty string (data.effective_value), like current_export_rows.
+local function export_rows_from_result(result)
+  local st = data.new({ rows = result.rows, columns = result.columns, empty_cells = result.empty_cells })
+  local rows = {}
+  for r = 1, #st.rows do
+    local row = {}
+    for ci, col in ipairs(st.columns) do row[ci] = data.effective_value(st, r, col) end
+    rows[r] = row
+  end
+  return rows
+end
+M._export_rows_from_result = export_rows_from_result
+
+--- What the SQL export needs to write SQL Server's literals; other adapters
+--- keep the plain '...' export.
+local function export_opts(session, result)
+  local kind = require("dadbod-grip.adapters").kind(db.resolved_url(session.url or session.state.url))
+  if kind ~= "sqlserver" then return nil end
+  return { kind = kind, types = (result and result.column_types) or session.state.column_types }
+end
+
 local function current_export_rows(session)
   local rows = {}
   local cols = session.state.columns or {}
@@ -1710,7 +1737,8 @@ local function request_export_rows(session, destination, callback)
         vim.notify("Export failed: " .. tostring(err or "query failed"), vim.log.levels.ERROR)
         return
       end
-      rows, cols = result.rows or {}, result.columns or session.state.columns or {}
+      rows, cols = export_rows_from_result(result), result.columns or session.state.columns or {}
+      session._export_result = result
       local fetched_count = #rows
       if destination == "clipboard" and fetched_count > 100000 then
         vim.notify("Clipboard export is limited to 100,000 rows; export to a file instead",
@@ -1736,13 +1764,15 @@ local function request_export_rows(session, destination, callback)
       vim.notify("No rows to export", vim.log.levels.WARN)
       return
     end
-    callback(rows, cols, scope)
+    local result = scope == "All matching rows" and session._export_result or nil
+    session._export_result = nil
+    callback(rows, cols, scope, export_opts(session, result))
   end)
 end
 
 --- Stream an export to a same-directory temporary file, then atomically rename
 --- it into place. Any formatter/write/rename failure removes only the temp file.
-local function write_export_file(rows, cols, format, table_name, path)
+local function write_export_file(rows, cols, format, table_name, path, opts)
   local temp = string.format("%s.grip-tmp-%d-%d", path, vim.fn.getpid(), vim.uv.hrtime())
   local file, open_err = io.open(temp, "wb")
   if not file then return nil, open_err end
@@ -1760,7 +1790,7 @@ local function write_export_file(rows, cols, format, table_name, path)
     for start = 1, #rows, batch_size do
       local batch = {}
       for i = start, math.min(start + batch_size - 1, #rows) do batch[#batch + 1] = rows[i] end
-      local lines = format_export(batch, cols, format, table_name)
+      local lines = format_export(batch, cols, format, table_name, opts)
       if format == "csv" and not first_batch then table.remove(lines, 1) end
       if format == "json" then
         table.remove(lines, 1)
@@ -1797,7 +1827,7 @@ function M.export_to_clipboard(bufnr)
     vim.notify("No grip result to export", vim.log.levels.WARN)
     return
   end
-  request_export_rows(session, "clipboard", function(rows, cols)
+  request_export_rows(session, "clipboard", function(rows, cols, _, opts)
     local formats = { "CSV", "TSV", "JSON", "SQL INSERT", "Markdown", "Grip Table" }
     vim.ui.select(formats, { prompt = "Export format:" }, function(choice)
       if not choice then return end
@@ -1806,7 +1836,7 @@ function M.export_to_clipboard(bufnr)
         ["SQL INSERT"] = "sql", ["Markdown"] = "markdown", ["Grip Table"] = "grip",
       }
       local output = table.concat(format_export(
-        rows, cols, ids[choice], session.state.table_name or "table_name"), "\n")
+        rows, cols, ids[choice], session.state.table_name or "table_name", opts), "\n")
       vim.fn.setreg("+", output)
       vim.notify(string.format("Exported %d rows as %s to clipboard", #rows, choice),
         vim.log.levels.INFO)
@@ -1823,7 +1853,7 @@ function M.do_export(bufnr)
     return
   end
 
-  request_export_rows(session, "file", function(rows, cols)
+  request_export_rows(session, "file", function(rows, cols, _, opts)
     -- Scope is intentionally chosen before format.
     local fmt = ui.input({ prompt = "Export format [csv/json/sql]: " })
     if not fmt then return end
@@ -1842,7 +1872,7 @@ function M.do_export(bufnr)
     if not path then return end
 
     local ok, err = write_export_file(
-      rows, cols, fmt, session.query_spec and session.query_spec.table_name, path)
+      rows, cols, fmt, session.query_spec and session.query_spec.table_name, path, opts)
     if ok then
       vim.notify(string.format("Exported %d rows → %s", #rows, path), vim.log.levels.INFO)
     else
