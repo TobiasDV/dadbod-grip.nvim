@@ -14,7 +14,11 @@ vim.fn.mkdir(dir, "p")
 local script = {
   "#!/bin/sh",
   "tr '\\000' '\\n' < /proc/$$/cmdline > \"$GRIP_DB_CMDLINE_FILE\"",
-  "cat > \"$GRIP_DB_STDIN_FILE\"",
+  -- The script channel: a -i file (sqlcmd) or stdin (everything else).
+  "script=",
+  "prev=",
+  "for a in \"$@\"; do [ \"$prev\" = -i ] && script=\"$a\"; prev=\"$a\"; done",
+  "if [ -n \"$script\" ]; then cat \"$script\" > \"$GRIP_DB_STDIN_FILE\"; else cat > \"$GRIP_DB_STDIN_FILE\"; fi",
   "case \"${0##*/}\" in",
   "  psql)",
   "    printf 'PGSERVICE=%s\\nPGPASSWORD=%s\\nPGOPTIONS=%s\\n' \"$PGSERVICE\" \"$PGPASSWORD\" \"$PGOPTIONS\" > \"$GRIP_DB_ENV_FILE\"",

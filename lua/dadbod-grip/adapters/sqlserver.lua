@@ -66,7 +66,7 @@ local function split_table_name(table_name, default_schema)
   return sql_util.split_table_name(table_name, default_schema or "dbo")
 end
 
---- Build connection-only argv. Statements always arrive through stdin.
+--- Build connection-only argv. Statements arrive in a script file (-i).
 local function sqlcmd_args(parsed, opts)
   local server = parsed.host or "127.0.0.1"
   if parsed.port and parsed.port ~= "" then
@@ -123,13 +123,24 @@ local function sqlcmd_args(parsed, opts)
 end
 
 --- Prefix the session settings required by ordinary query execution.
-local function sqlcmd_stdin(sql_str, opts)
+local function sqlcmd_script(sql_str, opts)
   opts = opts or {}
   local session = "SET QUOTED_IDENTIFIER ON;\n"
   if opts.nocount ~= false then session = session .. "SET NOCOUNT ON;\n" end
-  -- go-sqlcmd ignores a last stdin line with no newline, so without it the
-  -- statement never runs and the query comes back as an empty grid.
+  -- go-sqlcmd ignores a last line with no newline when it reads the script
+  -- from stdin; terminating it keeps the script valid however it is fed.
   return session .. sql_str .. "\n"
+end
+
+--- Write `script` to a private temp file for sqlcmd -i. Statements never go
+--- through stdin: Microsoft's ODBC sqlcmd breaks a line it reads from a pipe
+--- every ~4096 bytes, which put a newline inside long string literals.
+local function script_file(script)
+  local path = vim.fn.tempname() .. ".sql"
+  local f = assert(io.open(path, "wb"))
+  f:write(script)
+  f:close()
+  return path
 end
 
 --- opts.env for one sqlcmd invocation: SQLCMDPASSWORD carrying the password so
@@ -143,20 +154,27 @@ local function sqlcmd_env(parsed)
   return { SQLCMDPASSWORD = parsed.pass or "" }
 end
 
---- Build and run the sqlcmd command, blocking.
-local function sqlcmd(parsed, sql_str, timeout_ms, opts)
-  return adapters.run_cmd(sqlcmd_args(parsed, opts),
+--- Run `script` through sqlcmd -i, blocking, and remove the file afterwards.
+local function run_script(parsed, script, timeout_ms, opts)
+  local path = script_file(script)
+  local args = sqlcmd_args(parsed, opts)
+  vim.list_extend(args, { "-i", path })
+  local stdout, stderr, code = adapters.run_cmd(args,
     timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
-    { stdin = sqlcmd_stdin(sql_str, opts), env = sqlcmd_env(parsed) })
+    { env = sqlcmd_env(parsed) })
+  os.remove(path)
+  return stdout, stderr, code
 end
 
---- Run GO-separated batches by feeding them to sqlcmd on stdin. `-Q` can only
---- carry one batch, and SET SHOWPLAN_TEXT has to be alone in its own.
+--- Build and run the sqlcmd command, blocking.
+local function sqlcmd(parsed, sql_str, timeout_ms, opts)
+  return run_script(parsed, sqlcmd_script(sql_str, opts), timeout_ms, opts)
+end
+
+--- Run GO-separated batches as one sqlcmd script. `-Q` can only carry one
+--- batch, and SET SHOWPLAN_TEXT has to be alone in its own.
 local function sqlcmd_batch(parsed, batches, timeout_ms)
-  local script = table.concat(batches, "\nGO\n") .. "\nGO\n"
-  return adapters.run_cmd(sqlcmd_args(parsed),
-    timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
-    { stdin = script, env = sqlcmd_env(parsed) })
+  return run_script(parsed, table.concat(batches, "\nGO\n") .. "\nGO\n", timeout_ms)
 end
 
 --- Message for a non-zero sqlcmd exit. With -b the server's "Msg 208, ..." text
@@ -531,15 +549,19 @@ local function run_query_async(sql_str, url, timeout_ms, callback)
     return
   end
 
-  adapters.run_cmd_async(sqlcmd_args(parsed),
+  local path = script_file(sqlcmd_script(normalize_query_sql(sql_str)))
+  local args = sqlcmd_args(parsed)
+  vim.list_extend(args, { "-i", path })
+  adapters.run_cmd_async(args,
     timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
     function(stdout, stderr, code)
+      os.remove(path)
       if code ~= 0 then
         callback(nil, sqlcmd_error(stdout, stderr, code))
         return
       end
       callback(parse_sqlcmd_table(stdout), nil)
-    end, { stdin = sqlcmd_stdin(normalize_query_sql(sql_str)), env = sqlcmd_env(parsed) })
+    end, { env = sqlcmd_env(parsed) })
 end
 
 function M.query(sql_str, url)
@@ -889,9 +911,9 @@ function M.get_table_stats(table_name, url)
 end
 
 --- SHOWPLAN_TEXT has to be the only statement in its batch, so the plan cannot
---- go through run_query's single stdin script (which also prefixes SET NOCOUNT ON):
+--- go through run_query's single script (which also prefixes SET NOCOUNT ON):
 --- the server answers every such attempt with "The SET SHOWPLAN statements must
---- be the only statements in the batch". Two GO-separated batches on stdin.
+--- be the only statements in the batch". Two GO-separated batches instead.
 function M.explain(sql_str, url)
   if vim.fn.executable("sqlcmd") == 0 then
     return nil, "sqlcmd not found. Install Microsoft sqlcmd tools."
@@ -921,7 +943,7 @@ M._parse_url = parse_url
 M._parse_sqlcmd_table = parse_sqlcmd_table
 M._sqlcmd_args = sqlcmd_args
 M._sqlcmd_env = sqlcmd_env
-M._sqlcmd_stdin = sqlcmd_stdin
+M._sqlcmd_script = sqlcmd_script
 M._normalize_query_sql = normalize_query_sql
 M._json_page_sql = json_page_sql
 M._decode_json_row = decode_json_row

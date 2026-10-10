@@ -40,6 +40,15 @@ end
 
 -- ── mock helpers ──────────────────────────────────────────────────────────────
 
+--- What sqlcmd was given to run: the -i script file's contents, or stdin.
+--- Read inside the mock, since the adapter removes the file afterwards.
+local function script_of(args, opts)
+  for i, a in ipairs(args) do
+    if a == "-i" then return table.concat(vim.fn.readfile(args[i + 1], "b"), "\n") end
+  end
+  return opts and opts.stdin
+end
+
 local function with_system_mock(stdout, stderr, code, fn)
   local orig = vim.system
   vim.system = function(_args, _opts, cb)
@@ -56,7 +65,7 @@ local function capture_system_args(stdout, fn)
   local orig = vim.system
   vim.system = function(args, opts, cb)
     captured = args
-    captured._stdin = opts and opts.stdin
+    captured._stdin = script_of(args, opts)
     local r = { stdout = stdout or "", stderr = "", code = 0 }
     if cb then cb(r) else return { wait = function() return r end } end
   end
@@ -75,7 +84,7 @@ local function capture_system_call(stdout, fn)
   vim.system = function(args, opts, cb)
     call_count = call_count + 1
     captured_args = args
-    captured_opts = opts
+    captured_opts = vim.tbl_extend("force", opts or {}, { script = script_of(args, opts) })
     local r = { stdout = stdout or "", stderr = "", code = 0 }
     if cb then cb(r) else return { wait = function() return r end } end
   end
@@ -515,7 +524,7 @@ test("sqlserver query: builds sqlcmd args for non-interactive use", function()
       assert(not tostring(a):find("pw", 1, true), "password in argv: " .. tostring(a))
     end
     eq(opts.env.SQLCMDPASSWORD, "pw", "password delivered via env instead")
-    contains(opts.stdin, "SELECT 1", "query delivered via stdin")
+    contains(opts.script, "SELECT 1", "query delivered as the script")
   end)
 end)
 
@@ -533,7 +542,7 @@ test("sqlserver query: sends one complete multi-batch block in one invocation", 
       assert(result, err)
     end)
     eq(calls, 1, "one sqlcmd process")
-    contains(opts.stdin, block, "complete block delivered through one stdin")
+    contains(opts.script, block, "complete block delivered as one script")
   end)
 end)
 
@@ -1382,8 +1391,16 @@ for _, case in ipairs(BATCH_ARGV_CASES) do
     end)
     assert(sync_argv ~= nil, case.name .. ": blocking path must spawn a process")
     assert(async_argv ~= nil, case.name .. ": async path must spawn a process")
-    eq_argv(async_argv, sync_argv, case.name .. " async argv must match sync argv")
-    eq(async_opts.stdin, sync_opts.stdin, case.name .. " async stdin must match sync stdin")
+    -- sqlcmd's -i names a fresh temp file per call; its contents are compared below.
+    local function masked(argv)
+      local out = vim.deepcopy(argv)
+      for i, v in ipairs(out) do
+        if v == "-i" then out[i + 1] = "<script>" end
+      end
+      return out
+    end
+    eq_argv(masked(async_argv), masked(sync_argv), case.name .. " async argv must match sync argv")
+    eq(async_opts.script, sync_opts.script, case.name .. " async script must match sync script")
     local sync_env = vim.deepcopy(sync_opts.env or {})
     local async_env = vim.deepcopy(async_opts.env or {})
     if case.name == "pg" then
