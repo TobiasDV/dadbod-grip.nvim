@@ -352,11 +352,16 @@ function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind, opts
   local types = opts and opts.types
   local pk_set = {}
   for _, pk in ipairs(pks) do pk_set[pk] = true end
+  local EMPTY = require("dadbod-grip.data").EMPTY
   local where_parts = {}
   for col, val in pairs(values) do
-    if not pk_set[col] and not (skip and skip[col])
-      and val and val ~= "" and val ~= NULL_SENTINEL then
-      table.insert(where_parts, quote_ident(col) .. " = " .. M.value_sql(tostring(val), adapter_kind, types and types[col]))
+    if not pk_set[col] and val and val ~= "" and val ~= NULL_SENTINEL then
+      if not (skip and skip[col]) then
+        table.insert(where_parts, quote_ident(col) .. " = " .. M.value_sql(tostring(val), adapter_kind, types and types[col]))
+      elseif adapter_kind == "sqlserver" and types and types[col] then
+        -- = refuses text, ntext, xml, ...: compare them as text instead.
+        table.insert(where_parts, M.equals_sql(col, val == EMPTY and "" or tostring(val), adapter_kind, types[col]))
+      end
     end
   end
   if #where_parts == 0 then return nil end

@@ -565,6 +565,24 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server can undo an insert whose values are all text or ntext", function()
+    local probe = "grip_live_textonly"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT IDENTITY(1,1) PRIMARY KEY, txt TEXT, ntxt NTEXT)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " (txt, ntxt) VALUES ('old', N'old')", URL))
+      local st = grid(probe)
+      local values = { txt = "new", ntxt = "nieuw ✓" }
+      assert(db.execute(sql.build_insert(probe, values, st.columns, "sqlserver"), URL))
+      local find_sql = sql.build_insert_lookup(probe, st.pks, values, st.incomparable_columns, "sqlserver",
+        sql.state_opts(st))
+      assert(find_sql, "a lookup, not none")
+      eq(assert(db.query(find_sql, URL)).rows[1][1], "2", "the inserted row")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server reports the server's error for a view it cannot describe", function()
     local probe, broken = "grip_live_base", "grip_live_broken"
     db.execute("DROP VIEW IF EXISTS " .. broken, URL)
