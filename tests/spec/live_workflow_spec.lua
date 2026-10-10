@@ -514,6 +514,31 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       "the server's own error: " .. tostring(bad.err))
   end)
 
+  test("SQL Server profiles (gR, gS) tables with bit, image, text, xml and geography", function()
+    local profile = require("dadbod-grip.profile")
+    local probe = "grip_live_profile"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, flag BIT, img IMAGE, txt TEXT,"
+        .. " doc XML, loc GEOGRAPHY, g UNIQUEIDENTIFIER, name NVARCHAR(20))", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, 1, 0x01, 'a', '<a/>', geography::Point(1, 2, 4326), NEWID(), N'x'),"
+        .. " (2, 0, NULL, NULL, NULL, NULL, NULL, NULL)", URL))
+      local data_report, report_err = profile.gather(probe, URL)
+      assert(data_report, "gR: " .. tostring(report_err))
+      eq(#data_report.profiles, 8, "every column profiled")
+      for _, p in ipairs(data_report.profiles) do
+        if p.name == "img" then eq(p.nulls, 1, "img nulls") end
+        if p.name == "flag" then eq(p.max, "1", "bit max") end
+      end
+      for _, ci in ipairs(db.get_column_info(probe, URL)) do
+        local cs, cs_err = profile.gather_column(probe, ci.column_name, ci.data_type, URL)
+        assert(cs, "gS " .. ci.column_name .. ": " .. tostring(cs_err))
+      end
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server reports the server's error for a view it cannot describe", function()
     local probe, broken = "grip_live_base", "grip_live_broken"
     db.execute("DROP VIEW IF EXISTS " .. broken, URL)

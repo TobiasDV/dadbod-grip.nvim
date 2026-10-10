@@ -740,6 +740,33 @@ test("gather: date column carries top values, not a single-spike sparkline", fun
   assert(ordered_at.top_values and #ordered_at.top_values > 0, "date has top values")
 end)
 
+-- ── columns an aggregate cannot read as they are ───────────────────────────
+
+test("build_stats_sql: SQL Server bit goes through a cast, image/text/xml are not aggregated", function()
+  local stats = profile.build_stats_sql("t", {
+    { column_name = "flag", data_type = "bit" },
+    { column_name = "img", data_type = "image" },
+    { column_name = "doc", data_type = "xml" },
+    { column_name = "name", data_type = "nvarchar(50)" },
+  }, "sqlserver")
+  assert(not stats:find('MIN("flag")', 1, true), "MIN of a bit")
+  contains(stats, 'MIN(CAST("flag" AS INT))')
+  assert(not stats:find('"img") FROM', 1, true), "no aggregate reads image")
+  assert(not stats:find('DISTINCT "doc"', 1, true), "no aggregate reads xml")
+  contains(stats, '"img" IS NULL', "nulls still counted")
+  contains(stats, 'MIN("name")')
+end)
+
+test("build_stats_sql: postgres text is an ordinary column", function()
+  contains(profile.build_stats_sql("t", { { column_name = "body", data_type = "text" } }, "postgresql"),
+    'MIN("body")')
+end)
+
+test("build_histogram_sql: nothing to group for an image column", function()
+  eq(profile.build_histogram_sql("t", "img", "unknown", nil, nil, "image", "sqlserver"), nil)
+  assert(profile.build_histogram_sql("t", "flag", "unknown", nil, nil, "bit", "sqlserver"))
+end)
+
 -- ── summary ──────────────────────────────────────────────────────────────────
 
 print(string.format("\nprofile_spec: %d passed, %d failed", pass, fail))

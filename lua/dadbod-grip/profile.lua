@@ -101,18 +101,49 @@ end
 
 -- ── SQL generation ────────────────────────────────────────────────────────────
 
+-- SQL Server types no aggregate, DISTINCT or GROUP BY may read.
+local SQLSERVER_UNAGGREGATABLE = {
+  text = true, ntext = true, image = true, xml = true, geography = true, geometry = true,
+}
+
+--- How the aggregates may read a column: nil when they cannot read it at all,
+--- else { value = <expr for DISTINCT and GROUP BY>, minmax = <expr for MIN/MAX> }.
+--- MIN/MAX refuse booleans (and SQL Server's bit), so those go through INT.
+function M.column_exprs(col_sql, data_type, adapter_kind)
+  local base = ((data_type or ""):lower():match("^%a+")) or ""
+  if adapter_kind == "sqlserver" and SQLSERVER_UNAGGREGATABLE[base] then return nil end
+  local minmax = col_sql
+  if M.classify_column(data_type) == "boolean" or (adapter_kind == "sqlserver" and base == "bit") then
+    minmax = "CAST(" .. col_sql .. " AS INT)"
+  end
+  return { value = col_sql, minmax = minmax }
+end
+
+--- The adapter kind of a connection URL, for the builders below.
+local function kind_of(url)
+  return require("dadbod-grip.adapters").kind(db.resolved_url(url))
+end
+
 --- Build a batched stats query for multiple columns.
 --- Returns one row with interleaved per-column stats.
-function M.build_stats_sql(table_name, col_infos)
+function M.build_stats_sql(table_name, col_infos, adapter_kind)
   local tbl = sql.quote_ident(table_name)
   local parts = { "(SELECT COUNT(*) FROM " .. tbl .. ") AS _total" }
   for i, ci in ipairs(col_infos) do
     local col = sql.quote_ident(ci.column_name)
     local cat = M.classify_column(ci.data_type)
-    table.insert(parts, string.format("(SELECT COUNT(DISTINCT %s) FROM %s) AS _d%d", col, tbl, i))
-    table.insert(parts, string.format("(SELECT COUNT(*) - COUNT(%s) FROM %s) AS _n%d", col, tbl, i))
-    table.insert(parts, string.format("(SELECT MIN(%s) FROM %s) AS _min%d", col, tbl, i))
-    table.insert(parts, string.format("(SELECT MAX(%s) FROM %s) AS _max%d", col, tbl, i))
+    local ex = M.column_exprs(col, ci.data_type, adapter_kind)
+    if ex then
+      table.insert(parts, string.format("(SELECT COUNT(DISTINCT %s) FROM %s) AS _d%d", ex.value, tbl, i))
+      table.insert(parts, string.format("(SELECT COUNT(*) - COUNT(%s) FROM %s) AS _n%d", ex.value, tbl, i))
+      table.insert(parts, string.format("(SELECT MIN(%s) FROM %s) AS _min%d", ex.minmax, tbl, i))
+      table.insert(parts, string.format("(SELECT MAX(%s) FROM %s) AS _max%d", ex.minmax, tbl, i))
+    else
+      table.insert(parts, string.format("NULL AS _d%d", i))
+      table.insert(parts, string.format("(SELECT COUNT(*) FROM %s WHERE %s IS NULL) AS _n%d", tbl, col, i))
+      table.insert(parts, string.format("NULL AS _min%d", i))
+      table.insert(parts, string.format("NULL AS _max%d", i))
+    end
     if cat == "numeric" then
       table.insert(parts, string.format("(SELECT AVG(CAST(%s AS REAL)) FROM %s) AS _avg%d", col, tbl, i))
     end
@@ -131,9 +162,12 @@ end
 --- Build a histogram query for one column.
 --- Text, boolean and unknown columns -- and anything numeric or date-like whose
 --- bounds cannot be bucketed -- get the top BUCKET_COUNT values by frequency.
-function M.build_histogram_sql(table_name, col_name, col_type, min_val, max_val)
+--- nil when the column cannot be grouped at all (see column_exprs); data_type
+--- and adapter_kind may be omitted for the generic behaviour.
+function M.build_histogram_sql(table_name, col_name, col_type, min_val, max_val, data_type, adapter_kind)
   local tbl = sql.quote_ident(table_name)
   local col = sql.quote_ident(col_name)
+  if not M.column_exprs(col, data_type, adapter_kind) then return nil end
 
   if not M.is_bucketed(col_type, min_val, max_val) then
     return string.format(
@@ -174,7 +208,8 @@ function M.gather(table_name, url)
   end
 
   -- Fetch batched stats
-  local stats_sql = M.build_stats_sql(table_name, limited)
+  local kind = kind_of(url)
+  local stats_sql = M.build_stats_sql(table_name, limited, kind)
   local stats_result, stats_err = db.query(stats_sql, url)
   if not stats_result or #stats_result.rows == 0 then
     return nil, stats_err or "Stats query returned no data"
@@ -223,8 +258,8 @@ function M.gather(table_name, url)
 
   -- Fetch histograms per column
   for i, p in ipairs(profiles) do
-    local hist_sql = M.build_histogram_sql(table_name, p.name, p.category, p.min, p.max)
-    local hist_result = db.query(hist_sql, url)
+    local hist_sql = M.build_histogram_sql(table_name, p.name, p.category, p.min, p.max, p.data_type, kind)
+    local hist_result = hist_sql and db.query(hist_sql, url)
     if hist_result and #hist_result.rows > 0 then
       -- Which shape the rows have is decided by the same predicate that chose
       -- the SQL. The open-coded version this replaced left "date" out, so a
@@ -281,12 +316,18 @@ end
 function M.gather_column(table_name, col_name, data_type, url)
   local tbl = sql.quote_ident(table_name)
   local col = sql.quote_ident(col_name)
+  local kind = kind_of(url)
+  local ex = M.column_exprs(col, data_type, kind)
 
-  local stats_sql = string.format(
+  local stats_sql = ex and string.format(
     "SELECT COUNT(*) AS total, COUNT(DISTINCT %s) AS distinct_count, " ..
     "COUNT(*) - COUNT(%s) AS null_count, MIN(%s) AS min_val, MAX(%s) AS max_val " ..
     "FROM %s",
-    col, col, col, col, tbl
+    ex.value, ex.value, ex.minmax, ex.minmax, tbl
+  ) or string.format(
+    "SELECT COUNT(*) AS total, NULL AS distinct_count, " ..
+    "SUM(CASE WHEN %s IS NULL THEN 1 ELSE 0 END) AS null_count, NULL AS min_val, NULL AS max_val FROM %s",
+    col, tbl
   )
   local stats_result, stats_err = db.query(stats_sql, url)
   if stats_err then return nil, stats_err end
@@ -308,8 +349,8 @@ function M.gather_column(table_name, col_name, data_type, url)
   }
 
   local bucketed = M.is_bucketed(cs.category, cs.min, cs.max)
-  local hist_result = db.query(
-    M.build_histogram_sql(table_name, col_name, cs.category, cs.min, cs.max), url)
+  local hist_sql = M.build_histogram_sql(table_name, col_name, cs.category, cs.min, cs.max, data_type, kind)
+  local hist_result = hist_sql and db.query(hist_sql, url)
   if not hist_result or #hist_result.rows == 0 then return cs end
 
   if bucketed then
