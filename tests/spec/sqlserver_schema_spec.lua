@@ -396,6 +396,21 @@ test("sqlserver query: a value over 8000 characters arrives whole and editable",
   end)
 end)
 
+test("sqlserver query: text, ntext and image columns are reported as incomparable", function()
+  with_executable(function()
+    local out = lines({
+      describe_line({ { "id", "int" }, { "txt", "text" }, { "ntxt", "ntext" }, { "name", "nvarchar(10)" } }),
+      [[{"id":1,"txt":"a","ntxt":"b","name":"c"}]],
+    })
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "legacy" LIMIT 100', URL))
+      eq(r.incomparable_columns.txt, true)
+      eq(r.incomparable_columns.ntxt, true)
+      eq(r.incomparable_columns.name, nil)
+    end)
+  end)
+end)
+
 test("sqlserver query: a server warning between JSON rows is not a row", function()
   with_executable(function()
     local out = JSON_PAGE_OUT .. "Warning: Null value is eliminated by an aggregate or other SET operation.\n"

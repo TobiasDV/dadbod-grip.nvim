@@ -281,6 +281,26 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server finds an inserted row past text and ntext columns", function()
+    local probe = "grip_live_legacy"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe
+        .. " (id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(40), txt TEXT, ntxt NTEXT)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " (name, txt, ntxt) VALUES (N'one', 'a', N'b')", URL))
+      local page = assert(db.query(query.build_sql(query.new_table(probe, 50)), URL))
+      eq(page.incomparable_columns.txt, true, "text reported")
+      local values = { name = "one", txt = "a", ntxt = "b" }
+      local find_sql = sql.build_insert_lookup(probe, { "id" }, values, page.incomparable_columns, "sqlserver")
+      local found = assert(db.query(find_sql, URL))
+      eq(found.rows[1][1], "1", "row found")
+      local _, unskipped_err = db.query(sql.build_insert_lookup(probe, { "id" }, values, nil, "sqlserver"), URL)
+      assert(unskipped_err, "comparing text with = must fail, or this test proves nothing")
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server geography columns load as editable text", function()
     local probe = "grip_live_places"
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)

@@ -237,6 +237,17 @@ test("quote_value: sqlserver splices CRs in as NCHAR(13)", function()
   eq(sql.quote_value("a\r\nb", "postgresql"), "'a\r\nb'", "other adapters unchanged")
 end)
 
+test("build_insert_lookup: matches given values, newest key first", function()
+  local s = sql.build_insert_lookup("notes", { "id" }, { title = "a", body = "b", id = "" }, nil, "sqlserver")
+  eq(s, 'SELECT "id" FROM "notes" WHERE "body" = N\'b\' AND "title" = N\'a\' ORDER BY "id" DESC LIMIT 1')
+end)
+
+test("build_insert_lookup: leaves out skipped columns, nil when nothing is left", function()
+  local s = sql.build_insert_lookup("legacy", { "id" }, { txt = "x", name = "n" }, { txt = true }, "sqlserver")
+  eq(s, 'SELECT "id" FROM "legacy" WHERE "name" = N\'n\' ORDER BY "id" DESC LIMIT 1')
+  eq(sql.build_insert_lookup("legacy", { "id" }, { txt = "x" }, { txt = true }, "sqlserver"), nil)
+end)
+
 test("quote_value: sqlserver booleans are 1/0", function()
   eq(sql.quote_value(true, "sqlserver"), "1")
   eq(sql.quote_value(false, "sqlserver"), "0")

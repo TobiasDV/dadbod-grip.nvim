@@ -294,6 +294,30 @@ function M.build_reinsert(table_name, values, columns, adapter_kind)
   return toggle .. " ON;\n" .. insert .. ";\n" .. toggle .. " OFF"
 end
 
+--- SELECT that finds the row an INSERT just created when the database
+--- generated its key: match every non-key value the INSERT was given, newest
+--- key first. Columns in `skip` (types the database cannot compare with =,
+--- such as SQL Server text and ntext) are left out. Returns nil when no column
+--- is left to match on.
+function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind)
+  local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
+  local pk_set = {}
+  for _, pk in ipairs(pks) do pk_set[pk] = true end
+  local where_parts = {}
+  for col, val in pairs(values) do
+    if not pk_set[col] and not (skip and skip[col])
+      and val and val ~= "" and val ~= NULL_SENTINEL then
+      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(tostring(val), adapter_kind))
+    end
+  end
+  if #where_parts == 0 then return nil end
+  table.sort(where_parts)
+  local pk_cols = table.concat(vim.tbl_map(quote_ident, pks), ", ")
+  return "SELECT " .. pk_cols .. " FROM " .. quote_ident(table_name)
+    .. " WHERE " .. table.concat(where_parts, " AND ")
+    .. " ORDER BY " .. quote_ident(pks[1]) .. " DESC LIMIT 1"
+end
+
 -- M.build_delete(table_name, pk_values, adapter_kind) → string
 -- pk_values: { col = "val", ... }
 function M.build_delete(table_name, pk_values, adapter_kind)

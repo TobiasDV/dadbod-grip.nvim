@@ -86,12 +86,13 @@ local function edit_copy(state)
     _next_insert_idx = state._next_insert_idx,
     readonly         = state.readonly,
     readonly_reason  = state.readonly_reason,
+    incomparable_columns = state.incomparable_columns,
   }
 end
 
 -- M.new(query_result) → State
 -- query_result = { rows, columns, primary_keys, table_name, url, sql, readonly,
---                  readonly_reason }
+--                  readonly_reason, incomparable_columns }
 -- query_result.readonly is the caller saying so outright (a read-only adapter,
 -- a connection saved with "mode": "ro"). Those callers also hand over an empty
 -- primary_keys, which already produced a read-only state on its own -- this
@@ -116,6 +117,8 @@ function M.new(query_result)
     -- Shown in the grid's "read-only: <reason>" badge.
     readonly_reason = readonly and (query_result.readonly_reason
       or (query_result.readonly == true and "connection" or "no PK")) or nil,
+    -- Columns the database cannot compare with =, kept out of value lookups.
+    incomparable_columns = query_result.incomparable_columns,
   }
 end
 

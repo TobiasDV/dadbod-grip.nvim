@@ -386,6 +386,10 @@ end
 
 local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
 
+--- Types SQL Server cannot compare with =, reported so value lookups such as
+--- sql.build_insert_lookup leave them out.
+local INCOMPARABLE_TYPES = { text = true, ntext = true, image = true }
+
 --- FOR JSON prints binaries as base64 and floats as 1.500000000000000e+000;
 --- show them as 0x hex and the shortest decimal that reads back the same.
 local function json_cell(value, type_name)
@@ -457,7 +461,14 @@ local function parse_json_page(raw)
       rows[#rows + 1] = row
     end
   end
-  return { columns = columns, rows = rows, types = types }
+  local incomparable
+  for i, type_name in ipairs(types) do
+    if INCOMPARABLE_TYPES[base_type(type_name)] then
+      incomparable = incomparable or {}
+      incomparable[columns[i]] = true
+    end
+  end
+  return { columns = columns, rows = rows, types = types, incomparable = incomparable }
 end
 
 local function run_query(sql_str, url, timeout_ms)
@@ -540,6 +551,7 @@ function M.query(sql_str, url)
     primary_keys = {},
     readonly = parsed.text or nil,
     readonly_reason = parsed.text and "plain text output" or nil,
+    incomparable_columns = parsed.incomparable,
   }, nil
 end
 

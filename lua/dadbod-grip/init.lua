@@ -686,24 +686,9 @@ local function do_apply(bufnr, url)
 
     if not next(ins_pk_values) and #st.pks > 0 then
       -- Auto-assigned PK: locate the row by non-PK values (best-effort)
-      local pk_set = {}
-      for _, pk in ipairs(st.pks) do pk_set[pk] = true end
-      local where_parts = {}
-      for col, val in pairs(ins.values) do
-        if not pk_set[col] and val and val ~= "" and val ~= data.NULL_SENTINEL then
-          table.insert(where_parts,
-            sql.quote_ident(col) .. " = " .. sql.quote_value(tostring(val), adapter_kind))
-        end
-      end
-      if #where_parts > 0 then
-        local pk_cols = table.concat(vim.tbl_map(function(pk)
-          return sql.quote_ident(pk)
-        end, st.pks), ", ")
-        -- ORDER BY pk DESC picks the highest (most recently inserted) matching row
-        local find_sql = "SELECT " .. pk_cols
-          .. " FROM " .. sql.quote_ident(st.table_name)
-          .. " WHERE " .. table.concat(where_parts, " AND ")
-          .. " ORDER BY " .. sql.quote_ident(st.pks[1]) .. " DESC LIMIT 1"
+      local find_sql = sql.build_insert_lookup(st.table_name, st.pks, ins.values,
+        st.incomparable_columns, adapter_kind)
+      if find_sql then
         local r, _ = db.query(find_sql, url)
         if r and r.rows and r.rows[1] then
           for i, pk in ipairs(st.pks) do
