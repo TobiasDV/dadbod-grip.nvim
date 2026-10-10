@@ -359,6 +359,23 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
     if not ok then error(err) end
   end)
+
+  test("SQL Server reports the server's error for a view it cannot describe", function()
+    local probe, broken = "grip_live_base", "grip_live_broken"
+    db.execute("DROP VIEW IF EXISTS " .. broken, URL)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, gone INT)", URL))
+      assert(db.execute("EXEC ('CREATE VIEW " .. broken .. " AS SELECT id, gone FROM " .. probe .. "')", URL))
+      assert(db.execute("ALTER TABLE " .. probe .. " DROP COLUMN gone", URL))
+      local page, qerr = db.query(query.build_sql(query.new_table(broken, 50)), URL)
+      eq(page, nil, "no page")
+      assert(tostring(qerr):find("Invalid column name 'gone'", 1, true), "server error: " .. tostring(qerr))
+    end)
+    db.execute("DROP VIEW IF EXISTS " .. broken, URL)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
 end
 
 print(string.format("\nlive_workflow_spec: %d passed, %d failed", pass, fail))
