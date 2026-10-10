@@ -270,9 +270,10 @@ end
 -- ── JSON pages ───────────────────────────────────────────────────────────
 -- A grid page is read as JSON produced by the server, with sqlcmd only
 -- carrying it: one FOR JSON object per row, so a tab, newline or value of any
--- length arrives escaped on one line. The same batch first describes the
--- result set, which gives the column order, the columns of an empty page,
--- and the types needed to print values the way the text output does.
+-- length arrives escaped on one line. The batch first describes the result
+-- set: that gives the column order, the columns of an empty page and the
+-- types, and the server uses the same description to format each column
+-- (see PAGE_BATCH) before the rows are built.
 
 --- The quote_ident-style name at `pos` ("dbo"."my ""table"""), or nil.
 local function quoted_name_at(s, pos)
@@ -287,15 +288,41 @@ local function quoted_name_at(s, pos)
   return s:sub(pos, stop - 1)
 end
 
--- Wrapped in a scalar SELECT: a top-level FOR JSON comes back cut into rows
--- of about 2000 characters, a scalar subquery as one value on one line.
-local DESCRIBE_SQL = "SELECT (SELECT name, system_type_name"
-  .. " FROM sys.dm_exec_describe_first_result_set(N'%s', NULL, 0)"
-  .. " ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);"
+--- Binaries larger than this many bytes arrive as "<binary N bytes>", which
+--- the grid shows as binary and the editor refuses, instead of as hex: a page
+--- of documents would otherwise ship megabytes and freeze the editor.
+local MAX_BINARY_BYTES = 8000
 
---- Types FOR JSON refuses to serialize. json_page_sql casts them to text:
---- WKT for geography and geometry, /1/2/ for hierarchyid.
-local CLR_TYPES = { geography = true, geometry = true, hierarchyid = true }
+-- One batch, run with -y 0:
+-- 1. The description, wrapped in a scalar SELECT: a top-level FOR JSON comes
+--    back cut into rows of about 2000 characters, a scalar subquery as one
+--    value on one line.
+-- 2. The rows, as a FOR JSON object each, built by dynamic SQL from that same
+--    description so every column gets the server's formatting: binaries as 0x
+--    hex (or the placeholder past MAX_BINARY_BYTES), and the CLR types FOR JSON
+--    refuses (geography, geometry, hierarchyid) as their text.
+-- When the description fails, its columns have no name, @cols stays NULL and
+-- EXEC runs nothing; parse_json_page then sends the caller to the text path.
+-- Placeholders: the statement, MAX_BINARY_BYTES, the row source, the FROM tail.
+local PAGE_BATCH = [[
+DECLARE @q nvarchar(max) = N'%s';
+DECLARE @cols nvarchar(max) = STUFF((
+  SELECT N', ' + CASE
+      WHEN system_type_name LIKE N'%%binary%%' OR system_type_name IN (N'image', N'timestamp')
+        THEN N'CASE WHEN DATALENGTH(' + ref + N') > %d'
+          + N' THEN CONCAT(N''<binary '', DATALENGTH(' + ref + N'), N'' bytes>'')'
+          + N' ELSE CONVERT(varchar(max), CONVERT(varbinary(max), ' + ref + N'), 1) END'
+      WHEN system_type_name IN (N'geography', N'geometry', N'hierarchyid')
+        THEN N'CAST(' + ref + N' AS nvarchar(max))'
+      ELSE ref
+    END + N' AS ' + QUOTENAME(name)
+  FROM (SELECT name, system_type_name, column_ordinal, N'%s.' + QUOTENAME(name) AS ref
+        FROM sys.dm_exec_describe_first_result_set(@q, NULL, 0)) AS d
+  ORDER BY column_ordinal
+  FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'');
+SELECT (SELECT name, system_type_name FROM sys.dm_exec_describe_first_result_set(@q, NULL, 0)
+  ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);
+EXEC (N'SELECT (SELECT ' + @cols + N' FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) ' + N'%s');]]
 
 --- "nvarchar" for "nvarchar(max)".
 local function base_type(type_name)
@@ -303,12 +330,9 @@ local function base_type(type_name)
 end
 
 --- Rewrite a query.build_sql statement (SELECT * over a quoted table or over
---- the `(...) AS _grip` wrapper) into the describe + JSON batch. Its WHERE,
---- ORDER BY and paging stay as they are. Each row object is `<source>.*`,
---- or with `columns` (from described_columns) an explicit list that casts
---- CLR columns to text. Returns the batch and its describe statement alone,
---- or nil for any other statement.
-local function json_page_sql(sql_str, columns)
+--- the `(...) AS _grip` wrapper) into PAGE_BATCH. Its WHERE, ORDER BY and
+--- paging stay as they are. Returns nil for any other statement.
+local function json_page_sql(sql_str)
   local body = sql_str:gsub("[%s;]+$", "")
   local from_kw, source_pos = body:match(
     "^%s*[Ss][Ee][Ll][Ee][Cc][Tt]%s+%*%s+()[Ff][Rr][Oo][Mm]%s+()")
@@ -323,22 +347,7 @@ local function json_page_sql(sql_str, columns)
     if not source then return nil end
   end
 
-  local row_list = source .. ".*"
-  if columns then
-    local parts = {}
-    for i, col in ipairs(columns) do
-      local name = '"' .. col.name:gsub('"', '""') .. '"'
-      local ref = source .. "." .. name
-      if CLR_TYPES[base_type(col.type)] then ref = "CAST(" .. ref .. " AS nvarchar(max))" end
-      parts[i] = ref .. " AS " .. name
-    end
-    row_list = table.concat(parts, ", ")
-  end
-
-  local describe = string.format(DESCRIBE_SQL, esc(body))
-  return describe .. "\n" .. string.format(
-    "SELECT (SELECT %s FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) %s",
-    row_list, body:sub(from_kw)), describe
+  return string.format(PAGE_BATCH, esc(body), MAX_BINARY_BYTES, esc(source), esc(body:sub(from_kw)))
 end
 
 --- Index of the quote closing the JSON string that opens at `pos`.
@@ -402,22 +411,18 @@ local function decode_json_row(line)
   end
 end
 
-local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
-
 --- Types SQL Server cannot compare with =, reported so value lookups such as
 --- sql.build_insert_lookup leave them out.
-local INCOMPARABLE_TYPES = { text = true, ntext = true, image = true }
+local INCOMPARABLE_TYPES = {
+  text = true, ntext = true, image = true, xml = true, geography = true, geometry = true,
+}
 
---- FOR JSON prints binaries as base64 and floats as 1.500000000000000e+000;
---- show them as 0x hex and the shortest decimal that reads back the same.
+--- FOR JSON prints floats as 1.500000000000000e+000; show the shortest
+--- decimal that reads back the same. Everything else arrives as the grid
+--- shows it (binaries already as hex, see PAGE_BATCH).
 local function json_cell(value, type_name)
   if value == "" then return value end
   local base = base_type(type_name)
-  if BINARY_TYPES[base] then
-    local ok, bytes = pcall(vim.base64.decode, value)
-    if not ok then return nil end
-    return "0x" .. bytes:gsub(".", function(b) return string.format("%02X", b:byte()) end)
-  end
   if base == "float" or base == "real" then
     local n = tonumber(value)
     if not n then return nil end
@@ -429,7 +434,7 @@ local function json_cell(value, type_name)
   return value
 end
 
---- The { name, type } list a DESCRIBE_SQL result printed: its first output
+--- The { name, type } list the description in a PAGE_BATCH printed: its first output
 --- line that is a JSON array. nil when there is none or a column has no name,
 --- as when the server cannot describe the statement.
 local function described_columns(raw)
@@ -498,25 +503,17 @@ local function run_query(sql_str, url, timeout_ms)
   if not parsed then return nil, parse_err end
 
   local query_sql = normalize_query_sql(sql_str)
-  local page_sql, describe_sql = json_page_sql(query_sql)
+  local page_sql = json_page_sql(query_sql)
   if page_sql then
     local stdout, stderr, code = sqlcmd(parsed, page_sql, timeout_ms, { json = true })
-    if code ~= 0 then
-      local err = sqlcmd_error(stdout, stderr, code)
-      -- Any other error would fail on the text path too.
-      if not err:find("FOR JSON", 1, true) then return nil, err end
-      -- FOR JSON refuses CLR columns such as geography, and says so before
-      -- the describe half runs. Describe the page on its own and retry with
-      -- those columns cast to text.
-      local described, _, describe_code = sqlcmd(parsed, describe_sql, timeout_ms, { json = true })
-      local columns = describe_code == 0 and described_columns(described)
-      if columns then
-        stdout, _, code = sqlcmd(parsed, json_page_sql(query_sql, columns), timeout_ms, { json = true })
-      end
-    end
     if code == 0 then
       local page = parse_json_page(stdout)
       if page then return page, nil end
+    else
+      local err = sqlcmd_error(stdout, stderr, code)
+      -- FOR JSON still refuses a user-defined CLR type, which the text output
+      -- can show; any other error would fail on the text path too.
+      if not err:find("FOR JSON", 1, true) then return nil, err end
     end
   end
 

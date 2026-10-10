@@ -321,6 +321,26 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server pages of large binaries load quickly, with placeholders", function()
+    local probe = "grip_live_blobs"
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    local ok, err = pcall(function()
+      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, blob VARBINARY(MAX))", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " SELECT n, CAST(REPLICATE(CAST('A' AS VARCHAR(MAX)), 2000000)"
+        .. " AS VARBINARY(MAX)) FROM (VALUES (1), (2), (3), (4), (5)) AS v(n)", URL))
+      assert(db.execute("INSERT INTO " .. probe .. " VALUES (6, 0x41)", URL))
+      local started = vim.uv.hrtime()
+      local page = assert(db.query(query.build_sql(query.new_table(probe, 50)), URL))
+      local seconds = (vim.uv.hrtime() - started) / 1e9
+      eq(page.rows[1][2], "<binary 2000000 bytes>", "large binary")
+      eq(page.rows[6][2], "0x41", "small binary as hex")
+      eq(page.readonly, nil, "grid stays editable")
+      assert(seconds < 5, string.format("page took %.1f s", seconds))
+    end)
+    db.execute("DROP TABLE IF EXISTS " .. probe, URL)
+    if not ok then error(err) end
+  end)
+
   test("SQL Server geography columns load as editable text", function()
     local probe = "grip_live_places"
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
