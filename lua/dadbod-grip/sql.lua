@@ -347,7 +347,9 @@ end
 --- key first. Columns in `skip` (types the database cannot compare with =,
 --- such as SQL Server text and ntext) are left out. Returns nil when no column
 --- is left to match on.
-function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind, opts)
+--- The WHERE that finds a row by the values it was inserted with, or nil
+--- when no value can be compared.
+local function lookup_where(pks, values, skip, adapter_kind, opts)
   local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
   local types = opts and opts.types
   local pk_set = {}
@@ -366,10 +368,90 @@ function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind, opts
   end
   if #where_parts == 0 then return nil end
   table.sort(where_parts)
+  return table.concat(where_parts, " AND ")
+end
+
+function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind, opts)
+  local where = lookup_where(pks, values, skip, adapter_kind, opts)
+  if not where then return nil end
   local pk_cols = table.concat(vim.tbl_map(quote_ident, pks), ", ")
   return "SELECT " .. pk_cols .. " FROM " .. quote_ident(table_name)
-    .. " WHERE " .. table.concat(where_parts, " AND ")
+    .. " WHERE " .. where
     .. " ORDER BY " .. quote_ident(pks[1]) .. " DESC LIMIT 1"
+end
+
+--- One query that lists, for every staged insert the database gives a key
+--- (no key value staged), the keys of all rows holding its values. Run it
+--- before and after the apply: the new keys are the inserted rows, whatever
+--- order the keys have (a GUID's "highest" is not the newest).
+--- Returns nil when no insert needs it, else
+--- { sql, slots = { [insert_i] = branch }, groups = { [insert_i] = where } }.
+function M.build_inserted_keys(state, adapter_kind)
+  local data = require("dadbod-grip.data")
+  if #state.pks == 0 then return nil end
+  local pk_cols = table.concat(vim.tbl_map(quote_ident, state.pks), ", ")
+  local branches, slots, groups = {}, {}, {}
+  for i, ins in ipairs(data.get_inserts(state)) do
+    local explicit = false
+    for _, pk in ipairs(state.pks) do
+      local v = ins.values[pk]
+      if v ~= nil and v ~= data.NULL_SENTINEL then explicit = true end
+    end
+    local where = not explicit and lookup_where(state.pks, ins.values, state.incomparable_columns,
+      adapter_kind, M.state_opts(state))
+    if where then
+      branches[#branches + 1] = string.format("SELECT %d AS _grip_k, %s FROM %s WHERE %s",
+        #branches + 1, pk_cols, quote_ident(state.table_name), where)
+      slots[i], groups[i] = #branches, where
+    end
+  end
+  if #branches == 0 then return nil end
+  return { sql = table.concat(branches, " UNION ALL "), slots = slots, groups = groups }
+end
+
+--- The inserted rows' keys from the build_inserted_keys rows before and
+--- after the apply: { [insert_i] = { pk = value } }. Inserts with the same
+--- values share their new rows; when the count does not match, they get none
+--- rather than a guess.
+function M.match_inserted_keys(plan, before_rows, after_rows, pks)
+  local function by_branch(rows)
+    local out = {}
+    for _, row in ipairs(rows or {}) do
+      local k = tonumber(row[1])
+      if k then
+        out[k] = out[k] or {}
+        table.insert(out[k], table.concat(row, "\31", 2, #pks + 1))
+      end
+    end
+    return out
+  end
+  local before, after = by_branch(before_rows), by_branch(after_rows)
+  local members, order = {}, {}
+  for i = 1, table.maxn(plan.slots) do
+    local g = plan.groups[i]
+    if g then
+      if not members[g] then members[g] = {}; order[#order + 1] = g end
+      table.insert(members[g], i)
+    end
+  end
+  local keys = {}
+  for _, g in ipairs(order) do
+    local k = plan.slots[members[g][1]]
+    local seen = {}
+    for _, t in ipairs(before[k] or {}) do seen[t] = true end
+    local new = {}
+    for _, t in ipairs(after[k] or {}) do if not seen[t] then new[#new + 1] = t end end
+    table.sort(new)
+    if #new == #members[g] then
+      for j, i in ipairs(members[g]) do
+        local parts = vim.split(new[j], "\31", { plain = true })
+        local key = {}
+        for p, pk in ipairs(pks) do key[pk] = parts[p] end
+        keys[i] = key
+      end
+    end
+  end
+  return keys
 end
 
 -- M.build_delete(table_name, pk_values, adapter_kind) → string

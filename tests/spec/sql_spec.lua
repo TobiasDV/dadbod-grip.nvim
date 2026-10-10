@@ -371,6 +371,30 @@ b']])
   eq(sql.equals_sql("c", "x", "postgresql", "text"), [["c" = 'x']], "other adapters unchanged")
 end)
 
+test("build_inserted_keys: one query for every insert without a key", function()
+  local st = data_mod.new({ rows = { { "g1", "first" } }, columns = { "id", "label" }, primary_keys = { "id" },
+    table_name = "t" })
+  st = data_mod.clone_row(st, 1)
+  st = data_mod.clone_row(st, 1)
+  st = data_mod.insert_row_with_values(st, 1, { id = "explicit", label = "x" })
+  local plan = sql.build_inserted_keys(st, "postgresql")
+  contains(plan.sql, "UNION ALL")
+  eq(plan.slots[1], 1)
+  eq(plan.slots[2], 2)
+  eq(plan.slots[3], nil, "an insert with its own key needs no lookup")
+end)
+
+test("match_inserted_keys: the new keys are what was not there before", function()
+  local plan = { slots = { 1, 2 }, groups = { [1] = "w", [2] = "w" } }
+  local before = { { "1", "g1" }, { "2", "g1" } }
+  local after = { { "1", "g1" }, { "1", "g9" }, { "1", "g5" }, { "2", "g1" }, { "2", "g9" }, { "2", "g5" } }
+  local keys = sql.match_inserted_keys(plan, before, after, { "id" })
+  eq(keys[1].id, "g5")
+  eq(keys[2].id, "g9")
+  local ambiguous = sql.match_inserted_keys(plan, before, { { "1", "g1" }, { "1", "g9" }, { "2", "g1" }, { "2", "g9" } }, { "id" })
+  eq(ambiguous[1], nil, "two inserts, one new row: no guess")
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\nsql_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

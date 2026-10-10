@@ -649,6 +649,11 @@ local function do_apply(bufnr, url)
     return
   end
 
+  -- Keys the database will give the inserts: which rows hold their values now,
+  -- so the ones that appear after the apply are known to be theirs.
+  local key_plan = sql.build_inserted_keys(st, adapter_kind)
+  local keys_before = key_plan and db.query(key_plan.sql, url)
+
   -- Wrap in transaction for atomicity (all or nothing)
   local txn_sql = sql.wrap_transaction(stmts, adapter_kind)
   local t_apply = vim.uv.hrtime()
@@ -672,27 +677,21 @@ local function do_apply(bufnr, url)
 
   -- Reverse of INSERT = DELETE by PK.
   -- If the user typed an explicit PK (plain INSERT), use it directly.
-  -- If PK was auto-assigned (clone / new-row with SERIAL/UUID), find the row
-  -- by matching non-PK values after commit, then build reverse DELETE.
-  for _, ins in ipairs(inserts) do
+  -- If PK was auto-assigned (clone / new-row with SERIAL/UUID), its key is the
+  -- one that holds the row's values now and did not before the apply.
+  local new_keys = {}
+  if key_plan and keys_before then
+    local keys_after = db.query(key_plan.sql, url)
+    if keys_after then
+      new_keys = sql.match_inserted_keys(key_plan, keys_before.rows, keys_after.rows, st.pks)
+    end
+  end
+  for i, ins in ipairs(inserts) do
     local ins_pk_values = {}
     for _, pk in ipairs(st.pks) do
       ins_pk_values[pk] = ins.values[pk]
     end
-
-    if not next(ins_pk_values) and #st.pks > 0 then
-      -- Auto-assigned PK: locate the row by non-PK values (best-effort)
-      local find_sql = sql.build_insert_lookup(st.table_name, st.pks, ins.values,
-        st.incomparable_columns, adapter_kind, sql.state_opts(st))
-      if find_sql then
-        local r, _ = db.query(find_sql, url)
-        if r and r.rows and r.rows[1] then
-          for i, pk in ipairs(st.pks) do
-            ins_pk_values[pk] = r.rows[1][i]
-          end
-        end
-      end
-    end
+    if not next(ins_pk_values) and new_keys[i] then ins_pk_values = new_keys[i] end
 
     if next(ins_pk_values) then
       table.insert(reverse_stmts, sql.build_delete(st.table_name, ins_pk_values, adapter_kind, sql.state_opts(st)))

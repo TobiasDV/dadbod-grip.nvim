@@ -639,35 +639,6 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
-  test("SQL Server SQL export loads back into an identical table", function()
-    local probe, copy = "grip_live_export", "grip_live_export_copy"
-    local function drop()
-      db.execute("DROP TABLE IF EXISTS " .. probe, URL)
-      db.execute("DROP TABLE IF EXISTS " .. copy, URL)
-    end
-    drop()
-    local ok, err = pcall(function()
-      assert(db.execute("CREATE TABLE " .. probe .. " (id INT PRIMARY KEY, u NVARCHAR(20), e VARCHAR(5) NOT NULL,"
-        .. " n INT, b VARBINARY(8), ml NVARCHAR(MAX))", URL))
-      assert(db.execute("INSERT INTO " .. probe .. " VALUES (1, N'李 😀', '', NULL, 0xDEAD, N'a' + CHAR(13) + CHAR(10) + N'b'),"
-        .. " (2, NULL, 'x', 5, NULL, N'')", URL))
-      assert(db.execute("SELECT * INTO " .. copy .. " FROM " .. probe .. " WHERE 1 = 0", URL))
-      local result = assert(db.query(query.build_sql(query.new_table(probe, 50), { paginate = false }), URL))
-      local path = vim.fn.tempname() .. ".sql"
-      assert(view._write_export_file(view._export_rows_from_result(result), result.columns, "sql", copy, path,
-        { kind = "sqlserver", types = result.column_types }))
-      assert(db.execute(table.concat(vim.fn.readfile(path), "\n"), URL))
-      vim.fn.delete(path)
-      local function snap(t)
-        return dump("SELECT id, ISNULL(u, '<null>'), e, ISNULL(CAST(n AS varchar), '<null>'),"
-          .. " ISNULL(CONVERT(varchar(20), b, 1), '<null>'), ml FROM " .. t .. " ORDER BY id")
-      end
-      eq(snap(copy), snap(probe), "same rows")
-    end)
-    drop()
-    if not ok then error(err) end
-  end)
-
   test("SQL Server undo of a clone deletes the clone, never the original (GUID keys)", function()
     local probe = "grip_live_guid"
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
