@@ -491,6 +491,41 @@ end)
 
 local CLR_ERROR = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n"
 
+test("sqlserver query: reports types, generated and required text columns, and empty strings", function()
+  with_executable(function()
+    local describe = vim.json.encode({
+      { name = "id", system_type_name = "int", is_nullable = false, is_updateable = false, is_identity_column = true },
+      { name = "code", system_type_name = "varchar(10)", is_nullable = false, is_updateable = true, is_identity_column = false },
+      { name = "note", system_type_name = "nvarchar(50)", is_nullable = true, is_updateable = true, is_identity_column = false },
+      { name = "total", system_type_name = "decimal(21,2)", is_nullable = true, is_updateable = false, is_identity_column = false },
+      { name = "rv", system_type_name = "timestamp", is_nullable = false, is_updateable = false, is_identity_column = false },
+    })
+    local out = lines({ describe,
+      [[{"id":1,"code":"","note":null,"total":2.00,"rv":"0x00000000000007D1"}]],
+      [[{"id":2,"code":"x","note":"","total":null,"rv":"0x00000000000007D2"}]] })
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "versioned" LIMIT 100', URL))
+      eq(r.column_types.code, "varchar(10)")
+      eq(r.generated_columns.total, true, "computed")
+      eq(r.generated_columns.rv, true, "rowversion")
+      eq(r.generated_columns.id, nil, "identity is written back on undo")
+      eq(r.required_text_columns.code, true, "NOT NULL text")
+      eq(r.required_text_columns.note, nil, "nullable")
+      eq(r.empty_cells[1][2], true, "'' in row 1")
+      eq((r.empty_cells[1] or {})[3], nil, "NULL is not ''")
+      eq(r.empty_cells[2][3], true, "'' in row 2")
+      eq(r.rows[1][2], "", "rows still hold ''")
+    end)
+  end)
+end)
+
+test("sqlserver query: the page batch describes nullability and writability", function()
+  local batch = sqlserver._json_page_sql('SELECT * FROM "t" ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY')
+  contains(batch, "is_nullable")
+  contains(batch, "is_updateable")
+  contains(batch, "is_identity_column")
+end)
+
 test("sqlserver query: binaries and CLR columns arrive formatted, in one call", function()
   with_executable(function()
     local r

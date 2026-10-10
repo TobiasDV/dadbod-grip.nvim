@@ -43,6 +43,33 @@ function M.quote_value(v, adapter_kind)
 end
 
 --- Wrap statements in the transaction syntax accepted by the target adapter.
+--- Binary column types, whose values the grid shows as 0x hex.
+local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
+
+--- One value as SQL for a column of type `type_name` (nil when unknown):
+--- data.NULL_SENTINEL is NULL, data.EMPTY is '', and on SQL Server a 0x hex
+--- value for a binary column is written as a binary literal, since the
+--- server will not turn N'0x..' into bytes.
+function M.value_sql(v, adapter_kind, type_name)
+  local data = require("dadbod-grip.data")
+  if v == data.NULL_SENTINEL then return "NULL" end
+  if v == data.EMPTY then return M.quote_value("", adapter_kind) end
+  if adapter_kind == "sqlserver" and type(v) == "string" and type_name
+      and BINARY_TYPES[(type_name:match("^%a+") or ""):lower()] and v:match("^0[xX]%x*$") then
+    return v
+  end
+  return M.quote_value(v, adapter_kind)
+end
+
+--- `col = value`, or `col IS NULL` for a NULL key.
+local function key_sql(col, val, adapter_kind, types)
+  local data = require("dadbod-grip.data")
+  if val == nil or val == "" or val == data.NULL_SENTINEL then
+    return M.quote_ident(col) .. " IS NULL"
+  end
+  return M.quote_ident(col) .. " = " .. M.value_sql(val, adapter_kind, types and types[col])
+end
+
 function M.wrap_transaction(statements, adapter_kind)
   local begin_stmt = adapter_kind == "sqlserver"
       and "SET XACT_ABORT ON;\nBEGIN TRANSACTION;" or "BEGIN;"
@@ -220,23 +247,19 @@ end
 -- M.build_update(table_name, pk_values, changes, adapter_kind) → string
 -- pk_values: { col = "val", ... }
 -- changes:   { col = new_val, ... }  (data.NULL_SENTINEL means SQL NULL)
-function M.build_update(table_name, pk_values, changes, adapter_kind)
-  local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
+-- opts.types:  { col = type name }, for values that need their type (binaries)
+function M.build_update(table_name, pk_values, changes, adapter_kind, opts)
+  local types = opts and opts.types
   local set_parts = {}
   for col, val in pairs(changes) do
-    local sql_val = (val == NULL_SENTINEL) and "NULL" or M.quote_value(val, adapter_kind)
-    table.insert(set_parts, quote_ident(col) .. " = " .. sql_val)
+    table.insert(set_parts, quote_ident(col) .. " = " .. M.value_sql(val, adapter_kind, types and types[col]))
   end
   -- Sort for deterministic output
   table.sort(set_parts)
 
   local where_parts = {}
   for col, val in pairs(pk_values) do
-    if val == nil or val == "" then
-      table.insert(where_parts, quote_ident(col) .. " IS NULL")
-    else
-      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(val, adapter_kind))
-    end
+    table.insert(where_parts, key_sql(col, val, adapter_kind, types))
   end
   table.sort(where_parts)
 
@@ -251,8 +274,10 @@ end
 -- M.build_insert(table_name, values, columns, adapter_kind) → string
 -- values:  { col = val, ... }  (data.NULL_SENTINEL means SQL NULL)
 -- columns: ordered list of column names (defines INSERT column order)
-function M.build_insert(table_name, values, columns, adapter_kind)
-  local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
+-- opts.types:  { col = type name };  opts.skip: { col = true } never written
+function M.build_insert(table_name, values, columns, adapter_kind, opts)
+  local types = opts and opts.types
+  local skip = opts and opts.skip
   local col_parts = {}
   local val_parts = {}
 
@@ -260,10 +285,9 @@ function M.build_insert(table_name, values, columns, adapter_kind)
     local val = values[col]
     -- Skip columns with nil that aren't explicitly set (let DB use DEFAULT)
     -- NULL_SENTINEL is non-nil and emits SQL NULL explicitly
-    if val ~= nil then
+    if val ~= nil and not (skip and skip[col]) then
       table.insert(col_parts, quote_ident(col))
-      local sql_val = (val == NULL_SENTINEL) and "NULL" or M.quote_value(val, adapter_kind)
-      table.insert(val_parts, sql_val)
+      table.insert(val_parts, M.value_sql(val, adapter_kind, types and types[col]))
     end
   end
 
@@ -284,8 +308,8 @@ end
 -- The INSERT that undoes a DELETE, original key included. SQL Server refuses
 -- an explicit IDENTITY value unless IDENTITY_INSERT is on, and refuses to turn
 -- that on for a table without an IDENTITY column, hence the OBJECTPROPERTY test.
-function M.build_reinsert(table_name, values, columns, adapter_kind)
-  local insert = M.build_insert(table_name, values, columns, adapter_kind)
+function M.build_reinsert(table_name, values, columns, adapter_kind, opts)
+  local insert = M.build_insert(table_name, values, columns, adapter_kind, opts)
   if adapter_kind ~= "sqlserver" then return insert end
   local ident = quote_ident(table_name)
   local toggle = string.format(
@@ -299,15 +323,16 @@ end
 --- key first. Columns in `skip` (types the database cannot compare with =,
 --- such as SQL Server text and ntext) are left out. Returns nil when no column
 --- is left to match on.
-function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind)
+function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind, opts)
   local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
+  local types = opts and opts.types
   local pk_set = {}
   for _, pk in ipairs(pks) do pk_set[pk] = true end
   local where_parts = {}
   for col, val in pairs(values) do
     if not pk_set[col] and not (skip and skip[col])
       and val and val ~= "" and val ~= NULL_SENTINEL then
-      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(tostring(val), adapter_kind))
+      table.insert(where_parts, quote_ident(col) .. " = " .. M.value_sql(tostring(val), adapter_kind, types and types[col]))
     end
   end
   if #where_parts == 0 then return nil end
@@ -320,14 +345,11 @@ end
 
 -- M.build_delete(table_name, pk_values, adapter_kind) → string
 -- pk_values: { col = "val", ... }
-function M.build_delete(table_name, pk_values, adapter_kind)
+function M.build_delete(table_name, pk_values, adapter_kind, opts)
+  local types = opts and opts.types
   local where_parts = {}
   for col, val in pairs(pk_values) do
-    if val == nil or val == "" then
-      table.insert(where_parts, quote_ident(col) .. " IS NULL")
-    else
-      table.insert(where_parts, quote_ident(col) .. " = " .. M.quote_value(val, adapter_kind))
-    end
+    table.insert(where_parts, key_sql(col, val, adapter_kind, types))
   end
   table.sort(where_parts)
 
@@ -341,19 +363,76 @@ end
 -- M.preview_staged(table_name, updates, deletes, inserts, adapter_kind) → string
 -- Generates a multi-line SQL preview of all staged changes.
 -- updates: from data.get_updates(), deletes: from data.get_deletes(), inserts: from data.get_inserts()
-function M.preview_staged(table_name, updates, deletes, inserts, adapter_kind)
+function M.preview_staged(table_name, updates, deletes, inserts, adapter_kind, opts)
   local stmts = {}
   for _, del in ipairs(deletes) do
-    table.insert(stmts, M.build_delete(table_name, del.pk_values, adapter_kind) .. ";")
+    table.insert(stmts, M.build_delete(table_name, del.pk_values, adapter_kind, opts) .. ";")
   end
   for _, upd in ipairs(updates) do
-    table.insert(stmts, M.build_update(table_name, upd.pk_values, upd.changes, adapter_kind) .. ";")
+    table.insert(stmts, M.build_update(table_name, upd.pk_values, upd.changes, adapter_kind, opts) .. ";")
   end
   for _, ins in ipairs(inserts) do
-    table.insert(stmts, M.build_insert(table_name, ins.values, ins.columns, adapter_kind) .. ";")
+    table.insert(stmts, M.build_insert(table_name, ins.values, ins.columns, adapter_kind, opts) .. ";")
   end
   if #stmts == 0 then return "-- no staged changes" end
   return table.concat(stmts, "\n")
+end
+
+-- ── staged changes of a grid state ─────────────────────────────────────────
+
+--- The types and never-written columns of a grid state, as builder opts.
+function M.state_opts(state)
+  return { types = state.column_types, skip = state.generated_columns }
+end
+
+--- The statements that apply a grid state's staged changes: deletes first
+--- (avoids FK conflicts with inserts), then updates, then inserts.
+function M.build_apply(state, adapter_kind)
+  local data = require("dadbod-grip.data")
+  local opts = M.state_opts(state)
+  local stmts = {}
+  for _, del in ipairs(data.get_deletes(state)) do
+    table.insert(stmts, M.build_delete(state.table_name, del.pk_values, adapter_kind, opts))
+  end
+  for _, upd in ipairs(data.get_updates(state)) do
+    table.insert(stmts, M.build_update(state.table_name, upd.pk_values, upd.changes, adapter_kind, opts))
+  end
+  for _, ins in ipairs(data.get_inserts(state)) do
+    table.insert(stmts, M.build_insert(state.table_name, ins.values, ins.columns, adapter_kind, opts))
+  end
+  return stmts
+end
+
+--- The statements that undo a grid state's staged deletes and updates once
+--- applied: a deleted row goes back in whole, an update gets its old values.
+--- Returns reverse, irreversible: the row indexes of deleted rows that cannot
+--- be put back because a binary in them only reached the grid as a
+--- "<binary N bytes>" placeholder.
+function M.build_undo(state, adapter_kind)
+  local data = require("dadbod-grip.data")
+  local opts = M.state_opts(state)
+  local reverse, irreversible = {}, {}
+  local deletes = data.get_deletes(state)
+  table.sort(deletes, function(a, b) return a.row_idx < b.row_idx end)
+  for _, del in ipairs(deletes) do
+    local values, placeholder = {}, false
+    for _, col in ipairs(state.columns) do
+      local v = data.original_value(state, del.row_idx, col)
+      if type(v) == "string" and v:sub(1, #"<binary ") == "<binary " then placeholder = true end
+      values[col] = v
+    end
+    if placeholder then
+      table.insert(irreversible, del.row_idx)
+    else
+      table.insert(reverse, M.build_reinsert(state.table_name, values, state.columns, adapter_kind, opts))
+    end
+  end
+  for _, upd in ipairs(data.get_updates(state)) do
+    local old = {}
+    for col in pairs(upd.changes) do old[col] = data.original_value(state, upd.row_idx, col) end
+    table.insert(reverse, M.build_update(state.table_name, upd.pk_values, old, adapter_kind, opts))
+  end
+  return reverse, irreversible
 end
 
 return M

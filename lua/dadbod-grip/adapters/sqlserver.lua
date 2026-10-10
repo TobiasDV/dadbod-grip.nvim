@@ -322,7 +322,8 @@ DECLARE @cols nvarchar(max) = STUFF((
         FROM sys.dm_exec_describe_first_result_set(@q, NULL, 0)) AS d
   ORDER BY column_ordinal
   FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'');
-SELECT (SELECT name, system_type_name FROM sys.dm_exec_describe_first_result_set(@q, NULL, 0)
+SELECT (SELECT name, system_type_name, is_nullable, is_updateable, is_identity_column
+  FROM sys.dm_exec_describe_first_result_set(@q, NULL, 0)
   ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);
 IF @cols <> N'' EXEC (N'SELECT (SELECT ' + @cols + N' FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) ' + N'%s');]]
 
@@ -365,12 +366,13 @@ end
 
 --- Decode one FOR JSON row: a flat object with no whitespace between tokens.
 --- Numbers keep their exact text (a bigint or decimal would not survive a Lua
---- number), bits become 1/0 and null becomes "", as in the text output.
---- Returns keys, values; nil for anything else, such as the nested object a
---- dotted column alias produces or a row cut off at the -y width.
+--- number), bits become 1/0 and null becomes "", as in the text output; the
+--- third result marks the positions that held a real empty string.
+--- Returns keys, values, empties; nil for anything else, such as the nested
+--- object a dotted column alias produces or a row cut off at the -y width.
 local function decode_json_row(line)
   if line:sub(1, 1) ~= "{" then return nil end
-  local keys, values = {}, {}
+  local keys, values, empties = {}, {}, {}
   local pos = 2
   while true do
     if line:sub(pos, pos) ~= '"' then return nil end
@@ -387,6 +389,7 @@ local function decode_json_row(line)
       if not value_end then return nil end
       ok, value = pcall(vim.json.decode, line:sub(pos, value_end))
       if not ok then return nil end
+      if value == "" then empties[#keys + 1] = true end
     else
       local literal = line:match("^%a+", pos)
       if literal == "null" then value = ""
@@ -406,7 +409,7 @@ local function decode_json_row(line)
     local sep = line:sub(pos, pos)
     if sep == "}" then
       if pos ~= #line then return nil end
-      return keys, values
+      return keys, values, empties
     end
     if sep ~= "," then return nil end
     pos = pos + 1
@@ -417,6 +420,11 @@ end
 --- sql.build_insert_lookup leave them out.
 local INCOMPARABLE_TYPES = {
   text = true, ntext = true, image = true, xml = true, geography = true, geometry = true,
+}
+
+--- Character types: the grid's "" can be a real empty string in these.
+local TEXT_TYPES = {
+  char = true, varchar = true, nchar = true, nvarchar = true, text = true, ntext = true,
 }
 
 --- FOR JSON prints floats as 1.500000000000000e+000; show the shortest
@@ -449,7 +457,14 @@ local function described_columns(raw)
       for i, entry in ipairs(list) do
         if type(entry.name) ~= "string" or entry.name == "" then return nil end
         local type_name = entry.system_type_name
-        columns[i] = { name = entry.name, type = type(type_name) == "string" and type_name or "" }
+        columns[i] = {
+          name = entry.name,
+          type = type(type_name) == "string" and type_name or "",
+          nullable = entry.is_nullable ~= false,
+          -- Computed, rowversion and period columns: no INSERT or UPDATE takes them.
+          -- IDENTITY is not updateable either, but undo writes it back.
+          generated = entry.is_updateable == false and entry.is_identity_column ~= true,
+        }
       end
       return columns
     end
@@ -471,11 +486,11 @@ local function parse_json_page(raw)
   -- Every row is one line starting with "{". Other lines are the describe
   -- array and server messages such as "Warning: Null value is eliminated by
   -- an aggregate".
-  local rows = {}
+  local rows, empty_cells = {}, {}
   for line in raw:gmatch("[^\r\n]+") do
     line = vim.trim(line)
     if line:sub(1, 1) == "{" then
-      local keys, values = decode_json_row(line)
+      local keys, values, empties = decode_json_row(line)
       if not keys or #keys ~= #columns then return nil end
       local row = {}
       for i, key in ipairs(keys) do
@@ -484,16 +499,26 @@ local function parse_json_page(raw)
         if not row[i] then return nil end
       end
       rows[#rows + 1] = row
+      if next(empties) then empty_cells[#rows] = empties end
     end
   end
   local incomparable
-  for i, type_name in ipairs(types) do
-    if INCOMPARABLE_TYPES[base_type(type_name)] then
+  local column_types, generated, required_text = {}, {}, {}
+  for i, col in ipairs(described) do
+    local base = base_type(col.type)
+    if INCOMPARABLE_TYPES[base] then
       incomparable = incomparable or {}
-      incomparable[columns[i]] = true
+      incomparable[col.name] = true
     end
+    column_types[col.name] = col.type
+    if col.generated then generated[col.name] = true end
+    if TEXT_TYPES[base] and not col.nullable then required_text[col.name] = true end
   end
-  return { columns = columns, rows = rows, types = types, incomparable = incomparable }
+  return {
+    columns = columns, rows = rows, types = types, incomparable = incomparable,
+    column_types = column_types, generated = generated, required_text = required_text,
+    empty_cells = empty_cells,
+  }
 end
 
 local function run_query(sql_str, url, timeout_ms)
@@ -573,6 +598,12 @@ function M.query(sql_str, url)
     readonly = parsed.text or nil,
     readonly_reason = parsed.text and "plain text output" or nil,
     incomparable_columns = parsed.incomparable,
+    -- Only the JSON path knows these; the text path leaves them nil and the
+    -- grid keeps treating "" as NULL there.
+    column_types = parsed.column_types,
+    generated_columns = parsed.generated,
+    required_text_columns = parsed.required_text,
+    empty_cells = parsed.empty_cells,
   }, nil
 end
 

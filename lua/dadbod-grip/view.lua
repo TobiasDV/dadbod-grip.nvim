@@ -335,9 +335,10 @@ local function format_cell(value, width, is_null_staged)
     local s = pad_display(value, width, false)
     return s, "GripReadonly"
   end
-  local display = value ~= "" and value:gsub("\n", "↵"):gsub("\r", "") or NULL_DISPLAY
-  local hl = value == "" and "GripNull" or nil
-  return pad_display(display, width), hl
+  -- "" here is a real empty string: data.effective_value turns the ""
+  -- adapters use for NULL into nil.
+  local display = value:gsub("\n", "↵"):gsub("\r", "")
+  return pad_display(display, width), nil
 end
 
 --- Classify a cell value for conditional formatting.
@@ -738,7 +739,7 @@ local function build_render(session, opts)
             else
               cell_hl = "GripModified"
             end
-          elseif eff == nil or eff == "" then
+          elseif eff == nil then
             cell_hl = "GripNull"
           else
             cell_hl = classify_cell(eff, cond_type_map[col])

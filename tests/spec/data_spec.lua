@@ -401,6 +401,74 @@ test("clone_row: inserts after source row_idx", function()
   eq(ordered[3], 2, "original row 2 should be last")
 end)
 
+-- ── empty strings and generated columns ────────────────────────────────────
+
+local function sqlserver_state()
+  return data.new({
+    rows = { { "1", "", "" }, { "2", "x", "" } },
+    columns = { "id", "code", "note" },
+    primary_keys = { "id" },
+    table_name = "t",
+    empty_cells = { [1] = { [2] = true }, [2] = { [3] = true } },
+    required_text_columns = { code = true },
+    generated_columns = { total = true },
+    column_types = { id = "int", code = "varchar(10)", note = "nvarchar(50)" },
+  })
+end
+
+test("empty strings: a marked cell reads as '', an unmarked one as NULL", function()
+  local st = sqlserver_state()
+  eq(data.effective_value(st, 1, "code"), "")
+  eq(data.effective_value(st, 1, "note"), nil)
+  eq(data.effective_value(st, 2, "note"), "")
+  eq(data.original_value(st, 1, "code"), data.EMPTY)
+  eq(data.original_value(st, 1, "note"), data.NULL_SENTINEL)
+  eq(data.original_value(st, 2, "code"), "x")
+end)
+
+test("empty strings: a staged EMPTY reads as '' and survives edit_copy", function()
+  local st = data.add_change(sqlserver_state(), 2, "code", data.EMPTY)
+  eq(st.changes[2].code, data.EMPTY)
+  eq(data.effective_value(st, 2, "code"), "")
+  st = data.toggle_delete(st, 1)
+  eq(data.effective_value(st, 1, "code"), "", "marks carried by edit_copy")
+end)
+
+test("empty strings: clearing gives '' for NOT NULL text or a cell that held ''", function()
+  local st = sqlserver_state()
+  eq(data.cleared_value(st, 2, "code"), data.EMPTY, "NOT NULL text")
+  eq(data.cleared_value(st, 1, "note"), nil, "nullable NULL stays NULL")
+  eq(data.cleared_value(st, 2, "note"), data.EMPTY, "held ''")
+end)
+
+test("empty strings: other adapters keep '' meaning NULL", function()
+  local st = make_state({ rows = { { "1", "", "a@b" } } })
+  eq(data.effective_value(st, 1, "name"), nil)
+  eq(data.cleared_value(st, 1, "name"), nil)
+end)
+
+test("clone_row: copies '' and leaves generated columns out", function()
+  local st = data.new({
+    rows = { { "1", "", "4", "0x01" } },
+    columns = { "id", "code", "total", "rv" },
+    primary_keys = { "id" },
+    table_name = "t",
+    empty_cells = { [1] = { [2] = true } },
+    generated_columns = { total = true, rv = true },
+  })
+  st = data.clone_row(st, 1)
+  local ins = st.inserted[st._next_insert_idx - 1].values
+  eq(ins.code, data.EMPTY)
+  eq(ins.total, nil)
+  eq(ins.rv, nil)
+end)
+
+test("column_writable: generated columns are not", function()
+  local st = sqlserver_state()
+  eq(data.column_writable(st, "code"), true)
+  eq(data.column_writable(st, "total"), false)
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\ndata_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
