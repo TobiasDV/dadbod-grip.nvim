@@ -70,6 +70,13 @@ test("new: readonly_reason says why the grid is read-only", function()
     "survives edits")
 end)
 
+test("new: incomparable_columns is kept and survives edits", function()
+  local st = data.new({ rows = { { "1", "x" } }, columns = { "id", "txt" }, primary_keys = { "id" },
+    table_name = "legacy", incomparable_columns = { txt = true } })
+  eq(st.incomparable_columns.txt, true)
+  eq(data.add_change(st, 1, "txt", "y").incomparable_columns.txt, true, "after an edit")
+end)
+
 test("new: rows are deep-copied", function()
   local original = { { "1", "alice" } }
   local st = make_state({ rows = original, columns = { "id", "name" } })

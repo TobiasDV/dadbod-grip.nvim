@@ -252,6 +252,8 @@ test("sqlserver: sqlcmd runs with -y 8000 (the default cuts (max) values to 256)
       if a == "-y" then width = args[i + 1] end
     end
     eq(width, "8000", "-y width: " .. table.concat(args, " "))
+    -- Microsoft's ODBC sqlcmd refuses -y together with -W.
+    assert(not vim.tbl_contains(args, "-W"), "-W with -y: " .. table.concat(args, " "))
   end)
 end)
 
@@ -269,63 +271,47 @@ test("sqlserver: grids are editable (no adapter-wide readonly)", function()
   eq(require("dadbod-grip.db").is_readonly(URL), false)
 end)
 
-test("sqlserver query: clean output stays editable", function()
+test("sqlserver text output: always read-only (fields are trimmed, NULL is ambiguous)", function()
   with_executable(function()
-    with_system_mock(lines({ "id\tname", "--\t----", "1\tAlice", "2\tNULL" }), "", 0, function()
+    with_system_mock(lines({ "id\tname", "--\t----", "1\tAlice   ", "2\tNULL" }), "", 0, function()
       local r = sqlserver.query("SELECT id, name FROM dbo.users", URL)
-      eq(#r.rows, 2)
+      eq(r.rows[1][2], "Alice", "trimmed")
       eq(r.rows[2][2], "", "NULL is an empty cell")
-      eq(r.readonly, nil)
-    end)
-  end)
-end)
-
-test("sqlserver text output: a newline inside a value makes the grid read-only", function()
-  with_executable(function()
-    with_system_mock(lines({ "id\tnote\tqty", "--\t----\t---", "1\tline one", "line two\t5" }), "", 0, function()
-      eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, true)
-    end)
-  end)
-end)
-
-test("sqlserver text output: a tab inside a value makes the grid read-only", function()
-  with_executable(function()
-    with_system_mock(lines({ "id\tnote", "--\t----", "1\ta\tb" }), "", 0, function()
-      local r = sqlserver.query("SELECT * FROM dbo.notes", URL)
       eq(r.readonly, true)
-      eq(r.readonly_reason, "tab or newline in a value")
-    end)
-  end)
-end)
-
-test("sqlserver text output: a value at the -y width makes the grid read-only", function()
-  with_executable(function()
-    local cut = string.rep("x", 8000)
-    with_system_mock(lines({ "id\tnote", "--\t----", "1\t" .. cut }), "", 0, function()
-      local r = sqlserver.query("SELECT * FROM dbo.notes", URL)
-      eq(r.readonly, true)
-      eq(r.readonly_reason, "value over 8000 characters")
-    end)
-    -- 4000 two-byte characters is 8000 bytes but well under the width.
-    local wide = string.rep("é", 4000)
-    with_system_mock(lines({ "id\tnote", "--\t----", "1\t" .. wide }), "", 0, function()
-      eq(sqlserver.query("SELECT * FROM dbo.notes", URL).readonly, nil)
+      eq(r.readonly_reason, "plain text output")
     end)
   end)
 end)
 
 -- ── JSON pages ──────────────────────────────────────────────────────────────
 
+--- Answer successive sqlcmd calls from `replies` ({stdout, code} each) and
+--- return the stdin of every call.
+local function with_replies(replies, fn)
+  local calls = {}
+  local orig = vim.system
+  vim.system = function(_args, opts, cb)
+    calls[#calls + 1] = opts.stdin
+    local reply = replies[#calls] or replies[#replies]
+    cb({ stdout = reply[1], stderr = "", code = reply[2] })
+  end
+  local ok, err = pcall(fn)
+  vim.system = orig
+  if not ok then error(err) end
+  return calls
+end
+
+--- The single line a DESCRIBE_SQL batch prints: { {"id", "int"}, ... } as JSON.
+local function describe_line(cols)
+  local parts = {}
+  for _, c in ipairs(cols) do
+    parts[#parts + 1] = vim.json.encode({ name = c[1], system_type_name = c[2] })
+  end
+  return "[" .. table.concat(parts, ",") .. "]"
+end
+
 local JSON_PAGE_OUT = lines({
-  "name\tsystem_type_name",
-  "----\t----------------",
-  "id\tint",
-  "note\tnvarchar(max)",
-  "blob\tvarbinary(max)",
-  "ratio\tfloat",
-  "",
-  "_grip_json",
-  "----------",
+  describe_line({ { "id", "int" }, { "note", "nvarchar(max)" }, { "blob", "varbinary(max)" }, { "ratio", "float" } }),
   [[{"id":1,"note":"line one\nline two\ttabbed","blob":"3q2+7w==","ratio":1.500000000000000e+000}]],
   [[{"id":9223372036854775807,"note":null,"blob":null,"ratio":null}]],
 })
@@ -336,6 +322,9 @@ test("sqlserver json_page_sql: grid queries are rewritten, everything else is no
   contains(table_sql, [[SELECT (SELECT "dbo"."my ""t""".* FOR JSON PATH]], "table rows")
   contains(table_sql, [[FROM "dbo"."my ""t""" WHERE ("id" > 1) ORDER BY]], "original tail kept")
   contains(table_sql, [[dm_exec_describe_first_result_set(N'SELECT * FROM "dbo"]], "described first")
+  contains(table_sql, "ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);",
+    "describe is a single JSON line")
+  assert(not table_sql:find("_grip_json", 1, true), "no header alias needed")
 
   local raw_sql = sqlserver._json_page_sql("SELECT * FROM (SELECT 'a' AS x) AS _grip ORDER BY (SELECT NULL)")
   contains(raw_sql, "SELECT (SELECT _grip.* FOR JSON PATH", "raw wrapper rows")
@@ -379,7 +368,50 @@ test("sqlserver query: a JSON page keeps tabs, newlines, exact numbers and hex b
   end)
 end)
 
-test("sqlserver query: a server warning after a JSON page is not a row", function()
+test("sqlserver query: JSON pages run with -y 0 and no header flags", function()
+  with_executable(function()
+    local args = capture_system_args(JSON_PAGE_OUT, function()
+      sqlserver.query('SELECT * FROM "notes" LIMIT 100', URL)
+    end)
+    local width
+    for i, a in ipairs(args) do
+      if a == "-y" then width = args[i + 1] end
+    end
+    eq(width, "0", "-y width: " .. table.concat(args, " "))
+    assert(not vim.tbl_contains(args, "-h"), "-h is refused next to -y 0")
+    assert(not vim.tbl_contains(args, "-W"), "-W is refused next to -y")
+  end)
+end)
+
+test("sqlserver query: a value over 8000 characters arrives whole and editable", function()
+  with_executable(function()
+    local long = string.rep("x", 20000)
+    local out = lines({ describe_line({ { "id", "int" }, { "body", "varchar(max)" } }),
+      '{"id":1,"body":"' .. long .. '"}' })
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "documents" LIMIT 100', URL))
+      eq(#r.rows[1][2], 20000, "whole value")
+      eq(r.readonly, nil, "editable")
+    end)
+  end)
+end)
+
+test("sqlserver query: text, ntext and image columns are reported as incomparable", function()
+  with_executable(function()
+    local out = lines({
+      describe_line({ { "id", "int" }, { "txt", "text" }, { "ntxt", "ntext" }, { "name", "nvarchar(10)" } }),
+      [[{"id":1,"txt":"a","ntxt":"b","name":"c"}]],
+    })
+    with_system_mock(out, "", 0, function()
+      local r = assert(sqlserver.query('SELECT * FROM "legacy" LIMIT 100', URL))
+      eq(r.incomparable_columns.txt, true)
+      eq(r.incomparable_columns.ntxt, true)
+      eq(r.incomparable_columns.name, nil)
+    end)
+  end)
+end)
+
+test("sqlserver query: a server warning between JSON rows is not a row", function()
   with_executable(function()
     local out = JSON_PAGE_OUT .. "Warning: Null value is eliminated by an aggregate or other SET operation.\n"
     with_system_mock(out, "", 0, function()
@@ -392,8 +424,7 @@ end)
 
 test("sqlserver query: an empty JSON page still has its columns", function()
   with_executable(function()
-    local out = lines({ "name\tsystem_type_name", "----\t----------------", "id\tint", "", "_grip_json", "----------" })
-    with_system_mock(out, "", 0, function()
+    with_system_mock(lines({ describe_line({ { "id", "int" } }) }), "", 0, function()
       local r = assert(sqlserver.query('SELECT * FROM "notes" LIMIT 100', URL))
       eq(table.concat(r.columns, ","), "id")
       eq(#r.rows, 0)
@@ -401,26 +432,23 @@ test("sqlserver query: an empty JSON page still has its columns", function()
   end)
 end)
 
---- Answer successive sqlcmd calls from `replies` ({stdout, code} each) and
---- return the stdin of every call.
-local function with_replies(replies, fn)
-  local calls = {}
-  local orig = vim.system
-  vim.system = function(_args, opts, cb)
-    calls[#calls + 1] = opts.stdin
-    local reply = replies[#calls] or replies[#replies]
-    cb({ stdout = reply[1], stderr = "", code = reply[2] })
-  end
-  local ok, err = pcall(fn)
-  vim.system = orig
-  if not ok then error(err) end
-  return calls
-end
+test("sqlserver query: a describe without column names falls back to the text output", function()
+  with_executable(function()
+    local r
+    local calls = with_replies({
+      { lines({ '[{"name":null,"system_type_name":null}]' }), 0 },
+      { lines({ "id", "--", "7" }), 0 },
+    }, function()
+      r = assert(sqlserver.query("SELECT * FROM (SELECT id FROM #t) AS _grip LIMIT 100", URL))
+    end)
+    eq(#calls, 2, "JSON, then text")
+    assert(not calls[2]:find("FOR JSON", 1, true), "second call is plain")
+    eq(r.rows[1][1], "7")
+  end)
+end)
 
 local CLR_ERROR = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n"
-local PLACES_DESCRIBED = lines({
-  "name\tsystem_type_name", "----\t----------------", "id\tint", "loc\tgeography",
-})
+local PLACES_DESCRIBED = lines({ describe_line({ { "id", "int" }, { "loc", "geography" } }) })
 
 test("sqlserver query: CLR columns are retried cast to text", function()
   with_executable(function()
@@ -428,7 +456,7 @@ test("sqlserver query: CLR columns are retried cast to text", function()
     local calls = with_replies({
       { CLR_ERROR, 1 },
       { PLACES_DESCRIBED, 0 },
-      { PLACES_DESCRIBED .. lines({ "", "_grip_json", "----------", [[{"id":1,"loc":"POINT (4.9 52.4)"}]] }), 0 },
+      { PLACES_DESCRIBED .. lines({ [[{"id":1,"loc":"POINT (4.9 52.4)"}]] }), 0 },
     }, function()
       r = assert(sqlserver.query('SELECT * FROM "dbo"."places" LIMIT 100', URL))
     end)
@@ -453,6 +481,7 @@ test("sqlserver query: a page JSON cannot carry falls back to the text output", 
     eq(#calls, 3, "JSON, describe, text")
     assert(not calls[3]:find("FOR JSON", 1, true), "last call is plain")
     eq(r.rows[1][2], "POINT (4 52)")
+    eq(r.readonly, true, "text fallback is read-only")
   end)
 end)
 
@@ -461,7 +490,7 @@ test("sqlserver text output: raw bytes make the grid read-only instead of breaki
     with_system_mock(lines({ "id\tloc", "--\t---", "1\t\230\16\0\0\1" }), "", 0, function()
       local r = sqlserver.query("SELECT * FROM dbo.places", URL)
       eq(r.readonly, true)
-      eq(r.readonly_reason, "binary value in text output")
+      eq(r.readonly_reason, "plain text output")
       assert(not r.rows[1][2]:find("%z"), "NUL bytes stripped")
     end)
   end)

@@ -67,7 +67,7 @@ local function split_table_name(table_name, default_schema)
 end
 
 --- Build connection-only argv. Statements always arrive through stdin.
-local function sqlcmd_args(parsed)
+local function sqlcmd_args(parsed, opts)
   local server = parsed.host or "127.0.0.1"
   if parsed.port and parsed.port ~= "" then
     server = server .. "," .. parsed.port
@@ -79,10 +79,19 @@ local function sqlcmd_args(parsed)
     -- Supplying -N makes sqlcmd validate the server certificate unless the
     -- URL explicitly opts into -C. Mandatory is the secure default.
     "-N" .. ({ optional = "o", mandatory = "m", strict = "s" })[parsed.encrypt or "mandatory"],
-    "-W",
-    -- Without -y, (max) columns are cut to 256 characters. 8000 is the most
-    -- go-sqlcmd accepts; -y 0 would also drop the header row the parser reads.
-    "-y", tostring(MAX_VALUE_WIDTH),
+  }
+  if opts and opts.json then
+    -- JSON rows carry their own column names. -y 0 prints no header and no
+    -- width limit, so a value of any length stays on its row's one line.
+    vim.list_extend(args, { "-y", "0" })
+  else
+    -- Without -y, (max) columns are cut to 256 characters. 8000 is the widest
+    -- that still prints the header row the parser reads. Microsoft's ODBC
+    -- sqlcmd refuses -W next to -y, so columns arrive padded and
+    -- parse_sqlcmd_table trims them.
+    vim.list_extend(args, { "-y", tostring(MAX_VALUE_WIDTH) })
+  end
+  vim.list_extend(args, {
     "-s", "\t",
     -- No $(var) substitution: a value containing "$(" is sent as written.
     "-x",
@@ -90,7 +99,7 @@ local function sqlcmd_args(parsed)
     -- every `code ~= 0` guard below would be dead and a refused DROP would be
     -- reported as a success.
     "-b",
-  }
+  })
 
   if parsed.trust_server_certificate then args[#args + 1] = "-C" end
   if parsed.server_certificate then
@@ -136,7 +145,7 @@ end
 
 --- Build and run the sqlcmd command, blocking.
 local function sqlcmd(parsed, sql_str, timeout_ms, opts)
-  return adapters.run_cmd(sqlcmd_args(parsed),
+  return adapters.run_cmd(sqlcmd_args(parsed, opts),
     timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
     { stdin = sqlcmd_stdin(sql_str, opts), env = sqlcmd_env(parsed) })
 end
@@ -171,17 +180,9 @@ local function sqlcmd_error(stdout, stderr, code)
   return "sqlcmd exited with code " .. tostring(code)
 end
 
---- Number of UTF-8 characters in s: every byte that is not a continuation byte.
-local function char_count(s)
-  return select(2, s:gsub("[^\128-\191]", ""))
-end
-
---- `lossy` names why the rows cannot be trusted to match the server's values
---- (false when they can), which makes the grid read-only (see M.query).
---- sqlcmd does not quote fields:
---- a tab or newline inside a value shifts or splits its row, so an edit could
---- put the wrong value in the WHERE clause. A value at the -y width may have
---- been cut off, and writing it back would truncate it.
+--- Parse sqlcmd's tab-separated text output. Fields are trimmed and NULL
+--- reads as "", so trailing spaces and the text 'NULL' do not survive: grids
+--- built from this are read-only (see M.query); JSON pages carry exact values.
 local function parse_sqlcmd_table(raw)
   if not raw or raw == "" then
     return { columns = {}, rows = {} }
@@ -208,30 +209,21 @@ local function parse_sqlcmd_table(raw)
 
   local columns = split(lines[1])
   local rows = {}
-  local lossy = false
   for i = 2, #lines do
     local sep_probe = lines[i]:gsub("[\t%s%-]", "")
     if not (sep_probe == "" and lines[i]:find("-", 1, true)) then
       local row = split(lines[i])
-      if #row ~= #columns then lossy = lossy or "tab or newline in a value" end
-      -- sqlcmd prints a CLR value such as geography as its raw bytes.
+      -- sqlcmd prints a CLR value such as geography as its raw bytes, and a
+      -- NUL among them would break rendering the grid.
       for k, field in ipairs(row) do
-        if field:find("%z") then
-          row[k] = field:gsub("%z", "")
-          lossy = lossy or "binary value in text output"
-        end
-      end
-      for _, field in ipairs(row) do
-        if #field >= MAX_VALUE_WIDTH and char_count(field) >= MAX_VALUE_WIDTH then
-          lossy = "value over " .. MAX_VALUE_WIDTH .. " characters"
-        end
+        row[k] = field:gsub("%z", "")
       end
       while #row < #columns do table.insert(row, "") end
       table.insert(rows, row)
     end
   end
 
-  return { columns = columns, rows = rows, lossy = lossy }
+  return { columns = columns, rows = rows }
 end
 
 --- Translate the LIMIT/OFFSET tail emitted by the shared query builder into
@@ -258,13 +250,11 @@ local function normalize_query_sql(sql_str)
 end
 
 -- ── JSON pages ───────────────────────────────────────────────────────────
--- A grid page is fetched as one FOR JSON object per row instead of sqlcmd's
--- unquoted text, so a tab or newline inside a value arrives escaped and the
--- grid stays editable. The same batch first describes the result set, which
--- gives the column order, the columns of an empty page, and the types needed
--- to print values the way the text output does.
-
-local JSON_COLUMN = "_grip_json"
+-- A grid page is read as JSON produced by the server, with sqlcmd only
+-- carrying it: one FOR JSON object per row, so a tab, newline or value of any
+-- length arrives escaped on one line. The same batch first describes the
+-- result set, which gives the column order, the columns of an empty page,
+-- and the types needed to print values the way the text output does.
 
 --- The quote_ident-style name at `pos` ("dbo"."my ""table"""), or nil.
 local function quoted_name_at(s, pos)
@@ -279,8 +269,11 @@ local function quoted_name_at(s, pos)
   return s:sub(pos, stop - 1)
 end
 
-local DESCRIBE_SQL = "SELECT name, system_type_name"
-  .. " FROM sys.dm_exec_describe_first_result_set(N'%s', NULL, 0) ORDER BY column_ordinal;"
+-- Wrapped in a scalar SELECT: a top-level FOR JSON comes back cut into rows
+-- of about 2000 characters, a scalar subquery as one value on one line.
+local DESCRIBE_SQL = "SELECT (SELECT name, system_type_name"
+  .. " FROM sys.dm_exec_describe_first_result_set(N'%s', NULL, 0)"
+  .. " ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);"
 
 --- Types FOR JSON refuses to serialize. json_page_sql casts them to text:
 --- WKT for geography and geometry, /1/2/ for hierarchyid.
@@ -326,8 +319,8 @@ local function json_page_sql(sql_str, columns)
 
   local describe = string.format(DESCRIBE_SQL, esc(body))
   return describe .. "\n" .. string.format(
-    "SELECT (SELECT %s FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) AS %s %s",
-    row_list, JSON_COLUMN, body:sub(from_kw)), describe
+    "SELECT (SELECT %s FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) %s",
+    row_list, body:sub(from_kw)), describe
 end
 
 --- Index of the quote closing the JSON string that opens at `pos`.
@@ -393,6 +386,10 @@ end
 
 local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
 
+--- Types SQL Server cannot compare with =, reported so value lookups such as
+--- sql.build_insert_lookup leave them out.
+local INCOMPARABLE_TYPES = { text = true, ntext = true, image = true }
+
 --- FOR JSON prints binaries as base64 and floats as 1.500000000000000e+000;
 --- show them as 0x hex and the shortest decimal that reads back the same.
 local function json_cell(value, type_name)
@@ -414,37 +411,43 @@ local function json_cell(value, type_name)
   return value
 end
 
---- The { name, type } list a DESCRIBE_SQL result printed, or nil.
+--- The { name, type } list a DESCRIBE_SQL result printed: its first output
+--- line that is a JSON array. nil when there is none or a column has no name,
+--- as when the server cannot describe the statement.
 local function described_columns(raw)
-  local described = parse_sqlcmd_table(raw)
-  if described.lossy or #described.rows == 0 then return nil end
-  local columns = {}
-  for i, row in ipairs(described.rows) do
-    if row[1] == "" then return nil end
-    columns[i] = { name = row[1], type = row[2] or "" }
+  for line in (raw or ""):gmatch("[^\r\n]+") do
+    line = vim.trim(line)
+    if line:sub(1, 1) == "[" then
+      local ok, list = pcall(vim.json.decode, line)
+      if not ok or type(list) ~= "table" or #list == 0 then return nil end
+      local columns = {}
+      for i, entry in ipairs(list) do
+        if type(entry.name) ~= "string" or entry.name == "" then return nil end
+        local type_name = entry.system_type_name
+        columns[i] = { name = entry.name, type = type(type_name) == "string" and type_name or "" }
+      end
+      return columns
+    end
   end
-  return columns
+  return nil
 end
 
---- Parse the output of a json_page_sql batch into { columns, rows }.
---- Returns nil when any row does not decode into exactly the described
---- columns; the caller then falls back to the text output.
+--- Parse the output of a json_page_sql batch into { columns, rows, types }.
+--- Returns nil when the describe line is missing or any row does not decode
+--- into exactly the described columns; the caller then uses the text output.
 local function parse_json_page(raw)
-  local split = (raw or ""):find("\n" .. JSON_COLUMN .. "\r?\n%-")
-  if not split then return nil end
-
-  local described = described_columns(raw:sub(1, split))
+  local described = described_columns(raw)
   if not described then return nil end
   local columns, types = {}, {}
   for i, col in ipairs(described) do
     columns[i], types[i] = col.name, col.type
   end
 
-  -- Every row is one line starting with "{": JSON escapes the newlines inside
-  -- values. Other lines are the column header, its dashes, and server
-  -- messages such as "Warning: Null value is eliminated by an aggregate".
+  -- Every row is one line starting with "{". Other lines are the describe
+  -- array and server messages such as "Warning: Null value is eliminated by
+  -- an aggregate".
   local rows = {}
-  for line in raw:sub(split + 1):gmatch("[^\r\n]+") do
+  for line in raw:gmatch("[^\r\n]+") do
     line = vim.trim(line)
     if line:sub(1, 1) == "{" then
       local keys, values = decode_json_row(line)
@@ -458,7 +461,14 @@ local function parse_json_page(raw)
       rows[#rows + 1] = row
     end
   end
-  return { columns = columns, rows = rows }
+  local incomparable
+  for i, type_name in ipairs(types) do
+    if INCOMPARABLE_TYPES[base_type(type_name)] then
+      incomparable = incomparable or {}
+      incomparable[columns[i]] = true
+    end
+  end
+  return { columns = columns, rows = rows, types = types, incomparable = incomparable }
 end
 
 local function run_query(sql_str, url, timeout_ms)
@@ -472,7 +482,7 @@ local function run_query(sql_str, url, timeout_ms)
   local query_sql = normalize_query_sql(sql_str)
   local page_sql, describe_sql = json_page_sql(query_sql)
   if page_sql then
-    local stdout, stderr, code = sqlcmd(parsed, page_sql, timeout_ms)
+    local stdout, stderr, code = sqlcmd(parsed, page_sql, timeout_ms, { json = true })
     if code ~= 0 then
       local err = sqlcmd_error(stdout, stderr, code)
       -- Any other error would fail on the text path too.
@@ -480,10 +490,10 @@ local function run_query(sql_str, url, timeout_ms)
       -- FOR JSON refuses CLR columns such as geography, and says so before
       -- the describe half runs. Describe the page on its own and retry with
       -- those columns cast to text.
-      local described, _, describe_code = sqlcmd(parsed, describe_sql, timeout_ms)
+      local described, _, describe_code = sqlcmd(parsed, describe_sql, timeout_ms, { json = true })
       local columns = describe_code == 0 and described_columns(described)
       if columns then
-        stdout, _, code = sqlcmd(parsed, json_page_sql(query_sql, columns), timeout_ms)
+        stdout, _, code = sqlcmd(parsed, json_page_sql(query_sql, columns), timeout_ms, { json = true })
       end
     end
     if code == 0 then
@@ -496,7 +506,9 @@ local function run_query(sql_str, url, timeout_ms)
   if code ~= 0 then
     return nil, sqlcmd_error(stdout, stderr, code)
   end
-  return parse_sqlcmd_table(stdout), nil
+  local result = parse_sqlcmd_table(stdout)
+  result.text = true
+  return result, nil
 end
 
 --- Non-blocking twin of run_query: same argv, same output parser, same guards.
@@ -537,8 +549,9 @@ function M.query(sql_str, url)
     rows = parsed.rows,
     columns = parsed.columns,
     primary_keys = {},
-    readonly = parsed.lossy and true or nil,
-    readonly_reason = parsed.lossy or nil,
+    readonly = parsed.text or nil,
+    readonly_reason = parsed.text and "plain text output" or nil,
+    incomparable_columns = parsed.incomparable,
   }, nil
 end
 
