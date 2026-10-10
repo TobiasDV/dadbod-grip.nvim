@@ -346,22 +346,26 @@ end
 
 local JSON_PAGE_OUT = lines({
   describe_line({ { "id", "int" }, { "note", "nvarchar(max)" }, { "blob", "varbinary(max)" }, { "ratio", "float" } }),
-  [[{"id":1,"note":"line one\nline two\ttabbed","blob":"3q2+7w==","ratio":1.500000000000000e+000}]],
+  [[{"id":1,"note":"line one\nline two\ttabbed","blob":"0xDEADBEEF","ratio":1.500000000000000e+000}]],
   [[{"id":9223372036854775807,"note":null,"blob":null,"ratio":null}]],
 })
 
 test("sqlserver json_page_sql: grid queries are rewritten, everything else is not", function()
   local table_sql = sqlserver._json_page_sql(
     'SELECT * FROM "dbo"."my ""t""" WHERE ("id" > 1) ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY')
-  contains(table_sql, [[SELECT (SELECT "dbo"."my ""t""".* FOR JSON PATH]], "table rows")
   contains(table_sql, [[FROM "dbo"."my ""t""" WHERE ("id" > 1) ORDER BY]], "original tail kept")
-  contains(table_sql, [[dm_exec_describe_first_result_set(N'SELECT * FROM "dbo"]], "described first")
+  contains(table_sql, [[DECLARE @q nvarchar(max) = N'SELECT * FROM "dbo"."my ""t""" WHERE]], "the statement described")
   contains(table_sql, "ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);",
     "describe is a single JSON line")
+  contains(table_sql, [[N'"dbo"."my ""t""".' + QUOTENAME(name)]], "columns qualified by the source")
+  contains(table_sql, "CONVERT(varchar(max), CONVERT(varbinary(max), ", "binaries as hex, by the server")
+  contains(table_sql, "<binary ", "large binaries as a placeholder")
+  contains(table_sql, "AS nvarchar(max))", "CLR types as text")
+  contains(table_sql, "EXEC (", "row objects built from the description")
   assert(not table_sql:find("_grip_json", 1, true), "no header alias needed")
 
   local raw_sql = sqlserver._json_page_sql("SELECT * FROM (SELECT 'a' AS x) AS _grip ORDER BY (SELECT NULL)")
-  contains(raw_sql, "SELECT (SELECT _grip.* FOR JSON PATH", "raw wrapper rows")
+  contains(raw_sql, "N'_grip.' + QUOTENAME(name)", "raw wrapper columns")
   contains(raw_sql, "N'SELECT * FROM (SELECT ''a'' AS x) AS _grip", "describe literal escaped")
 
   eq(sqlserver._json_page_sql("SELECT id FROM dbo.users"), nil, "explicit column list")
@@ -433,14 +437,18 @@ end)
 test("sqlserver query: text, ntext and image columns are reported as incomparable", function()
   with_executable(function()
     local out = lines({
-      describe_line({ { "id", "int" }, { "txt", "text" }, { "ntxt", "ntext" }, { "name", "nvarchar(10)" } }),
-      [[{"id":1,"txt":"a","ntxt":"b","name":"c"}]],
+      describe_line({ { "id", "int" }, { "txt", "text" }, { "ntxt", "ntext" }, { "name", "nvarchar(10)" },
+        { "doc", "xml" }, { "loc", "geography" }, { "shape", "geometry" } }),
+      [[{"id":1,"txt":"a","ntxt":"b","name":"c","doc":"<a/>","loc":"POINT (1 2)","shape":"POINT (0 0)"}]],
     })
     with_system_mock(out, "", 0, function()
       local r = assert(sqlserver.query('SELECT * FROM "legacy" LIMIT 100', URL))
       eq(r.incomparable_columns.txt, true)
       eq(r.incomparable_columns.ntxt, true)
       eq(r.incomparable_columns.name, nil)
+      eq(r.incomparable_columns.doc, true, "xml cannot be compared with =")
+      eq(r.incomparable_columns.loc, true, "geography cannot be compared with =")
+      eq(r.incomparable_columns.shape, true, "geometry cannot be compared with =")
     end)
   end)
 end)
@@ -482,22 +490,21 @@ test("sqlserver query: a describe without column names falls back to the text ou
 end)
 
 local CLR_ERROR = "Msg 13604, Level 16, State 1\nFOR JSON cannot serialize CLR objects.\n"
-local PLACES_DESCRIBED = lines({ describe_line({ { "id", "int" }, { "loc", "geography" } }) })
 
-test("sqlserver query: CLR columns are retried cast to text", function()
+test("sqlserver query: binaries and CLR columns arrive formatted, in one call", function()
   with_executable(function()
     local r
     local calls = with_replies({
-      { CLR_ERROR, 1 },
-      { PLACES_DESCRIBED, 0 },
-      { PLACES_DESCRIBED .. lines({ [[{"id":1,"loc":"POINT (4.9 52.4)"}]] }), 0 },
+      { lines({ describe_line({ { "id", "int" }, { "loc", "geography" }, { "blob", "varbinary(max)" } }),
+        [[{"id":1,"loc":"POINT (4.9 52.4)","blob":"0xDEADBEEF"}]],
+        [[{"id":2,"loc":null,"blob":"<binary 2097152 bytes>"}]] }), 0 },
     }, function()
       r = assert(sqlserver.query('SELECT * FROM "dbo"."places" LIMIT 100', URL))
     end)
-    eq(#calls, 3, "JSON, describe, JSON with casts")
-    contains(calls[3], [[CAST("dbo"."places"."loc" AS nvarchar(max)) AS "loc"]], "geography cast")
-    contains(calls[3], [["dbo"."places"."id" AS "id"]], "other columns listed as they are")
+    eq(#calls, 1, "one sqlcmd call")
     eq(r.rows[1][2], "POINT (4.9 52.4)")
+    eq(r.rows[1][3], "0xDEADBEEF", "hex as the server sent it")
+    eq(r.rows[2][3], "<binary 2097152 bytes>", "placeholder as the server sent it")
     eq(r.readonly, nil)
   end)
 end)
@@ -507,13 +514,12 @@ test("sqlserver query: a page JSON cannot carry falls back to the text output", 
     local r
     local calls = with_replies({
       { CLR_ERROR, 1 },
-      { "Msg 11529, Level 16, State 1\nThe metadata could not be determined.\n", 1 },
       { lines({ "id\tshape", "--\t-----", "1\tPOINT (4 52)" }), 0 },
     }, function()
       r = assert(sqlserver.query('SELECT * FROM "places" LIMIT 100', URL))
     end)
-    eq(#calls, 3, "JSON, describe, text")
-    assert(not calls[3]:find("FOR JSON", 1, true), "last call is plain")
+    eq(#calls, 2, "JSON, then text")
+    assert(not calls[2]:find("FOR JSON", 1, true), "last call is plain")
     eq(r.rows[1][2], "POINT (4 52)")
     eq(r.readonly, true, "text fallback is read-only")
   end)
