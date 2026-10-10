@@ -1667,7 +1667,7 @@ function M.open_welcome()
     "  a       apply changes        u     undo",
     "  gf      FK drill-down        s/S   sort / stack sort",
     "  gF      filter builder       f     quick filter",
-    "  violet = modified · green = inserted · red = deleted",
+    "  yellow = modified · green = inserted · red = deleted",
     "",
     "  ── Analysis ────────────────────────────────────",
     "  gR  column distributions     gS  column stats",
@@ -1732,7 +1732,7 @@ function M.open_welcome()
             })
           end
         end
-        hl_phrase("violet = modified", "GripModified")
+        hl_phrase("yellow = modified", "GripModified")
         hl_phrase("green = inserted",  "GripInserted")
         hl_phrase("red = deleted",     "GripDeleted")
       elseif line:sub(3, 7) == ":Grip" then

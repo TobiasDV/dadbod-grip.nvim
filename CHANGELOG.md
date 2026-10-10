@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Grip's colours come from the active colorscheme instead of a palette of
+  its own: deleted is the scheme's red, inserted its green, changed its
+  yellow, dimmed text its Comment grey, borders its FloatBorder, the
+  accent its Title. Under gruvbox grip now looks like gruvbox. The groups
+  are defined with `default`, so your own definitions win. A connection
+  `color` name resolves to the scheme's colour of that name. See
+  `:h grip-theme`.
 - Connecting to a connection from `~/.grip/connections.json` no longer
   copies it into the project's `.grip/connections.json`. The copy had no
   `env_file`, `mode` or `color` and shadowed the global entry, so the next

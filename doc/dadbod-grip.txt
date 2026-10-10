@@ -1200,32 +1200,64 @@ Three further limits:
   session at all. Point a `mode: "ro"` entry at the direct port rather than
   the pooled one.
 
+                                                          *grip-theme*
+Colours ~
+
+Grip has no palette of its own. Every highlight group is derived from the
+active colorscheme by role, so grip looks like the rest of Neovim under
+gruvbox, catppuccin or anything else:
+
+  role     tried in this order
+  red      Red, GruvboxRed, DiagnosticError, ErrorMsg
+  green    Green, GruvboxGreen, DiagnosticOk, String
+  yellow   Yellow, GruvboxYellow, DiagnosticWarn, WarningMsg
+  orange   Orange, GruvboxOrange, Special, DiagnosticWarn
+  blue     Blue, GruvboxBlue, DiagnosticInfo, Function
+  violet   Purple, GruvboxPurple, Boolean, Constant
+  grey     Grey, GruvboxGray, Comment, NonText
+  title    Title, Orange, GruvboxOrange, Special
+  border   FloatBorder, WinSeparator, Comment
+  column   CursorColumn, CursorLine, Visual
+
+  GripModified     yellow on the DiffChange background, bold
+  GripInserted     green on the DiffAdd background, bold
+  GripDeleted      red on the DiffDelete background, struck through
+  GripNullStaged   orange on the DiffChange background, bold
+  GripNull, GripReadonly, GripDatePast, GripColType   grey (italic but the last)
+  GripBoolTrue, GripStatusOk, GripDiffAdded         green, bold
+  GripBoolFalse, GripNegative, GripDiffDeleted      red, bold
+  GripStatusChg, GripDiffChanged                    yellow, bold
+  GripUrl          blue, underlined     GripWatch   blue, bold
+  GripColHighlight, GripHeaderActive   the column background
+  GripProfileHeader                    the title colour, bold
+
+These groups are defined with `default`, so a group you define yourself
+wins, and they are re-derived on every ColorScheme. The cterm index comes
+from the source group, or is approximated onto the nearest xterm entry.
+
                                                           *grip-accent*
 Connection colour ~
 
-`"color"` takes a palette name -- green, orange, red, blue, violet,
-yellow -- or a `#rrggbb` value, and tints the window borders, the grid
-rules and the schema sidebar title, so a red production connection does not
-look like a green local one. An unknown value is ignored, not raised.
-
-The palette reuses colours already in grip's theme, and every accent also
-carries a `ctermfg` (a `#rrggbb` value is approximated onto the nearest
-xterm palette entry), so none of this needs a truecolor terminal.
+`"color"` takes a role name -- green, orange, red, blue, violet, yellow --
+or a `#rrggbb` value, and tints the window borders, the grid rules and the
+schema sidebar title, so a red production connection does not look like a
+green local one. A name is the colorscheme's own colour, resolved through
+the table above. An unknown value is ignored, not raised.
 
 Three highlight groups carry it:
 
   GripConnAccent       the connection's colour
   GripConnAccentBold   the same, bold; used for the sidebar title
-  GripBorder           window borders and grid rules; DERIVED from the
-                       accent, which is what makes an entry without a
-                       `color` restore the default #cba6f7 / ctermfg=147
-                       instead of leaving the last connection's tint behind
+  GripBorder           window borders and grid rules
+
+Without a `color` they fall back to the colorscheme's own look: the Title
+colour for the accent and the FloatBorder colour for borders and rules,
+which is what makes leaving a coloured connection take its tint with it.
 
 All three are redefined on every connection switch and re-applied whenever
 highlights are rebuilt, so they survive a `:colorscheme` change. Because
-they are redefined rather than merged, defining any of them yourself in your
-config will not stick -- this is unchanged from how grip's other groups have
-always behaved.
+they are redefined rather than merged, defining any of them yourself in
+your config will not stick; set a `color` on the connection instead.
 
 ==============================================================================
 14. EXPORT                                                   *grip-export*

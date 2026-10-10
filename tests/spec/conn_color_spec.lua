@@ -29,9 +29,12 @@ local function fg(group)
   return vim.api.nvim_get_hl(0, { name = group }).fg
 end
 
--- GripBorder's definition from before per-connection colour existed. Every
--- "restores the default" assertion is against this number.
-local DEFAULT_BORDER = 0xcba6f7
+-- Every colour is the colorscheme's: the expectations below are read from
+-- theme.lua's roles at assertion time, never from a fixed number.
+local theme = require("dadbod-grip.theme")
+local function hexnum(c) return tonumber(c.hex:sub(2), 16) end
+local function default_border() return hexnum(theme.color("border", "fg") or theme.fg("grey")) end
+local function default_accent() return hexnum(theme.fg("title")) end
 
 -- ── set_connection_accent ─────────────────────────────────────────────────
 
@@ -40,17 +43,16 @@ test("a palette name sets the accent groups", function()
   view.set_connection_accent("red")
   local hl = vim.api.nvim_get_hl(0, { name = "GripConnAccent" })
   assert(hl.fg, "GripConnAccent has a foreground")
-  -- The palette is the one already in ensure_highlights: red is GripNegative's.
-  eq(hl.fg, 0xf38ba8, "red is the plugin's own red, not a second palette")
-  eq(fg("GripConnAccentBold"), 0xf38ba8, "the bold variant follows it")
+  eq(hl.fg, hexnum(theme.fg("red")), "red is the colorscheme's red")
+  eq(fg("GripConnAccentBold"), hexnum(theme.fg("red")), "the bold variant follows it")
   eq(vim.api.nvim_get_hl(0, { name = "GripConnAccentBold" }).bold, true, "and is bold")
-  eq(fg("GripBorder"), 0xf38ba8, "the border takes the accent too")
+  eq(fg("GripBorder"), hexnum(theme.fg("red")), "the border takes the accent too")
 end)
 
 test("a palette name is case-insensitive", function()
   local view = require("dadbod-grip.view")
   view.set_connection_accent("Green")
-  eq(fg("GripConnAccent"), 0xa6e3a1, "Green resolves like green")
+  eq(fg("GripConnAccent"), hexnum(theme.fg("green")), "Green resolves like green")
 end)
 
 test("every documented palette name resolves", function()
@@ -60,7 +62,7 @@ test("every documented palette name resolves", function()
     view.set_connection_accent(name)
     assert(fg("GripConnAccent"), name .. " resolves to a colour")
     if name ~= "violet" then
-      assert(fg("GripConnAccent") ~= DEFAULT_BORDER,
+      assert(fg("GripConnAccent") ~= default_accent(),
         name .. " must not silently fall through to the default")
     end
   end
@@ -76,16 +78,16 @@ test("nil restores the default border", function()
   local view = require("dadbod-grip.view")
   view.set_connection_accent("red")
   view.set_connection_accent(nil)
-  eq(vim.api.nvim_get_hl(0, { name = "GripBorder" }).fg, 0xcba6f7,
+  eq(vim.api.nvim_get_hl(0, { name = "GripBorder" }).fg, default_border(),
      "border back to its default after leaving a coloured connection")
-  eq(fg("GripConnAccent"), DEFAULT_BORDER, "and so are the accent groups")
+  eq(fg("GripConnAccent"), default_accent(), "and so are the accent groups")
 end)
 
 test("an unknown colour name is ignored rather than raising", function()
   local view = require("dadbod-grip.view")
   local ok = pcall(view.set_connection_accent, "chartreuse-ish")
   eq(ok, true, "no error on a bad value")
-  eq(fg("GripBorder"), DEFAULT_BORDER, "and it leaves the default look, not the last colour")
+  eq(fg("GripBorder"), default_border(), "and it leaves the default look, not the last colour")
 end)
 
 test("a malformed hex is ignored rather than half-applied", function()
@@ -94,7 +96,7 @@ test("a malformed hex is ignored rather than half-applied", function()
     view.set_connection_accent("red")
     local ok = pcall(view.set_connection_accent, bad)
     eq(ok, true, "no error on " .. tostring(bad))
-    eq(fg("GripBorder"), DEFAULT_BORDER, tostring(bad) .. " leaves the default look")
+    eq(fg("GripBorder"), default_border(), tostring(bad) .. " leaves the default look")
   end
 end)
 
@@ -105,8 +107,8 @@ end)
 test("an accent carries a ctermfg", function()
   local view = require("dadbod-grip.view")
   view.set_connection_accent("red")
-  eq(vim.api.nvim_get_hl(0, { name = "GripConnAccent" }).ctermfg, 203,
-    "the palette's own cterm index, matching GripNegative")
+  eq(vim.api.nvim_get_hl(0, { name = "GripConnAccent" }).ctermfg, theme.fg("red").cterm,
+    "the colorscheme's own cterm index for red")
   view.set_connection_accent("#00ff00")
   eq(vim.api.nvim_get_hl(0, { name = "GripConnAccent" }).ctermfg, 46,
     "a user hex is approximated into the xterm cube (#00ff00 = bright green)")
@@ -116,8 +118,8 @@ test("an accent carries a ctermfg", function()
   eq(vim.api.nvim_get_hl(0, { name = "GripConnAccent" }).ctermfg, 63,
     "the cube's uneven low end is honoured")
   view.set_connection_accent(nil)
-  eq(vim.api.nvim_get_hl(0, { name = "GripBorder" }).ctermfg, 147,
-    "the default's cterm index is unchanged too")
+  eq(vim.api.nvim_get_hl(0, { name = "GripBorder" }).ctermfg, (theme.color("border", "fg") or theme.fg("grey")).cterm,
+    "the default's cterm index follows the colorscheme too")
 end)
 
 -- The 240 indices above the ANSI 16 are the 6x6x6 cube plus a 24-step grey
@@ -154,11 +156,11 @@ test("the accent survives a :colorscheme change", function()
   local orig_scheme = vim.g.colors_name
   view.set_connection_accent("red")
   vim.cmd("colorscheme blue")
-  eq(fg("GripConnAccent"), 0xf38ba8, "accent re-applied after the scheme wiped it")
-  eq(fg("GripBorder"), 0xf38ba8, "and the border with it")
+  eq(fg("GripConnAccent"), hexnum(theme.fg("red")), "accent re-applied in the new scheme's red")
+  eq(fg("GripBorder"), hexnum(theme.fg("red")), "and the border with it")
   view.set_connection_accent(nil)
   vim.cmd("colorscheme " .. (orig_scheme or "default"))
-  eq(fg("GripBorder"), DEFAULT_BORDER, "an uncoloured connection survives it as the default")
+  eq(fg("GripBorder"), default_border(), "an uncoloured connection survives it as the default")
 end)
 
 -- ── the sidebar title ─────────────────────────────────────────────────────
@@ -190,9 +192,9 @@ test("the sidebar title is drawn with the accent group", function()
       { details = true })
     assert(#marks > 0, "the title line carries a highlight")
     eq(marks[1][4].hl_group, "GripConnAccentBold", "and it is the accent group")
-    eq(fg(marks[1][4].hl_group), 0xf38ba8, "which resolves red on a red connection")
+    eq(fg(marks[1][4].hl_group), hexnum(theme.fg("red")), "which resolves red on a red connection")
     view.set_connection_accent(nil)
-    eq(fg(marks[1][4].hl_group), DEFAULT_BORDER, "and back to the default without one")
+    eq(fg(marks[1][4].hl_group), default_accent(), "and back to the default without one")
   end)
 
   schema.close()
@@ -292,8 +294,8 @@ test("switching to a coloured connection tints the accent", function()
   with_real_file(function(local_grip)
     write_conns(local_grip)
     connections.switch(PROD, "prod", "postgresql")
-    eq(fg("GripConnAccent"), 0xf38ba8, "the entry's colour reached the highlight groups")
-    eq(fg("GripBorder"), 0xf38ba8, "so the grid border and sidebar title are red")
+    eq(fg("GripConnAccent"), hexnum(theme.fg("red")), "the entry's colour reached the highlight groups")
+    eq(fg("GripBorder"), hexnum(theme.fg("red")), "so the grid border and sidebar title are red")
   end)
 end)
 
@@ -302,9 +304,9 @@ test("switching back to an uncoloured connection restores the defaults", functio
     write_conns(local_grip)
     connections.switch(PROD, "prod", "postgresql")
     connections.switch(LOCAL, "local", "postgresql")
-    eq(fg("GripBorder"), DEFAULT_BORDER,
+    eq(fg("GripBorder"), default_border(),
       "leaving a red prod connection must not leave the border red")
-    eq(fg("GripConnAccent"), DEFAULT_BORDER, "and the accent with it")
+    eq(fg("GripConnAccent"), default_accent(), "and the accent with it")
   end)
 end)
 
@@ -314,7 +316,7 @@ test("switching to a connection that was never saved restores the defaults", fun
     connections.switch(PROD, "prod", "postgresql")
     -- ~ Connect once: no entry at all, so no colour.
     connections.switch("postgresql://u:p@h/adhoc", nil, "postgresql")
-    eq(fg("GripBorder"), DEFAULT_BORDER, "an ad-hoc connection is uncoloured")
+    eq(fg("GripBorder"), default_border(), "an ad-hoc connection is uncoloured")
   end)
 end)
 
