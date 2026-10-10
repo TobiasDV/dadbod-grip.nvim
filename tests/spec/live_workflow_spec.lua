@@ -481,6 +481,39 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
+  test("SQL Server query pad runs the SQL people type", function()
+    local grip = require("dadbod-grip")
+    -- { sql, rows, first cell of the last column of row 1, editable }
+    local cases = {
+      { "SELECT * FROM users ORDER BY name", 15, nil, true },
+      { "SELECT name FROM users ORDER BY name DESC", 15, nil, true },
+      { "SELECT u.name, COUNT(*) FROM orders o JOIN users u ON u.id = o.user_id GROUP BY u.name", nil, nil, false },
+      { "WITH x AS (SELECT * FROM users) SELECT name FROM x WHERE name = N'Alice'", 1, "Alice", false },
+      { "SELECT 1 AS a; SELECT 2 AS b", 1, "2", false },
+      { "PRINT 'hi'; SELECT 3 AS a", 1, "3", false },
+      { "DECLARE @n int = 2; SELECT TOP (@n) name FROM users ORDER BY id", 2, "Alice", false },
+      { "EXEC sp_executesql N'SELECT 4 AS a'", 1, "4", false },
+      { "SELECT 5 AS a\nGO\nSELECT 6 AS b", 1, "6", false },
+      { "SELECT * FROM users -- every user", 15, nil, true },
+      { "/* who */ SELECT name FROM users WHERE name = N'Bob'", 1, "Bob", true },
+      { "SELECT name FROM users ORDER BY LEN(name), name", 15, nil, false },
+    }
+    for _, c in ipairs(cases) do
+      local spec, table_name = grip._resolve_query(c[1], 50, "sqlserver")
+      assert(spec, c[1] .. ": no spec (" .. tostring(table_name) .. ")")
+      local fetched, used_spec, used_table = grip._fetch_grid(URL, spec, table_name)
+      assert(fetched.result, c[1] .. ": " .. tostring(fetched.err))
+      local r = fetched.result
+      if c[2] then eq(#r.rows, c[2], c[1] .. " rows") else assert(#r.rows > 0, c[1] .. " rows") end
+      if c[3] then eq(r.rows[1][#r.columns], c[3], c[1] .. " value") end
+      eq(used_table ~= nil and not r.readonly, c[4], c[1] .. " editable")
+      if used_spec.passthrough then eq(query.build_count_sql(used_spec), nil, "no count") end
+    end
+    local bad = grip._fetch_grid(URL, (grip._resolve_query("SELECT nope FROM users", 50, "sqlserver")))
+    assert(not bad.result and tostring(bad.err):find("Invalid column name 'nope'", 1, true),
+      "the server's own error: " .. tostring(bad.err))
+  end)
+
   test("SQL Server reports the server's error for a view it cannot describe", function()
     local probe, broken = "grip_live_base", "grip_live_broken"
     db.execute("DROP VIEW IF EXISTS " .. broken, URL)

@@ -45,6 +45,15 @@ function M.new_raw(sql_str, page_size)
   }
 end
 
+--- A batch that runs exactly as written: no wrapper, so no sort, filter,
+--- paging or count (see the SQL Server adapter's plan_query).
+function M.new_passthrough(sql_str, page_size)
+  local spec = M.new_raw(sql_str, page_size)
+  spec.base_sql = sql_str
+  spec.passthrough = true
+  return spec
+end
+
 -- ── sort modifiers ───────────────────────────────────────────────────────
 
 --- Toggle sort on a column (replaces existing sorts).
@@ -304,12 +313,14 @@ end
 --- Build the data query SQL from a spec. opts.paginate=false preserves the
 --- active filters and sorts but omits LIMIT/OFFSET (used by all-row export).
 function M.build_sql(spec, opts)
+  if spec.passthrough then return spec.base_sql end
   local parts = {}
 
   -- FROM clause
   local from
   if spec.is_raw then
-    from = "(" .. spec.base_sql .. ") AS _grip"
+    -- On its own line: a trailing -- comment would swallow the wrapper.
+    from = "(" .. spec.base_sql .. "\n) AS _grip"
   else
     from = sql_mod.quote_ident(spec.table_name)
   end
@@ -342,10 +353,12 @@ end
 
 --- Build COUNT query (for pagination total).
 function M.build_count_sql(spec)
+  if spec.passthrough then return nil end
   local parts = {}
   local from
   if spec.is_raw then
-    from = "(" .. spec.base_sql .. ") AS _grip"
+    -- On its own line: a trailing -- comment would swallow the wrapper.
+    from = "(" .. spec.base_sql .. "\n) AS _grip"
   else
     from = sql_mod.quote_ident(spec.table_name)
   end

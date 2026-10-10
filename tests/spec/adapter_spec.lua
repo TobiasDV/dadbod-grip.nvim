@@ -1594,6 +1594,7 @@ end)
 test("sqlserver get_schema_batch_async: delivers columns keyed by table name", function()
   local tsv_stdout = table.concat({
     "table_name\tCOLUMN_NAME\tdata_type\tIS_NULLABLE",
+    "----------\t-----------\t---------\t-----------",
     "invoices\tid\tint\tNO",
     "invoices\tamount\tdecimal(10,2)\tYES",
     "sales.leads\tid\tint\tNO",

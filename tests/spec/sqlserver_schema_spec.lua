@@ -798,6 +798,76 @@ test("sqlserver get_referencing_foreign_keys: query failure returns {} and err",
   contains(err, "Msg 262", "err carries the server message")
 end)
 
+-- ── query pad: what can be wrapped and paged, what runs as written ─────────
+
+test("plan_query: classifies query pad SQL", function()
+  local cases = {
+    { "customers", nil },
+    { "UPDATE customers SET vip = 1", nil },
+    { "SELECT * FROM customers WHERE vip = 1", "select" },
+    { "SELECT 1;", "select" },
+    { "/* lead */ SELECT * FROM customers", "select" },
+    { "SELECT * FROM customers -- trailing", "select" },
+    { "SELECT 'a;b' AS x", "select" },
+    { "SELECT * FROM t WHERE x = 'ORDER BY y'", "select" },
+    { "SELECT TOP 5 * FROM many ORDER BY id", "select" },
+    { "SELECT * FROM t ORDER BY LEN(name)", "passthrough" },
+    { "SELECT * FROM t ORDER BY 1", "passthrough" },
+    { "SELECT 1 AS a; SELECT 2 AS b", "passthrough" },
+    { "WITH x AS (SELECT 1 AS a) SELECT * FROM x", "passthrough" },
+    { "EXEC sp_help 'customers'", "passthrough" },
+    { "exec sp_who", "passthrough" },
+    { "DECLARE @n int = 3; SELECT @n", "passthrough" },
+    { "PRINT 'hi'; SELECT 1 AS a", "passthrough" },
+    { "SELECT 1 AS a\nGO\nSELECT 2 AS b", "passthrough" },
+    { "SELECT * INTO #t FROM customers", "passthrough" },
+    { "SELECT * FROM t FOR JSON PATH", "passthrough" },
+    { "SELEKT 1", "passthrough" },
+  }
+  for _, c in ipairs(cases) do
+    local plan = sqlserver.plan_query(c[1])
+    eq(plan and plan.kind, c[2], c[1])
+  end
+end)
+
+test("plan_query: a plain trailing ORDER BY becomes the grid's sort", function()
+  local plan = sqlserver.plan_query("SELECT c.name, c.id FROM customers c ORDER BY c.name DESC, [id]")
+  eq(plan.kind, "select")
+  eq(plan.sql, "SELECT c.name, c.id FROM customers c")
+  eq(#plan.sorts, 2)
+  eq(plan.sorts[1].column, "name")
+  eq(plan.sorts[1].dir, "DESC")
+  eq(plan.sorts[2].column, "id")
+  eq(plan.sorts[2].dir, "ASC")
+  local top = sqlserver.plan_query("SELECT TOP 5 * FROM many ORDER BY id")
+  eq(#top.sorts, 0, "ORDER BY with TOP is legal inside the wrapper")
+  eq(top.sql, "SELECT TOP 5 * FROM many ORDER BY id")
+end)
+
+test("plan_query: a batch that writes is flagged", function()
+  eq(sqlserver.plan_query("PRINT 'x'; DELETE FROM t").writes, true)
+  eq(sqlserver.plan_query("DECLARE @t TABLE (a int); INSERT INTO @t VALUES (1); SELECT * FROM @t").writes, true)
+  eq(sqlserver.plan_query("EXEC sp_help 'customers'").writes, false)
+  eq(sqlserver.plan_query("SELECT 'DROP TABLE x' AS s; SELECT 1").writes, false, "inside a literal")
+end)
+
+test("sqlserver text output: the last result set wins, PRINT lines are not rows", function()
+  local out = lines({ "hi", "a", "-", "1", "", "b\tc", "-\t-", "2\tx", "3\ty" })
+  local r = sqlserver._parse_sqlcmd_table(out)
+  eq(table.concat(r.columns, ","), "b,c")
+  eq(#r.rows, 2)
+  eq(r.rows[2][2], "y")
+  local msg = sqlserver._parse_sqlcmd_table(lines({ "only a message" }))
+  eq(#msg.columns, 0, "no result set")
+  eq(msg.messages[1], "only a message")
+end)
+
+test("sqlcmd script: the session setup shares the first line, so error lines match", function()
+  local script = sqlserver._sqlcmd_script("SELECT 1\nSELEKT 2")
+  eq(select(2, script:gsub("\n", "")), 2, "two lines in, two lines out")
+  assert(script:find("^SET QUOTED_IDENTIFIER ON; SET NOCOUNT ON; SELECT 1\n"), script)
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 
 print(string.format("\nsqlserver_schema_spec: %d passed, %d failed", pass, fail))

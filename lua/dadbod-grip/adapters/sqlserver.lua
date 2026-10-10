@@ -125,8 +125,10 @@ end
 --- Prefix the session settings required by ordinary query execution.
 local function sqlcmd_script(sql_str, opts)
   opts = opts or {}
-  local session = "SET QUOTED_IDENTIFIER ON;\n"
-  if opts.nocount ~= false then session = session .. "SET NOCOUNT ON;\n" end
+  -- On the first line of the user's SQL, so the server's "Line N" in an
+  -- error is the line they wrote.
+  local session = "SET QUOTED_IDENTIFIER ON; "
+  if opts.nocount ~= false then session = session .. "SET NOCOUNT ON; " end
   -- go-sqlcmd ignores a last line with no newline when it reads the script
   -- from stdin; terminating it keeps the script valid however it is fed.
   return session .. sql_str .. "\n"
@@ -206,14 +208,15 @@ local function parse_sqlcmd_table(raw)
     return { columns = {}, rows = {} }
   end
 
+  -- Blank lines stay until the header is found: an unnamed column, as in
+  -- SELECT COUNT(*), prints a blank header line.
   local lines = {}
-  for line in raw:gmatch("[^\r\n]+") do
-    local trimmed = vim.trim(line)
-    if trimmed ~= "" and not trimmed:match("^%(%d+ rows? affected%)$") then
+  for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
+    line = line:gsub("\r$", "")
+    if not vim.trim(line):match("^%(%d+ rows? affected%)$") then
       table.insert(lines, line)
     end
   end
-  if #lines == 0 then return { columns = {}, rows = {} } end
 
   local function split(line)
     local fields = {}
@@ -225,11 +228,31 @@ local function parse_sqlcmd_table(raw)
     return fields
   end
 
-  local columns = split(lines[1])
+  -- A result set is a header line, a line of dashes, then its rows. A batch
+  -- can print several, and PRINT output before them; the last one is the
+  -- result, as in a query editor.
+  local function is_separator(line)
+    for field in (line .. "\t"):gmatch("([^\t]*)\t") do
+      if not vim.trim(field):match("^%-+$") then return false end
+    end
+    return true
+  end
+  local sep_at
+  for i = 1, #lines do
+    if vim.trim(lines[i]) ~= "" and is_separator(lines[i]) then sep_at = i end
+  end
+  if not sep_at then
+    local messages = {}
+    for _, line in ipairs(lines) do
+      if vim.trim(line) ~= "" then messages[#messages + 1] = line end
+    end
+    return { columns = {}, rows = {}, messages = #messages > 0 and messages or nil }
+  end
+
+  local columns = split(lines[sep_at - 1] or "")
   local rows = {}
-  for i = 2, #lines do
-    local sep_probe = lines[i]:gsub("[\t%s%-]", "")
-    if not (sep_probe == "" and lines[i]:find("-", 1, true)) then
+  for i = sep_at + 1, #lines do
+    if vim.trim(lines[i]) ~= "" then
       local row = split(lines[i])
       -- sqlcmd prints a CLR value such as geography as its raw bytes, and a
       -- NUL among them would break rendering the grid.
@@ -421,6 +444,173 @@ end
 local INCOMPARABLE_TYPES = {
   text = true, ntext = true, image = true, xml = true, geography = true, geometry = true,
 }
+
+-- ── query pad SQL ────────────────────────────────────────────────────────
+-- A raw query is paged by wrapping it: SELECT * FROM (<query>) AS _grip.
+-- SQL Server refuses a lot inside that wrapper (ORDER BY without TOP, CTEs,
+-- several statements, EXEC, ...), so plan_query decides per query whether
+-- it can be wrapped or must run as written.
+
+--- Top-level-aware tokens of a T-SQL batch. Comments are dropped; literals,
+--- quoted names, words and punctuation carry their nesting depth.
+local function scan_tsql(sql_str)
+  local toks, i, n, depth = {}, 1, #sql_str, 0
+  local function quoted(open_at, close)
+    local j = open_at + 1
+    while j <= n do
+      if sql_str:sub(j, j) == close then
+        if sql_str:sub(j + 1, j + 1) ~= close then return j end
+        j = j + 2
+      else
+        j = j + 1
+      end
+    end
+    return n
+  end
+  while i <= n do
+    local c, two = sql_str:sub(i, i), sql_str:sub(i, i + 1)
+    if two == "--" then
+      i = (sql_str:find("\n", i, true) or n) + 1
+    elseif two == "/*" then
+      local nest, j = 1, i + 2
+      while j <= n and nest > 0 do
+        local t = sql_str:sub(j, j + 1)
+        if t == "/*" then nest, j = nest + 1, j + 2
+        elseif t == "*/" then nest, j = nest - 1, j + 2
+        else j = j + 1 end
+      end
+      i = j
+    elseif c == "'" then
+      local e = quoted(i, "'")
+      toks[#toks + 1] = { kind = "literal", s = i, e = e, depth = depth }
+      i = e + 1
+    elseif c == "[" or c == '"' then
+      local e = quoted(i, c == "[" and "]" or '"')
+      toks[#toks + 1] = { kind = "name", s = i, e = e, depth = depth, text = sql_str:sub(i, e) }
+      i = e + 1
+    elseif c:match("[%w_@#$\128-\255]") then
+      local s2, e2 = sql_str:find("^[%w_@#$\128-\255]+", i)
+      local text = sql_str:sub(s2, e2)
+      toks[#toks + 1] = { kind = "word", s = s2, e = e2, depth = depth, text = text, word = text:upper() }
+      i = e2 + 1
+    else
+      if c == ")" then depth = depth - 1 end
+      if c:match("[%(%);,%.]") then toks[#toks + 1] = { kind = c, s = i, e = i, depth = depth } end
+      if c == "(" then depth = depth + 1 end
+      i = i + 1
+    end
+  end
+  return toks
+end
+
+--- [a]]b] / "a""b" / a → a]b / a"b / a
+local function unquote_name(text)
+  local open = text:sub(1, 1)
+  if open == "[" then return text:sub(2, -2):gsub("%]%]", "]") end
+  if open == '"' then return text:sub(2, -2):gsub('""', '"') end
+  return text
+end
+
+-- First words the generic code already routes (mutation preview, DDL confirm).
+local ROUTED_ELSEWHERE = {
+  UPDATE = true, DELETE = true, INSERT = true, ALTER = true, DROP = true, CREATE = true,
+  BEGIN = true, COMMIT = true, ROLLBACK = true,
+}
+local WRITE_WORDS = {
+  INSERT = true, UPDATE = true, DELETE = true, MERGE = true, TRUNCATE = true, DROP = true,
+  ALTER = true, CREATE = true, GRANT = true, REVOKE = true, DENY = true,
+}
+
+--- Plain trailing ORDER BY items ([alias.]column [ASC|DESC]) as grid sorts,
+--- or nil when any item is something else (an expression, an ordinal).
+local function order_by_sorts(toks, from)
+  local sorts, item = {}, {}
+  local function close_item()
+    local last_name, dir, expect_name = nil, "ASC", true
+    for _, t in ipairs(item) do
+      if expect_name and (t.kind == "name" or (t.kind == "word" and t.word ~= "ASC" and t.word ~= "DESC")) then
+        last_name, expect_name = unquote_name(t.text), false
+      elseif not expect_name and t.kind == "." then
+        expect_name = true
+      elseif not expect_name and t.kind == "word" and (t.word == "ASC" or t.word == "DESC") and dir == "ASC" then
+        dir = t.word
+      else
+        return false
+      end
+    end
+    if not last_name or expect_name or last_name:match("^%d") then return false end
+    sorts[#sorts + 1] = { column = last_name, dir = dir }
+    item = {}
+    return true
+  end
+  for k = from, #toks do
+    local t = toks[k]
+    if t.kind == ";" then break end
+    if t.depth ~= 0 then return nil end
+    if t.kind == "," then
+      if not close_item() then return nil end
+    else
+      item[#item + 1] = t
+    end
+  end
+  if not close_item() then return nil end
+  return sorts
+end
+
+--- How the query pad should run `sql_str` on SQL Server. Returns nil for what
+--- the generic code handles (a bare table name, UPDATE/DELETE/INSERT, DDL),
+--- else a plan:
+---   { kind = "select", sql = <wrappable query>, sorts = { {column, dir} } }
+---   { kind = "passthrough", writes = <the batch writes> }: run as written.
+function M.plan_query(sql_str)
+  local trimmed = vim.trim(sql_str or "")
+  if trimmed == "" then return nil end
+  local toks = scan_tsql(trimmed)
+  local first
+  for _, t in ipairs(toks) do
+    if t.kind == "word" or t.kind == "name" then first = t break end
+  end
+  if not first then return nil end
+  if first.kind == "name" or (not trimmed:find("%s") and first.s == 1) then return nil end
+
+  local writes = false
+  for _, t in ipairs(toks) do
+    if t.kind == "word" and WRITE_WORDS[t.word] then writes = true end
+  end
+  if ROUTED_ELSEWHERE[first.word] then return nil end
+  if first.word == "WITH" and writes then return nil end
+  local passthrough = { kind = "passthrough", writes = writes }
+  if first.word ~= "SELECT" then return passthrough end
+
+  -- Anything after a top-level ';' or a GO line is another statement.
+  for k, t in ipairs(toks) do
+    if t.kind == ";" and t.depth == 0 and toks[k + 1] then return passthrough end
+  end
+  for line in trimmed:gmatch("[^\n]+") do
+    if line:match("^%s*[Gg][Oo]%s*%d*%s*$") then return passthrough end
+  end
+
+  local order_at, has_top = nil, false
+  for k, t in ipairs(toks) do
+    if t.depth == 0 and t.kind == "word" then
+      if t.word == "INTO" or t.word == "OPTION" or t.word == "COMPUTE" then return passthrough end
+      if t.word == "FOR" and toks[k + 1] and toks[k + 1].kind == "word"
+          and (toks[k + 1].word == "JSON" or toks[k + 1].word == "XML" or toks[k + 1].word == "BROWSE") then
+        return passthrough
+      end
+      if t.word == "TOP" or t.word == "OFFSET" then has_top = true end
+      if t.word == "ORDER" and toks[k + 1] and toks[k + 1].word == "BY" then order_at = k end
+    end
+  end
+
+  local body = trimmed:gsub("[%s;]+$", "")
+  if not order_at or has_top then
+    return { kind = "select", sql = body, sorts = {} }
+  end
+  local sorts = order_by_sorts(toks, order_at + 2)
+  if not sorts then return passthrough end
+  return { kind = "select", sql = vim.trim(trimmed:sub(1, toks[order_at].s - 1)), sorts = sorts }
+end
 
 --- Character types: the grid's "" can be a real empty string in these.
 local TEXT_TYPES = {

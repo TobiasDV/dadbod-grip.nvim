@@ -609,6 +609,18 @@ test("immutability: add_filter with pinned does not mutate original", function()
   eq(#spec.filters, 0)
 end)
 
+test("passthrough spec: runs as written, no count, no paging", function()
+  local spec = query.new_passthrough("EXEC sp_who", 100)
+  eq(query.build_sql(spec), "EXEC sp_who")
+  eq(query.build_count_sql(spec), nil)
+  eq(query.clean_sql(spec), "EXEC sp_who")
+end)
+
+test("raw spec: a trailing line comment cannot swallow the wrapper", function()
+  local sql = query.build_sql(query.new_raw("SELECT 1 AS a -- note", 100))
+  contains(sql, "-- note\n) AS _grip")
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 print(string.format("\nquery_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end
