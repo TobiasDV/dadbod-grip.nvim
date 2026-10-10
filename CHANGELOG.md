@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SQL Server: undoing a delete no longer loses the row when it holds `''`
+  in a NOT NULL column, a computed, rowversion or temporal period column, or
+  a binary value; undoing an edit of a `''` cell restores `''`, and clearing
+  a NOT NULL text cell writes `''` instead of failing on NULL. Binary cells
+  can be edited as `0x...`.
+- SQL Server query pad: ORDER BY, unnamed columns, CTEs, EXEC, DECLARE,
+  several statements, GO and leading or trailing comments run (as written,
+  read-only, capped at 1000 rows when they only read) instead of failing in
+  the paging wrapper. Error line numbers match the editor.
+- SQL Server: quick filter, filter builder and FK jumps find values outside
+  the code page, binaries, and text, xml or geography cells; a filter on a
+  multi-line value no longer breaks the grid; profiling (gR, gS) works on
+  tables with bit, image, text or xml columns.
 - Send SQL Server statements containing `$(` as written. sqlcmd took them for
   scripting variables and substituted or rejected them.
 - Guard query-grid edits against aliased columns, computed projections, and
