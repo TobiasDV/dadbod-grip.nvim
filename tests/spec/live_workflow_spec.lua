@@ -529,6 +529,13 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       eq(used_table ~= nil and not r.readonly, c[4], c[1] .. " editable")
       if used_spec.passthrough then eq(query.build_count_sql(used_spec), nil, "no count") end
     end
+    local many = "WITH n AS (SELECT TOP 1500 ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS i"
+      .. " FROM sys.all_objects a CROSS JOIN sys.all_objects b) SELECT i FROM n"
+    local capped = grip._fetch_grid(URL, (grip._resolve_query(many, 50, "sqlserver")))
+    eq(#assert(capped.result, capped.err).rows, 1000, "a batch run as written stops at 1000 rows")
+    local fallback = grip._fetch_grid(URL, (grip._resolve_query(
+      "SELECT o.user_id, COUNT(*) FROM orders o CROSS JOIN orders p GROUP BY o.user_id, p.id", 50, "sqlserver")))
+    eq(#assert(fallback.result, fallback.err).rows, 1000, "so does a SELECT the wrapper could not hold")
     local bad = grip._fetch_grid(URL, (grip._resolve_query("SELECT nope FROM users", 50, "sqlserver")))
     assert(not bad.result and tostring(bad.err):find("Invalid column name 'nope'", 1, true),
       "the server's own error: " .. tostring(bad.err))

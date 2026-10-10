@@ -456,6 +456,7 @@ local function resolve_query(arg, page_size, adapter_kind)
     if plan and plan.kind == "passthrough" then
       local spec = query.new_passthrough(arg, page_size)
       spec.writes = plan.writes
+      spec.prefix = plan.prefix
       return spec, nil
     elseif plan then
       local spec = query.new_raw(plan.sql, page_size)
@@ -785,6 +786,8 @@ function M._fetch_grid(url, spec, table_name)
   local fetched = fetch_refresh(url, query.build_sql(spec), table_name)
   if fetched.result or not spec.source_sql then return fetched, spec, table_name end
   local as_written = query.new_passthrough(spec.source_sql, spec.page_size)
+  local cap = require("dadbod-grip.adapters.sqlserver").row_cap_prefix(spec.source_sql)
+  as_written.prefix = cap ~= "" and cap or nil
   return fetch_refresh(url, query.build_sql(as_written), nil), as_written, nil
 end
 
@@ -1308,6 +1311,10 @@ function M.open(arg, url, opts)
   end
   local elapsed_ms = fetched.elapsed_ms
   result.elapsed_ms = elapsed_ms
+  if spec.prefix and #result.rows >= require("dadbod-grip.adapters.sqlserver").AS_WRITTEN_ROW_CAP then
+    vim.notify(string.format("Showing the first %d rows: the query runs as written, without paging",
+      #result.rows), vim.log.levels.INFO)
+  end
   if #result.columns == 0 and result.messages then
     -- A batch that printed but returned no rows (EXEC of a procedure, PRINT).
     vim.notify(table.concat(result.messages, "\n"), vim.log.levels.INFO)

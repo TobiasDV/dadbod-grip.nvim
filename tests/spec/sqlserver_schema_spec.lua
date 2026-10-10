@@ -849,6 +849,17 @@ test("plan_query: a plain trailing ORDER BY becomes the grid's sort", function()
   eq(top.sql, "SELECT TOP 5 * FROM many ORDER BY id")
 end)
 
+test("plan_query: read-only batches are capped at 1000 rows, others are not", function()
+  local cap = "SET ROWCOUNT 1000; "
+  eq(sqlserver.plan_query("SELECT * FROM t ORDER BY LEN(x)").prefix, cap)
+  eq(sqlserver.plan_query("WITH x AS (SELECT 1 AS a) SELECT * FROM x").prefix, cap)
+  eq(sqlserver.plan_query("DECLARE @n int = 1; SELECT @n").prefix, cap)
+  eq(sqlserver.plan_query("EXEC sp_help 't'").prefix, nil, "ROWCOUNT would reach into the procedure")
+  eq(sqlserver.plan_query("PRINT 'x'; DELETE FROM t").prefix, nil, "ROWCOUNT would limit the DELETE")
+  eq(sqlserver.plan_query("SELECT * INTO #t FROM t; SELECT * FROM #t").prefix, nil, "would fill #t partly")
+  eq(sqlserver.row_cap_prefix("SELECT u.name, COUNT(*) FROM u GROUP BY u.name"), cap)
+end)
+
 test("plan_query: a batch that writes is flagged", function()
   eq(sqlserver.plan_query("PRINT 'x'; DELETE FROM t").writes, true)
   eq(sqlserver.plan_query("DECLARE @t TABLE (a int); INSERT INTO @t VALUES (1); SELECT * FROM @t").writes, true)

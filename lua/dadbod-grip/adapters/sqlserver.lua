@@ -565,11 +565,28 @@ local function order_by_sorts(toks, from)
   return sorts
 end
 
+-- Rows per result set for a batch run as written, which no wrapper pages.
+local AS_WRITTEN_ROW_CAP = 1000
+
+--- "SET ROWCOUNT 1000; " for a batch it is safe to cap, else "". ROWCOUNT
+--- also limits INSERT, UPDATE, DELETE, SELECT INTO and whatever a procedure
+--- does, so batches that write, fill a table or EXEC are left alone.
+function M.row_cap_prefix(sql_str)
+  for _, t in ipairs(scan_tsql(sql_str or "")) do
+    if t.kind == "word" and (WRITE_WORDS[t.word] or t.word == "INTO" or t.word == "EXEC" or t.word == "EXECUTE") then
+      return ""
+    end
+  end
+  return "SET ROWCOUNT " .. AS_WRITTEN_ROW_CAP .. "; "
+end
+M.AS_WRITTEN_ROW_CAP = AS_WRITTEN_ROW_CAP
+
 --- How the query pad should run `sql_str` on SQL Server. Returns nil for what
 --- the generic code handles (a bare table name, UPDATE/DELETE/INSERT, DDL),
 --- else a plan:
 ---   { kind = "select", sql = <wrappable query>, sorts = { {column, dir} } }
----   { kind = "passthrough", writes = <the batch writes> }: run as written.
+---   { kind = "passthrough", writes = <the batch writes>, prefix = <row cap or nil> }:
+---     run as written.
 function M.plan_query(sql_str)
   local trimmed = vim.trim(sql_str or "")
   if trimmed == "" then return nil end
@@ -587,7 +604,8 @@ function M.plan_query(sql_str)
   end
   if ROUTED_ELSEWHERE[first.word] or not STATEMENT_WORDS[first.word] then return nil end
   if first.word == "WITH" and writes then return nil end
-  local passthrough = { kind = "passthrough", writes = writes }
+  local cap = M.row_cap_prefix(trimmed)
+  local passthrough = { kind = "passthrough", writes = writes, prefix = cap ~= "" and cap or nil }
   if first.word ~= "SELECT" then return passthrough end
 
   -- Anything after a top-level ';' or a GO line is another statement.

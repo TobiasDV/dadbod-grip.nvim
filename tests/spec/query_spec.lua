@@ -609,6 +609,12 @@ test("immutability: add_filter with pinned does not mutate original", function()
   eq(#spec.filters, 0)
 end)
 
+test("passthrough spec: a prefix goes on the same line", function()
+  local spec = query.new_passthrough("SELECT 1", 100)
+  spec.prefix = "SET ROWCOUNT 1000; "
+  eq(query.build_sql(spec), "SET ROWCOUNT 1000; SELECT 1")
+end)
+
 test("passthrough spec: runs as written, no count, no paging", function()
   local spec = query.new_passthrough("EXEC sp_who", 100)
   eq(query.build_sql(spec), "EXEC sp_who")
