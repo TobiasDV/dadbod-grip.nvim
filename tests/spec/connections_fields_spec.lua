@@ -190,6 +190,26 @@ test("switching to a global entry does not shadow it with a local copy", functio
   end)
 end)
 
+test("switching to a global entry stamps last_used in the global file, keeping its fields", function()
+  with_real_file(function(local_grip, global_grip)
+    paths.ensure_dir(global_grip)
+    vim.fn.writefile({ vim.fn.json_encode({
+      { name = "dev", url = "sqlite:/nonexistent/dev.db", env_file = "~/p/.env",
+        mode = "ro", color = "orange" },
+    }) }, global_grip .. "/connections.json")
+
+    eq(connections.switch("sqlite:/nonexistent/dev.db", "dev"), true, "the switch commits")
+    local raw = table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n")
+    local data = vim.fn.json_decode(raw)
+    eq(#data, 1, "still one global entry")
+    assert(type(data[1].last_used) == "number", "last_used stamped in the global file")
+    eq(data[1].env_file, "~/p/.env", "env_file kept")
+    eq(data[1].mode, "ro", "mode kept")
+    eq(data[1].color, "orange", "color kept")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "no local copy was written")
+  end)
+end)
+
 -- ── G:global promotion ──────────────────────────────────────────────────────
 -- Promoting a templated entry to ~/.grip/connections.json must carry the new
 -- fields, otherwise the promoted connection can't resolve its secret anymore.

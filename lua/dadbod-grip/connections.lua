@@ -391,6 +391,24 @@ local function write_file_connections(conns)
   vim.fn.writefile({ json }, connections_path())
 end
 
+--- Write connections to ~/.grip/connections.json, keeping every field.
+local function write_global_connections(conns)
+  ensure_global_grip_dir()
+  local data = {}
+  for _, c in ipairs(conns) do
+    local entry = { name = c.name, url = c.url }
+    if c.id then entry.id = c.id end
+    if c.type then entry.type = c.type end
+    if c.attachments and #c.attachments > 0 then entry.attachments = c.attachments end
+    if c.last_used then entry.last_used = c.last_used end
+    if c.env_file then entry.env_file = c.env_file end
+    if c.mode then entry.mode = c.mode end
+    if c.color then entry.color = c.color end
+    table.insert(data, entry)
+  end
+  vim.fn.writefile({ vim.fn.json_encode(data) }, global_connections_path())
+end
+
 --- Resolve a persisted connection by opaque ID.
 --- @return table|nil connection
 --- @return string|nil reason "missing" or "ambiguous"
@@ -443,21 +461,7 @@ function M.ensure_id(url)
     if c.url == url and not c.id then c.id, global_changed = id, true end
   end
   if local_changed then write_file_connections(local_conns) end
-  if global_changed then
-    ensure_global_grip_dir()
-    local data = {}
-    for _, c in ipairs(global_conns) do
-      local entry = { id = c.id, name = c.name, url = c.url }
-      if c.type then entry.type = c.type end
-      if c.attachments and #c.attachments > 0 then entry.attachments = c.attachments end
-      if c.last_used then entry.last_used = c.last_used end
-      if c.env_file then entry.env_file = c.env_file end
-      if c.mode then entry.mode = c.mode end
-      if c.color then entry.color = c.color end
-      table.insert(data, entry)
-    end
-    vim.fn.writefile({ vim.fn.json_encode(data) }, global_connections_path())
-  end
+  if global_changed then write_global_connections(global_conns) end
   return id
 end
 
@@ -567,22 +571,7 @@ function M.list()
   end
 
   -- Write global file if new entries were added
-  if new_global then
-    ensure_global_grip_dir()
-    local gdata = {}
-    for _, gc in ipairs(global_existing) do
-      local gentry = { name = gc.name, url = gc.url }
-      if gc.id then gentry.id = gc.id end
-      if gc.type then gentry.type = gc.type end
-      if gc.attachments and #gc.attachments > 0 then gentry.attachments = gc.attachments end
-      if gc.last_used then gentry.last_used = gc.last_used end
-      if gc.env_file then gentry.env_file = gc.env_file end
-      if gc.mode then gentry.mode = gc.mode end
-      if gc.color then gentry.color = gc.color end
-      table.insert(gdata, gentry)
-    end
-    vim.fn.writefile({ vim.fn.json_encode(gdata) }, global_connections_path())
-  end
+  if new_global then write_global_connections(global_existing) end
 
   -- Mark any connection whose URL is in the global file as source = "global".
   -- When a URL exists in both local and global files, the local entry wins the
@@ -789,8 +778,10 @@ function M.switch(url, name, conn_type, opts)
   -- The global file is only read when the entry is not local, since most
   -- callers pass conn_type or have a locally-known entry.
   local in_global = false
+  local global_conns = {}
   if not in_local and not configured_connections_path() then
-    for _, c in ipairs(read_json_connections(global_connections_path(), "global")) do
+    global_conns = read_json_connections(global_connections_path(), "global")
+    for _, c in ipairs(global_conns) do
       if c.url == url then
         in_global = true
         resolved_type = resolved_type or c.type
@@ -809,9 +800,14 @@ function M.switch(url, name, conn_type, opts)
   -- Except for an entry that lives only in the global file: a local copy
   -- would carry none of its env_file/mode/color, and because entry_for()
   -- reads the local file first, that copy would shadow the real entry and
-  -- the next connect would fail to resolve its ${VAR}.
-  local changed = false
-  if not in_global then
+  -- the next connect would fail to resolve its ${VAR}. Its MRU stamp goes
+  -- to the global file instead.
+  if in_global then
+    if touch_conn(global_conns, url) then
+      write_global_connections(global_conns)
+    end
+  else
+    local changed = false
     if name and name ~= "" then
       upsert_conn(local_conns, name, url)
       changed = true
@@ -820,9 +816,9 @@ function M.switch(url, name, conn_type, opts)
     if touch_conn(local_conns, url) then
       changed = true
     end
-  end
-  if changed then
-    write_file_connections(local_conns)
+    if changed then
+      write_file_connections(local_conns)
+    end
   end
 
   -- The one place a mode override is set or cleared. Connecting the ordinary
