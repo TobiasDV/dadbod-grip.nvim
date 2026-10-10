@@ -1319,6 +1319,21 @@ plain text instead. Those results are read-only: plain text has no quoting,
 drops trailing spaces, cuts values at 8000 characters and cannot tell NULL
 from the text 'NULL'.
 
+In SQL Server grids an empty cell is either NULL (shown as ·NULL·) or a
+real empty string (shown blank). Saving an empty editor writes '' to a NOT
+NULL text column or a cell that held '', and NULL otherwise; x always
+writes NULL. Computed, rowversion and temporal period columns cannot be
+edited and are left out of clones and of the INSERT that undoes a delete.
+A deleted row with a binary over 8000 bytes (shown as <binary N bytes>)
+cannot be undone, and apply asks first.
+
+The query pad pages a single SELECT by wrapping it, which SQL Server only
+allows for plain queries. A trailing ORDER BY of plain columns becomes the
+grid's sort. Anything else (CTEs, EXEC, DECLARE, several statements, GO,
+an unnamed column) runs as written and shows its last result set,
+read-only, without sort, filter or pages. A read-only batch is capped with
+SET ROWCOUNT 1000; a batch that writes asks before it runs.
+
 Each adapter implements: query, execute, get_primary_keys, get_column_info,
 get_foreign_keys, get_indexes, get_table_stats, list_tables, and explain.
 
