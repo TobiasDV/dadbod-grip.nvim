@@ -301,8 +301,10 @@ local MAX_BINARY_BYTES = 8000
 --    description so every column gets the server's formatting: binaries as 0x
 --    hex (or the placeholder past MAX_BINARY_BYTES), and the CLR types FOR JSON
 --    refuses (geography, geometry, hierarchyid) as their text.
--- When the description fails, its columns have no name, @cols stays NULL and
--- EXEC runs nothing; parse_json_page then sends the caller to the text path.
+-- When the description fails (a view over a dropped column, say), its columns
+-- have no name and @cols comes out NULL or empty, so EXEC is skipped and
+-- parse_json_page sends the caller to the text path, which reports the
+-- server's own error.
 -- Placeholders: the statement, MAX_BINARY_BYTES, the row source, the FROM tail.
 local PAGE_BATCH = [[
 DECLARE @q nvarchar(max) = N'%s';
@@ -322,7 +324,7 @@ DECLARE @cols nvarchar(max) = STUFF((
   FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'');
 SELECT (SELECT name, system_type_name FROM sys.dm_exec_describe_first_result_set(@q, NULL, 0)
   ORDER BY column_ordinal FOR JSON PATH, INCLUDE_NULL_VALUES);
-EXEC (N'SELECT (SELECT ' + @cols + N' FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) ' + N'%s');]]
+IF @cols <> N'' EXEC (N'SELECT (SELECT ' + @cols + N' FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES) ' + N'%s');]]
 
 --- "nvarchar" for "nvarchar(max)".
 local function base_type(type_name)
