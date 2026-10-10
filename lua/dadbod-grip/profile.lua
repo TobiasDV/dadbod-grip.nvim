@@ -119,6 +119,10 @@ function M.column_exprs(col_sql, data_type, adapter_kind)
   return { value = col_sql, minmax = minmax }
 end
 
+-- Profiling scans whole tables (COUNT DISTINCT, MIN, MAX per column), which
+-- takes longer than an ordinary page query on a big table.
+local PROFILE_TIMEOUT_MS = 120000
+
 --- The adapter kind of a connection URL, for the builders below.
 local function kind_of(url)
   return require("dadbod-grip.adapters").kind(db.resolved_url(url))
@@ -194,7 +198,7 @@ end
 -- ── data gathering ────────────────────────────────────────────────────────────
 
 --- Gather profile data for all columns of a table.
-function M.gather(table_name, url)
+local function gather(table_name, url)
   -- Get column info
   local col_infos, col_err = db.get_column_info(table_name, url)
   if not col_infos or #col_infos == 0 then
@@ -313,7 +317,7 @@ end
 --- Returns (colstats, nil) or (nil, err). A failed *histogram* is not an error:
 --- the caller still gets its statistics, with kind left nil, because losing the
 --- whole popup over the optional half of it would be the worse trade.
-function M.gather_column(table_name, col_name, data_type, url)
+local function gather_column(table_name, col_name, data_type, url)
   local tbl = sql.quote_ident(table_name)
   local col = sql.quote_ident(col_name)
   local kind = kind_of(url)
@@ -377,6 +381,15 @@ function M.gather_column(table_name, col_name, data_type, url)
   end
 
   return cs
+end
+
+function M.gather(table_name, url)
+  return require("dadbod-grip.adapters").with_timeout(PROFILE_TIMEOUT_MS, gather, table_name, url)
+end
+
+function M.gather_column(table_name, col_name, data_type, url)
+  return require("dadbod-grip.adapters").with_timeout(PROFILE_TIMEOUT_MS, gather_column,
+    table_name, col_name, data_type, url)
 end
 
 -- ── display rendering ─────────────────────────────────────────────────────────

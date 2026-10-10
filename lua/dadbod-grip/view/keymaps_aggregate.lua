@@ -107,7 +107,12 @@ function M.setup(bufnr, ctx)
     end
 
     local profile = require("dadbod-grip.profile")
-    local cs, cs_err = profile.gather_column(st_cs.table_name, col_name, data_type, st_cs.url)
+    -- A whole-table scan: keep the spinner up. One table out, since
+    -- ui.blocking drops everything after a leading nil.
+    local got = require("dadbod-grip.ui").blocking("  column stats " .. col_name .. "...", function()
+      return { profile.gather_column(st_cs.table_name, col_name, data_type, st_cs.url) }
+    end) or {}
+    local cs, cs_err = got[1], got[2]
     if not cs then
       vim.notify("Stats query failed: " .. (cs_err or "unknown error"), vim.log.levels.WARN)
       return

@@ -19,11 +19,31 @@ M._exit_grace_ms = 3000
 --- Resolve the public setup({ timeout = ... }) value at call time. Keeping it
 --- here makes all CLI adapters honor the same option without five copies of
 --- the configuration lookup.
+local _min_timeout = nil
+
 function M.configured_timeout(fallback)
   local ok, grip = pcall(require, "dadbod-grip")
-  if not ok or type(grip.get_opts) ~= "function" then return fallback end
-  local value = grip.get_opts().timeout
-  return type(value) == "number" and value or fallback
+  local value = fallback
+  if ok and type(grip.get_opts) == "function" and type(grip.get_opts().timeout) == "number" then
+    value = grip.get_opts().timeout
+  end
+  if _min_timeout and (not value or value < _min_timeout) then return _min_timeout end
+  return value
+end
+
+--- Run fn(...) with every CLI call given at least `ms` before it times out,
+--- for work that scans whole tables (profiling). Restored on error too.
+function M.with_timeout(ms, fn, ...)
+  local previous = _min_timeout
+  _min_timeout = math.max(ms, previous or 0)
+  local result = { n = 0 }
+  local function collect(...)
+    result = { n = select("#", ...), ... }
+  end
+  collect(pcall(fn, ...))
+  _min_timeout = previous
+  if not result[1] then error(result[2], 0) end
+  return unpack(result, 2, result.n)
 end
 
 --- Run a CLI command and wait for it to finish, pumping the full Neovim event

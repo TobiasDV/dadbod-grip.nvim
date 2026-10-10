@@ -767,6 +767,22 @@ test("build_histogram_sql: nothing to group for an image column", function()
   assert(profile.build_histogram_sql("t", "flag", "unknown", nil, nil, "bit", "sqlserver"))
 end)
 
+test("profile queries get a longer timeout, and only they do", function()
+  local adapters = require("dadbod-grip.adapters")
+  local db = require("dadbod-grip.db")
+  local seen = {}
+  local orig = db.query
+  db.query = function() seen[#seen + 1] = adapters.configured_timeout(10000); return nil, "stop" end
+  local ok = pcall(profile.gather_column, "t", "c", "int", "sqlserver://sa:pw@localhost/db")
+  db.query = orig
+  assert(ok, "gather_column ran")
+  assert(seen[1] and seen[1] >= 120000, "stats query timeout " .. tostring(seen[1]))
+  eq(adapters.configured_timeout(10000), 10000, "restored afterwards")
+  local raised = pcall(adapters.with_timeout, 120000, function() error("boom") end)
+  eq(raised, false)
+  eq(adapters.configured_timeout(10000), 10000, "restored after an error")
+end)
+
 -- ── summary ──────────────────────────────────────────────────────────────────
 
 print(string.format("\nprofile_spec: %d passed, %d failed", pass, fail))
