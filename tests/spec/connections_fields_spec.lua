@@ -165,6 +165,31 @@ test("an entry without the new fields round-trips with no new keys added", funct
   end)
 end)
 
+-- ── switching to a global entry ─────────────────────────────────────────────
+-- switch() upserts the picked entry into the project-local file. For a global
+-- entry that copy carries only name/url/id/last_used, and because entry_for()
+-- reads the local file first, the copy shadows the global entry: the next
+-- connect (and every db.resolve() on the query path) expands the URL without
+-- its env_file and fails with "unresolved variable".
+
+test("switching to a global entry does not shadow it with a local copy", function()
+  with_real_file(function(local_grip, global_grip)
+    local fake_home = vim.fn.fnamemodify(global_grip, ":h")
+    local env_path = fake_home .. "/dev.env"
+    vim.fn.writefile({ "DB_URL=sqlite:" .. fake_home .. "/dev.db" }, env_path)
+    paths.ensure_dir(global_grip)
+    vim.fn.writefile({ vim.fn.json_encode({
+      { name = "dev", url = "${DB_URL}", env_file = env_path },
+    }) }, global_grip .. "/connections.json")
+
+    eq(connections.switch("${DB_URL}", "dev"), true, "the first switch commits")
+    local entry = connections.entry_for("${DB_URL}")
+    eq(entry and entry.env_file, env_path, "entry_for still sees the global env_file")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "no local copy was written")
+    eq(connections.switch("${DB_URL}", "dev"), true, "the second switch still resolves the secret")
+  end)
+end)
+
 -- ── G:global promotion ──────────────────────────────────────────────────────
 -- Promoting a templated entry to ~/.grip/connections.json must carry the new
 -- fields, otherwise the promoted connection can't resolve its secret anymore.

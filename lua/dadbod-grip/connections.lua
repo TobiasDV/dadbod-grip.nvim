@@ -779,19 +779,21 @@ function M.switch(url, name, conn_type, opts)
   -- The global file is only read when actually needed for the lookup, since
   -- most callers already pass conn_type or have a locally-known type.
   local resolved_type = conn_type
-  if not resolved_type then
-    for _, c in ipairs(local_conns) do
-      if c.url == url and c.type then
-        resolved_type = c.type
-        break
-      end
+  local in_local = false
+  for _, c in ipairs(local_conns) do
+    if c.url == url then
+      in_local = true
+      resolved_type = resolved_type or c.type
     end
   end
-  if not resolved_type and not configured_connections_path() then
+  -- The global file is only read when the entry is not local, since most
+  -- callers pass conn_type or have a locally-known entry.
+  local in_global = false
+  if not in_local and not configured_connections_path() then
     for _, c in ipairs(read_json_connections(global_connections_path(), "global")) do
-      if c.url == url and c.type then
-        resolved_type = c.type
-        break
+      if c.url == url then
+        in_global = true
+        resolved_type = resolved_type or c.type
       end
     end
   end
@@ -803,14 +805,21 @@ function M.switch(url, name, conn_type, opts)
   -- URL) and rename (existing URL with a stale generic name like "vim.g.db").
   -- Without this, an already-saved URL would keep a stale name forever even
   -- when switching with the correct one.
+  --
+  -- Except for an entry that lives only in the global file: a local copy
+  -- would carry none of its env_file/mode/color, and because entry_for()
+  -- reads the local file first, that copy would shadow the real entry and
+  -- the next connect would fail to resolve its ${VAR}.
   local changed = false
-  if name and name ~= "" then
-    upsert_conn(local_conns, name, url)
-    changed = true
-  end
-  -- Touch AFTER upsert so first-time connections get last_used stamped.
-  if touch_conn(local_conns, url) then
-    changed = true
+  if not in_global then
+    if name and name ~= "" then
+      upsert_conn(local_conns, name, url)
+      changed = true
+    end
+    -- Touch AFTER upsert so first-time connections get last_used stamped.
+    if touch_conn(local_conns, url) then
+      changed = true
+    end
   end
   if changed then
     write_file_connections(local_conns)

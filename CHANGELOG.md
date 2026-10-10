@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Connecting to a connection from `~/.grip/connections.json` no longer
+  copies it into the project's `.grip/connections.json`. The copy had no
+  `env_file`, `mode` or `color` and shadowed the global entry, so the next
+  connect failed with "unresolved variable ${VAR}".
 - SQL Server: undoing a delete no longer loses the row when it holds `''`
   in a NOT NULL column, a computed, rowversion or temporal period column, or
   a binary value; undoing an edit of a `''` cell restores `''`, and clearing
