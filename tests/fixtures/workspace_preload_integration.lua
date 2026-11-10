@@ -4,7 +4,9 @@ local query_pad = require("dadbod-grip.query_pad")
 local schema = require("dadbod-grip.schema")
 
 local url = "sqlite:tests/seed_sqlite.db"
-grip.setup({})
+-- A switch now touches the saved profile in its original registry. Keep the
+-- fixture independent of any matching connection in the developer's home.
+grip.setup({ connections_path = vim.fn.tempname() .. "_connections.json" })
 assert(connections.switch(url, "seed", "sqlite"))
 
 assert(vim.wait(5000, function()

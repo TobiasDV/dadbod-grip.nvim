@@ -9,29 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Edit SQL Server grids. Edits, inserts, and deletes apply in one
-  `SET XACT_ABORT ON` transaction and can be undone. Values are written as
-  `N'...'`, so text outside the database code page is not stored as `?`;
-  CRs are written as `NCHAR(13)` because sqlcmd drops them from its input, and
-  undoing a delete restores an IDENTITY key. Grid rows are fetched as JSON, so tabs, newlines and values of any length
-  stay editable, and geography, geometry and hierarchyid columns show as text
-  (`POINT (4.9 52.4)`) and take that text back on save. Results that can
-  only come from sqlcmd's plain text (EXEC, GO scripts) are read-only. With `"mode": "ro"`, grip
-  refuses its own writes and warns that SQL Server cannot back that with a
-  read-only session.
+- Edit SQL Server grids. Edits, inserts, and deletes apply as one verified
+  transaction: each UPDATE and DELETE locks the row and checks that it still
+  holds the values the grid loaded, so a row changed elsewhere refuses the
+  batch instead of being overwritten. Undo uses the rows as that transaction
+  read and wrote them, including the key an IDENTITY, NEWID() or sequence
+  default gave an inserted row, and restores a deleted row under its original
+  IDENTITY value, with binaries over 8000 bytes intact. Values are written as
+  `N'...'`, so text outside the database code page is not stored as `?`; CRs
+  are written as `NCHAR(13)` because sqlcmd drops them from its input, and
+  binary cells are edited as `0x...`. Grid rows are fetched as JSON, so tabs,
+  newlines and values of any length stay editable, NULL and `''` stay apart,
+  and geography, geometry and hierarchyid columns show as text
+  (`POINT (4.9 52.4)`) and take that text back on save. Computed, rowversion
+  and temporal period columns are not editable and are left out of clones.
+  Results that can only come from sqlcmd's plain text (EXEC, GO scripts) are
+  read-only. With `"mode": "ro"`, grip refuses its own writes and warns that
+  SQL Server cannot back that with a read-only session.
 
 ### Fixed
 
-- Connecting to a connection from `~/.grip/connections.json` no longer
-  copies it into the project's `.grip/connections.json`. The copy had no
-  `env_file`, `mode` or `color` and shadowed the global entry, so the next
-  connect failed with "unresolved variable ${VAR}". Its last-used stamp is written to the
-  global file instead.
-- SQL Server: undoing a delete no longer loses the row when it holds `''`
-  in a NOT NULL column, a computed, rowversion or temporal period column, or
-  a binary value; undoing an edit of a `''` cell restores `''`, and clearing
-  a NOT NULL text cell writes `''` instead of failing on NULL. Binary cells
-  can be edited as `0x...`.
 - SQL Server query pad: ORDER BY, unnamed columns, CTEs, EXEC, DECLARE,
   several statements, GO and leading or trailing comments run (as written,
   read-only, capped at 1000 rows when they only read) instead of failing in
@@ -42,10 +39,316 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables with bit, image, text or xml columns.
 - Send SQL Server statements containing `$(` as written. sqlcmd took them for
   scripting variables and substituted or rejected them.
-- Open JSON cells exactly as stored in the float editor and in `gB`. Both
-  pretty-printed the value and saved the reformatted text, so editing one field
-  rewrote the whole document with sorted keys and numbers rounded through a
-  Lua double (`12345678901234567890` became `9.223372036854776e+18`).
+
+## [3.20.2] - 2026-11-03
+
+### Fixed
+
+- Cell-editor hints show the enabled save and cancel bindings after remapping.
+- Refreshing metadata into Records updates the title, facet and pager together.
+  Metadata and a failed repaint refuse direct cell, row and column staging;
+  applying previously staged Records changes remains available.
+- Metadata CSV and JSON exports use the displayed metadata snapshot for both
+  scopes instead of exporting records or adding nonexistent rows. Metadata SQL
+  exports refuse without a physical insertion target.
+- Metadata clipboard shortcuts also copy the displayed metadata rather than
+  reading the hidden Records state.
+- JSON export refuses BLOB cells and invalid UTF-8 text before creating or replacing a file. Typed SQL
+  export remains available for preserving binary bytes. Changing the visible
+  result or closing its session while selecting export scope cancels the stale request.
+- Switching database connections asks before discarding pending result changes.
+  Declining or a failed target check preserves those changes and the current
+  connection profile. Pending or uncertain writes must be resolved first.
+  With pending changes, opening a file profile requires applying or discarding
+  them manually before connecting.
+
+## [3.20.1] - 2026-11-03
+
+### Fixed
+
+- Metadata views show their own row count instead of the records query's page
+  count and navigation arrows. Reopening a metadata view advertises the
+  configured Records key rather than the SQL-pad key.
+- Built-in pickers wrap their key hints and keep them visible when scrolling
+  long lists. Open pickers reposition on terminal resize; saved-query previews
+  hide when space is tight and return with the selected query when widened.
+- Page changes and grid refreshes keep an existing data-cell cursor on a data
+  row when fewer rows remain, preserving its column instead of landing on the
+  border or footer.
+
+## [3.20.0] - 2026-11-03
+
+### Added
+
+- DuckDB completion suggests session-visible functions and macros in expressions,
+  and table functions after FROM or JOIN. Catalogs warm asynchronously through
+  the existing query queue, with stale-result fencing and schema invalidation.
+
+### Changed
+
+- Standalone completion waits for two characters or a qualifier dot, suppresses
+  a sole exact match, and leaves suggestions unselected without inserting text.
+  Enter accepts a selected match; otherwise it inserts a newline. Automatic
+  native and cmp/blink requests use cached schema rather than waiting on a query.
+
+## [3.19.1] - 2026-11-02
+
+### Fixed
+
+- Table-grid refreshes recount matching rows after Apply, committed Undo, and
+  manual refresh. Removing the last page moves to the previous valid page
+  while preserving filters, sorting, and page size. Failed counts stay unknown;
+  raw-query refreshes avoid an additional count evaluation.
+- DuckDB queries, writes, and background metadata work sharing a known local
+  database file wait in order instead of opening competing CLI processes.
+  Queueing retains each call's read-only options, and cancellation waits for
+  the actual child exit before admitting the next request. Invalidated catalog
+  lookups cannot repopulate the cache with an older result.
+- Schema and completion caches discard old metadata after custom SQL write
+  attempts, including batches that change the schema before returning an error.
+  Older background fetches cannot restore invalidated metadata or repaint a
+  sidebar after its connection changes. Grid refresh also reloads column
+  metadata, so formatting and inspection follow the current result. Metadata
+  finishes within the reload instead of leaving a reader that can collide
+  with the next SQLite write.
+
+## [3.19.0] - 2026-11-02
+
+### Fixed
+
+- SQL admission rejects embedded NUL bytes before preview requests, so a
+  client cannot truncate the statement into a different mutation. SQL
+  expressions such as `CHAR(0)` still support NUL data values.
+- Mutation previews parse UPDATE, DELETE, INSERT, and REPLACE with shared SQL
+  tokens. Target aliases, quoted names, comments, nested expressions, and
+  RETURNING no longer corrupt predicates, column mappings, or VALUES rows.
+  SQL Server OUTPUT clauses stay out of preview queries and SET values;
+  optional INTO/FROM spellings retain their target table. WITH-prefixed SQL
+  Server writes with omitted INTO/FROM or table-variable targets require
+  confirmation instead of being misrouted as SELECT queries.
+  UPDATE staging preserves NULL versus empty strings and the last assignment.
+  PostgreSQL composite and SQL Server UDT property targets no longer overwrite
+  unrelated scalar predictions. SQL Server column mapping preserves exact case
+  and only uses case-insensitive fallback when the catalog match is unique.
+  INSERT preserves column order and positional NULLs; SQLite/DuckDB INSERT OR
+  forms, DuckDB BY NAME/POSITION and FROM-first queries, parenthesized source
+  queries, and MySQL VALUE, SET, empty default lists, and row/column aliases
+  are recognized. VALUES query tails do not become predicted incoming rows.
+- UPSERT, REPLACE, ignored conflicts, explicit DEFAULT values, and
+  computed/source-query inserts show current data without predicting new
+  values or affected counts.
+  Confirmation executes the original SQL once; completed writes report the
+  adapter's affected count when available. MySQL/MariaDB transaction counts
+  are omitted when COMMIT prevents determining the mutation count.
+  SQLite trailing line comments cannot hide the affected-count query or cause
+  RETURNING values to be mistaken for affected counts.
+  Unsupported or multiple-statement previews fail without writing.
+  Committed transaction previews retain their complete SQL;
+  rollback blocks cannot be stripped into committed mutations. SQL Server
+  statements appended without semicolons and CLI command escapes are rejected
+  before a preview can issue a database request.
+- CTE DELETE modifiers and MERGE statements retain whole-statement confirmation;
+  keyword-shaped variables and SELECT FOR UPDATE locks remain query expressions.
+  MERGE uses confirmation rather than a predicted row preview. CTE command
+  positions distinguish writes from keyword-shaped columns and CTE names.
+- Build mutation preview staging in one pass instead of repeatedly copying
+  prior changes. Shared SQL tokenization scans words, strings, and comments
+  in chunks while preserving the existing SELECT editability checks.
+- MySQL optimizer hints containing client-command escapes are rejected
+  before mutation preview parsing can discard their content.
+
+## [3.18.0] - 2026-11-02
+
+### Added
+
+- The float and split cell editors provide buffer-local `:GripCellEmpty` and
+  `:GripCellNull` commands to stage empty text or SQL NULL explicitly.
+
+### Fixed
+
+- Grid writes capture their row identities within the original transaction.
+  Committed Undo uses the post-write keys and checks stored row values before
+  reversing changes. Conflicts preserve the Undo entry instead of reporting
+  success. Unsupported generated-key batches are refused before writing.
+- SQLite verifies REAL-value restoration before committing reversible grid
+  batches. Runtimes that cannot round-trip a value keep the batch staged
+  instead of committing a change that Undo cannot reverse exactly.
+- SQL NULL, empty text, and literal text stay distinct through supported query
+  transports, editing, cloning, grid writes, Undo, and CSV/TSV/JSON/SQL exports.
+  Blank editor saves now mean empty text; an untouched NULL remains unchanged.
+- A failed DuckDB query wrapper surfaces its error without rerunning the
+  original statement. Unsupported batch syntax is classified before execution.
+- MySQL/MariaDB default-row inserts translate SQL tokens instead of replacing
+  matching text inside data, quoted identifiers, or comments. Mixed-case and
+  comment-separated `DEFAULT VALUES` clauses work without rewriting their
+  surrounding SQL. Ambiguous or executable-comment input stays unchanged.
+- Connection picker deletion removes only the selected saved profile from
+  its original project, global, or configured registry. Same-name profiles
+  remain intact, and stale or ambiguous selections are refused. Surviving
+  records retain their complete contents, including extension fields and
+  exact numeric values; malformed registries are refused without writing.
+  Deletion refuses numeric and other unsupported profile IDs rather than
+  treating rounded numeric values as the same identity.
+- SQLite reads retain actual cell storage classes through guarded edits,
+  cloning, and Undo, including BLOBs in text-declared columns. Quoted column
+  names and values containing `WHERE` use structured predicates.
+- A write error after submission reports an unknown outcome unless rollback
+  is proved. Refresh preserves staging and the write guard while the original
+  client's completion remains unknown.
+- MySQL/MariaDB grid batches refuse ambiguous or unproven ENUM/SET definitions
+  before writing. Ordinary unique nonempty ASCII label profiles retain
+  update, clone, delete and Undo support; spatial restoration is refused.
+- MySQL/MariaDB supported SELECTs preserve NUL text, mixed character sets,
+  binary bytes and exact numeric text through one original read. Source types
+  are checked on the same transaction after the read and admitted only after
+  a complete quoted column-layout witness, COMMIT and client completion.
+  Privilege-filtered column prefixes and hidden generated-key metadata cannot
+  establish restoration proof. No TEMP privilege is required; read-only
+  profiles retain server enforcement. Other safe single reads keep native
+  headers and remain read-only with unproven types. Errors never replay SQL.
+- Result provenance remains attached to staged state and page/all-row exports.
+  Values with unproven physical types or byte encoding stay read-only and
+  cannot be cloned, restored or exported as SQL. Unproven bytes display as
+  hexadecimal in the grid and split inspector instead of being parsed as JSON
+  or copied as text. Source metadata alone never enables restoration.
+
+## [3.17.0] - 2026-10-31
+
+### Added
+
+- `highlights` setup overrides replace Grip group definitions and persist across
+  colorscheme changes, grid opens, and connection switches. Link the selected
+  column and sticky header to your theme's `Visual` group for matching light and
+  dark colors. Explicit overrides take precedence over connection accents.
+
+### Fixed
+
+- Projected query results stay read-only unless every primary-key column is
+  selected, preventing edits or deletes from using an incomplete row key.
+- JSON cells open exactly as stored in the float and split editors. Editing
+  one field preserves large integers, decimal spelling, key order, and
+  whitespace elsewhere in the document.
+- Selecting a global connection keeps it in the global registry and updates
+  its recency there. Repeated selections preserve templated credentials,
+  read-only mode, color, identity, and attachments without creating a local
+  shadow. Global DuckDB profiles also restore their saved attachments.
+- Attaching or detaching databases on a global DuckDB profile now saves the
+  attachment changes to its global registry, so reconnecting retains the
+  current attachment set, including when the last attachment is removed.
+
+## [3.16.0] - 2026-10-17
+
+### Added
+
+- Opt-in `engine_timing = true` collects DuckDB profiler latency during the
+  original single-statement run and shows a distinct Engine footer. Batches
+  and other adapters report unsupported timing; missing or invalid profiles
+  report unavailable timing. Collection defaults off; an enabled profile never
+  reruns its statement.
+- Opt-in Zen display with `show_hints = false` and the session-wide `:GripZen`
+  toggle. Automatic grid, SQL pad, sidebar, and welcome shortcuts can be hidden
+  independently of timing and pane layout. Essential result status and explicit
+  help remain available; new SQL pads display help outside the SQL text.
+- Mutation previews and confirmed writes show the loading clock, including
+  staged/import apply, local file write-back, transaction undo, and DDL.
+  Successful write/reload results retain a distinct `Write: ... client` time
+  alongside their own SELECT duration; later unrelated results do not inherit
+  it. Staged apply history now records its client write duration.
+  Completion preserves navigation and edits made while waiting. Interrupted
+  or timed-out client waits report an unknown database outcome before retry.
+- Independent `show_running_time` and `show_result_time` options (both true by
+  default) hide the loading counter or retained result durations. Loading
+  animation, completed action status, and history measurement remain available.
+- The loading float shows live elapsed time after half a second (`3.4s`,
+  `1m12s` past a minute). Nested steps keep the outer operation's clock, and
+  long labels shorten to keep the time visible. The timer stops when the
+  operation finishes, fails, or its float closes.
+- The results footer retains the successful query's client-observed duration
+  (`Query: 17ms client`, `Query: 1.6s client`). It stays visible during
+  horizontal data scrolling and adapts to each window's width. Staged edits
+  retain that result's duration. If the SELECT fails or is interrupted, the
+  previous result and its duration stay intact.
+
+## [3.15.0] - 2026-10-17
+
+### Added
+
+- The built-in demo includes an incident summary view on both engines, plus a DuckDB reporting schema, monthly report, and severity macro. The walkthrough teaches daily browsing, editing, review, export, history, and saved-query tasks with ASCII guides.
+- An optional local PostgreSQL lab demonstrates nested partitions, a view, and function source browsing.
+
+### Fixed
+
+- The keymap catalog describes `gN` as a database column rename with confirmation, matching its existing behavior.
+
+## [3.14.0] - 2026-10-17
+
+### Added
+
+- Welcome keeps the DBG logo and offers four actionable start rows. Enter
+  activates a row; Tab and Shift-Tab move between actions. It fits both a full
+  window and the shared workspace, using effective configured key hints.
+- Existing welcome shortcuts are now cataloged and support remap/disable
+  settings. Their default keys and the hidden Chonk cameo are preserved.
+- Chonk's Table Hug drawing appears in the About section at the end
+  of in-app help, with "Chonk holds the center" beneath it.
+
+### Changed
+
+- The demo focuses its first bundled SQL block after the workspace is ready.
+  It does not run the query automatically.
+- In-app help uses the current pane's action catalog, effective keys, and
+  contextual number-key behavior. Query-pad help describes its own actions.
+- The welcome diagram labels its effective schema, SQL, and table keys, with
+  run and zoom/restore hints nearby. Other panes retain their contextual keys.
+
+### Fixed
+
+- Result shortcut hints fit in two rows using each window's width and configured
+  keys. Narrow windows prioritize core actions and help; an ellipsis marks
+  omitted hints when it fits. Table data keeps its horizontal scrolling.
+- Opening SQL while another pane is zoomed restores its split layout. Opening
+  SQL in the same zoomed window preserves its zoom, draft, and cursor position.
+
+## [3.13.0] - 2026-10-16
+
+### Fixed
+
+- Connection variables read from `.env` files now support whitespace-separated
+  inline comments after quoted or unquoted values. Quoted hashes and unspaced
+  hashes stay literal, and malformed quoted tails are preserved rather than
+  silently truncated. File values still take precedence over process variables.
+
+### Added
+
+- `:GripZoom` and the configurable `gz` shortcut maximize the current split
+  and restore its previous sizes without closing windows or discarding buffers.
+  Zoom preserves unsaved SQL, staged results, and sidebar state, and fits
+  surviving panes after a resize or split change. The command is available through the palette
+  and in-editor help.
+
+## [3.12.0] - 2026-10-16
+
+### Added
+
+- The schema browser groups tables, views, functions, and procedures under
+  collapsed schemas when schema metadata is available. PostgreSQL partitions
+  appear beneath their actual parents, including nested and cross-schema
+  partitions. Objects with unknown schema metadata remain in flat sections.
+  Search finds hidden objects and routine signatures, then restores
+  the previous folds and view when cleared.
+
+### Changed
+
+- Sidebar labels retain complete names and signatures for native horizontal
+  scrolling. `L` opens schema and partition groups without fetching every
+  table's columns. Expanding columns no longer runs an exact row count.
+
+## [3.11.1] - 2026-10-15
+
+### Fixed
+
+- Preserve the welcome screen's cursor and scroll position when opening the
+  query pad above it with `splitkeep=screen`, including on Neovim 0.10.
 - Guard query-grid edits against aliased columns, computed projections, and
   bare SQL value expressions such as `CURRENT_TIMESTAMP` that can target an
   unrelated same-named column (#77). Preserve direct Unicode column references
@@ -711,7 +1014,20 @@ older tags are left in place so anyone pinned to them keeps working.
 - **joryeugene** — SQL Server adapter, PostgreSQL routines in the schema sidebar, focused ER diagram
   ([PR #17](https://github.com/joryeugene/dadbod-grip.nvim/pull/17)).
 
-[Unreleased]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.11.0...HEAD
+[Unreleased]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.20.2...HEAD
+[3.20.2]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.20.1...v3.20.2
+[3.20.1]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.20.0...v3.20.1
+[3.20.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.19.1...v3.20.0
+[3.19.1]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.19.0...v3.19.1
+[3.19.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.18.0...v3.19.0
+[3.18.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.17.0...v3.18.0
+[3.17.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.16.0...v3.17.0
+[3.16.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.15.0...v3.16.0
+[3.15.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.14.0...v3.15.0
+[3.14.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.13.0...v3.14.0
+[3.13.0]: https://github.com/joryeugene/dadbod-grip.nvim/compare/v3.12.0...v3.13.0
+[3.12.0]: https://github.com/joryeugene/dadbod-grip.nvim/releases/tag/v3.12.0
+[3.11.1]: https://github.com/joryeugene/dadbod-grip.nvim/releases/tag/v3.11.1
 [3.11.0]: https://github.com/joryeugene/dadbod-grip.nvim/releases/tag/v3.11.0
 [3.10.2]: https://github.com/joryeugene/dadbod-grip.nvim/releases/tag/v3.10.2
 [3.10.1]: https://github.com/joryeugene/dadbod-grip.nvim/releases/tag/v3.10.1

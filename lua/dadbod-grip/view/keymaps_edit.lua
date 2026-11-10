@@ -4,11 +4,19 @@
 -- bearing.
 
 local data   = require("dadbod-grip.data")
-local db     = require("dadbod-grip.db")
 local qmod   = require("dadbod-grip.query")
-local sql    = require("dadbod-grip.sql")
 
 local M = {}
+local function refuse_unknown(state)
+  if not state then
+    vim.notify('Visible result unavailable; clipboard export canceled',vim.log.levels.WARN)
+    return true
+  end
+  if require('dadbod-grip.provenance').has_unknown(state) then
+    vim.notify('Unproven byte encoding; clipboard export is unavailable',vim.log.levels.WARN)
+    return true
+  end
+end
 
 --- Row and cell editing: welcome/query pad entry, refresh, edit, delete,
 --- insert, clone, apply, undo/redo, yank, NULL, column set.
@@ -37,6 +45,7 @@ function M.setup(bufnr, ctx)
   kmap("grid_refresh", function()
     local session = ctx.session()
     if not session then return end
+    if not require('dadbod-grip.write').refresh_allowed(session) then return end
     if data.has_changes(session.state) then
       local staged = data.count_staged(session.state)
       local choice = vim.fn.confirm(
@@ -103,37 +112,50 @@ function M.setup(bufnr, ctx)
     -- Mutation preview mode: execute the pending mutation
     if session.pending_mutation then
       local pm = session.pending_mutation
+      local current_win = vim.api.nvim_get_current_win()
+      local is_current = require("dadbod-grip.write").capture_owner(bufnr, session)
+      local function can_reload()
+        return is_current() and vim.api.nvim_win_is_valid(current_win)
+          and vim.api.nvim_win_get_buf(current_win) == bufnr
+          and vim.api.nvim_get_current_win() == current_win
+      end
+      local preview_count = pm.row_count and string.format("%d row%s previewed",
+        pm.row_count, pm.row_count == 1 and "" or "s") or "current data; affected rows determined on execution"
       local choice = vim.fn.confirm(
-        string.format("Execute %s? (%d row%s affected)\n\n%s",
-          pm.type, pm.row_count, pm.row_count == 1 and "" or "s",
-          pm.sql:sub(1, 200)),
+        string.format("Execute %s? (%s)\n\n%s", pm.type, preview_count, pm.sql:sub(1, 200)),
         "&Execute\n&Cancel", 2)
       if choice ~= 1 then return end
-      local t0 = vim.uv.hrtime()
-      local _, err = db.execute(pm.sql, session.url)
-      local ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
+      local written, err, ms, unknown = require("dadbod-grip.write").execute(pm.sql, session.url, pm.table_name)
       if err then
-        vim.notify("Failed: " .. err, vim.log.levels.ERROR)
+        vim.notify((unknown and "" or "Failed: ") .. err, vim.log.levels.ERROR)
         return
       end
-      vim.notify(string.format("%s executed (%dms, %d row%s)",
-        pm.type, ms, pm.row_count, pm.row_count == 1 and "" or "s"), vim.log.levels.INFO)
+      local affected = not pm.affected_count_unavailable and written and tonumber(written.affected)
+      local result_count = affected and affected >= 0 and string.format(", %d row%s affected",
+        affected, affected == 1 and "" or "s") or ""
+      vim.notify(string.format("%s executed (%dms%s)", pm.type, ms, result_count), vim.log.levels.INFO)
       local history = require("dadbod-grip.history")
       history.record({ sql = pm.sql, url = session.url, type = pm.type:lower(), elapsed_ms = ms })
+      local still_current = can_reload()
+      -- Clear only the SQL that just committed, even if a newer window gained
+      -- focus. It must not remain offered as an executable pending mutation.
+      if view._sessions[bufnr] == session and session.pending_mutation == pm then
+        session.pending_mutation = nil
+        session._mutation_title = nil
+      end
+      if not still_current then return end
       -- Clear mutation state and reopen the full table
       local tbl = pm.table_name
       local s_url = session.url
-      session.pending_mutation = nil
-      session._mutation_title = nil
       -- Reopen the full table (not the WHERE-filtered preview)
-      local current_win = vim.api.nvim_get_current_win()
       local grip = require("dadbod-grip")
-      grip.open(tbl, s_url, { reuse_win = current_win })
+      grip.open(tbl, s_url, { reuse_win = current_win, write_elapsed_ms = ms,
+        write_engine_timing = written and written.engine_timing, write_is_current = can_reload })
       return
     end
 
     -- Normal mode: apply staged changes
-    if not ctx.session_is_editable() then
+    if not ctx.session_can_apply() then
       vim.notify("Read-only: no primary key detected", vim.log.levels.INFO)
       return
     end
@@ -189,21 +211,41 @@ function M.setup(bufnr, ctx)
     -- Tier 2: transaction undo
     if session._txn_undo_stack and #session._txn_undo_stack > 0 then
       local reverse = session._txn_undo_stack[#session._txn_undo_stack]
-      local count = #reverse
-      local choice = vim.fn.confirm(
-        "Undo last committed transaction? (" .. count .. " statement(s))",
-        "&Yes\n&No", 2)
-      if choice ~= 1 then return end
-      local txn = sql.wrap_transaction(reverse,
-        require("dadbod-grip.adapters").kind(db.resolved_url(session.url)))
-      local _, err = db.execute(txn, session.url)
-      if err then
-        vim.notify("Undo failed: " .. err, vim.log.levels.ERROR)
+      if reverse.version ~= 1 then
+        vim.notify("Undo unavailable: this transaction has no verified row identity", vim.log.levels.WARN)
         return
       end
-      table.remove(session._txn_undo_stack)
-      vim.notify("Undid transaction (" .. count .. " statement(s))", vim.log.levels.INFO)
-      if session.on_refresh then session.on_refresh(bufnr) end
+      if reverse.outcome_unknown then
+        vim.notify("Undo outcome unknown: inspect the database before any further reversal", vim.log.levels.ERROR)
+        return
+      end
+      local count = #reverse.ops
+      local choice = vim.fn.confirm(
+        "Undo last committed transaction on " .. reverse.table_name .. "? (" .. count .. " change(s))",
+        "&Yes\n&No", 2)
+      if choice ~= 1 then return end
+      if not require('dadbod-grip.write').begin_write(session) then return end
+      local is_current = require("dadbod-grip.write").capture_owner(bufnr, session)
+      local written, err, ms, unknown, lifecycle = require("dadbod-grip.write").execute(
+        reverse, reverse.url or session.url, "undo " .. reverse.table_name)
+      session._write_pending = nil
+      if err then
+        if unknown then
+          reverse.outcome_unknown = true
+          session._write_unknown, session._write_lifecycle = true, lifecycle
+        end
+        vim.notify((unknown and "" or "Undo refused or conflicted: ") .. err, vim.log.levels.ERROR)
+        return
+      end
+      vim.notify("Undid transaction (" .. count .. " change(s))", vim.log.levels.INFO)
+      if view._sessions[bufnr] == session and session._txn_undo_stack[#session._txn_undo_stack] == reverse then
+        table.remove(session._txn_undo_stack)
+      end
+      if not is_current() then return end
+      if session.on_refresh then
+        session.on_refresh(bufnr, { write_elapsed_ms = ms, write_engine_timing = written.engine_timing,
+          is_current = is_current })
+      end
       return
     end
 
@@ -252,9 +294,13 @@ function M.setup(bufnr, ctx)
 
   -- y: yank cell value
   kmap("grid_yank_cell", function()
-    local cell = view.get_cell(bufnr)
+    local cell = view.get_display_cell(bufnr)
     if not cell then
       vim.notify("Move cursor to a data row to yank", vim.log.levels.INFO)
+      return
+    end
+    if cell.storage_type=='raw_unknown' then
+      vim.notify('Unproven byte encoding; clipboard export is unavailable',vim.log.levels.WARN)
       return
     end
     local val = cell.value or ""
@@ -266,12 +312,13 @@ function M.setup(bufnr, ctx)
   kmap("grid_yank_row", function()
     local session = ctx.session()
     if not session then return end
-    local cell = view.get_cell(bufnr)
+    local cell = view.get_display_cell(bufnr)
     if not cell then
       vim.notify("Move cursor to a data row to yank", vim.log.levels.INFO)
       return
     end
-    local st = session.state
+    local st = view.get_display_state(bufnr)
+    if refuse_unknown(st) then return end
     local parts = {}
     for _, col in ipairs(st.columns) do
       local val = data.effective_value(st, cell.row_idx, col)
@@ -286,7 +333,8 @@ function M.setup(bufnr, ctx)
   kmap("grid_yank_table", function()
     local session = ctx.session()
     if not session then return end
-    local st = session.state
+    local st = view.get_display_state(bufnr)
+    if refuse_unknown(st) then return end
     local r = session._render
     if not r then return end
     local lines_out = { table.concat(st.columns, ",") }
@@ -306,7 +354,8 @@ function M.setup(bufnr, ctx)
   kmap("grid_yank_md", function()
     local session_gy = ctx.session()
     if not session_gy or not session_gy._render then return end
-    local st_gy = session_gy.state
+    local st_gy = view.get_display_state(bufnr)
+    if refuse_unknown(st_gy) then return end
     local r_gy = session_gy._render
     local cols = st_gy.columns
     local rows_data = {}
@@ -319,7 +368,7 @@ function M.setup(bufnr, ctx)
       end
       table.insert(rows_data, row)
     end
-    vim.fn.setreg("+", table.concat(view._format_export(rows_data, cols, "markdown"), "\n"))
+    vim.fn.setreg("+", table.concat(view._format_export(rows_data, cols, "markdown",nil,st_gy), "\n"))
     vim.notify("Copied as Markdown table (" .. #rows_data .. " rows)", vim.log.levels.INFO)
   end, "Yank table as Markdown")
 

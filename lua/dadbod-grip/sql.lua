@@ -5,11 +5,9 @@ local M = {}
 
 -- Quote a value for use in SQL.
 -- nil    → NULL
--- string → 'value' with single-quote escaping (N'value' on sqlserver)
+-- string → 'value' with single-quote escaping
 -- number → n
--- bool   → TRUE / FALSE (1 / 0 on sqlserver)
--- On SQL Server a plain '...' literal is varchar in the database code page,
--- so characters outside it are stored as '?'; N'...' keeps them.
+-- bool   → TRUE / FALSE
 -- Escape a value for embedding in a single-quoted SQL string literal.
 -- Only the quote doubling: callers add the surrounding quotes themselves,
 -- which is what every catalog query in the adapters needs.
@@ -20,45 +18,68 @@ function M.escape_literal(v)
 end
 local escape_literal = M.escape_literal
 
-function M.quote_value(v, adapter_kind)
-  if v == nil then
+--- SQL Server binary column types, whose values the grid shows as 0x hex.
+local SQLSERVER_BINARY = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
+function M.is_sqlserver_binary(type_name)
+  return SQLSERVER_BINARY[((type_name or ""):match("^%a+") or ""):lower()] == true
+end
+
+function M.quote_value(v, adapter_kind, storage_type, exact)
+  local problem=require('dadbod-grip.provenance').kind_error(storage_type);assert(not problem,problem)
+  if v == nil or v == vim.NIL then
     return "NULL"
+  elseif (adapter_kind == "sqlite" or adapter_kind == "mysql" or adapter_kind == "mariadb") and storage_type == "blob" then
+    return "X'" .. tostring(v):gsub(".", function(ch) return string.format("%02x", ch:byte()) end) .. "'"
+  elseif adapter_kind == "sqlite" and storage_type == "integer" then
+    assert(tostring(v):match("^%-?%d+$"), "invalid integer receipt")
+    return tostring(v)
+  elseif adapter_kind == "sqlite" and storage_type == "real" then
+    local numeric = exact or tostring(v)
+    if numeric == "Inf" then numeric = "9e999" elseif numeric == "-Inf" then numeric = "-9e999" end
+    assert(numeric:match("^[%+%-]?[%d%.]+[eE]?[%+%-]?%d*$"), "invalid real receipt")
+    -- Use the same text-to-REAL conversion checked by SQLite transaction
+    -- admission. A numeric SQL token must not take a different parser path.
+    return "CAST('" .. numeric .. "' AS REAL)"
   elseif type(v) == "boolean" then
     if adapter_kind == "sqlserver" then return v and "1" or "0" end
     return v and "TRUE" or "FALSE"
   elseif type(v) == "number" then
     return tostring(v)
   elseif adapter_kind == "sqlserver" then
-    -- sqlcmd drops the CR of every CRLF it reads from stdin, so CRs are
-    -- spliced in as NCHAR(13). The nvarchar(max) cast stops the concatenation
-    -- from cutting a long value to 4000 characters.
+    -- storage_type is the column's SQL Server type name when the caller knows
+    -- it: a 0x hex value for a binary column is written as a binary literal,
+    -- since the server will not turn N'0x..' into bytes.
+    if type(storage_type) == "string" and M.is_sqlserver_binary(storage_type)
+        and tostring(v):match("^0[xX]%x*$") then
+      return tostring(v)
+    end
+    -- sqlcmd drops the CR of every CRLF it reads, so CRs are spliced in as
+    -- NCHAR(13). The nvarchar(max) cast stops the concatenation from cutting
+    -- a long value to 4000 characters.
     local parts = vim.split(tostring(v), "\r", { plain = true })
     for i, part in ipairs(parts) do parts[i] = "N'" .. escape_literal(part) .. "'" end
     if #parts == 1 then return parts[1] end
     parts[1] = "CAST(" .. parts[1] .. " AS nvarchar(max))"
     return table.concat(parts, " + NCHAR(13) + ")
   else
+    if tostring(v):find("\0", 1, true) then
+      assert(adapter_kind ~= "postgresql", "PostgreSQL text cannot contain NUL bytes")
+      local hex = tostring(v):gsub(".", function(ch) return string.format("%02x", ch:byte()) end)
+      if adapter_kind == "mysql" or adapter_kind == "mariadb" then
+        return "CONVERT(X'" .. hex .. "' USING utf8mb4)"
+      elseif adapter_kind == "duckdb" then return "decode(from_hex('" .. hex .. "'))" end
+      return "CAST(X'" .. hex .. "' AS TEXT)"
+    end
     return "'" .. escape_literal(v) .. "'"
   end
 end
 
---- Wrap statements in the transaction syntax accepted by the target adapter.
---- Binary column types, whose values the grid shows as 0x hex.
-local BINARY_TYPES = { binary = true, varbinary = true, image = true, timestamp = true, rowversion = true }
-
 --- One value as SQL for a column of type `type_name` (nil when unknown):
---- data.NULL_SENTINEL is NULL, data.EMPTY is '', and on SQL Server a 0x hex
---- value for a binary column is written as a binary literal, since the
---- server will not turn N'0x..' into bytes.
+--- nil and data.NULL_SENTINEL are NULL, and on SQL Server a 0x hex value for a
+--- binary column is a binary literal (see quote_value).
 function M.value_sql(v, adapter_kind, type_name)
-  local data = require("dadbod-grip.data")
-  if v == data.NULL_SENTINEL then return "NULL" end
-  if v == data.EMPTY then return M.quote_value("", adapter_kind) end
-  if adapter_kind == "sqlserver" and type(v) == "string" and type_name
-      and BINARY_TYPES[(type_name:match("^%a+") or ""):lower()] and v:match("^0[xX]%x*$") then
-    return v
-  end
-  return M.quote_value(v, adapter_kind)
+  if v == nil or v == vim.NIL then return "NULL" end
+  return M.quote_value(v, adapter_kind, adapter_kind == "sqlserver" and type_name or nil)
 end
 
 -- SQL Server types = cannot compare directly: compared as their text.
@@ -71,7 +92,7 @@ local COMPARED_AS_TEXT = {
 --- literals, and text for the types = refuses (text, xml, geography, ...).
 function M.equals_sql(col, value, adapter_kind, type_name)
   local col_q = M.quote_ident(col)
-  if value == nil then return col_q .. " IS NULL" end
+  if value == nil or value == vim.NIL then return col_q .. " IS NULL" end
   if adapter_kind == "sqlserver" then
     local base = ((type_name or ""):match("^[%a_]+") or ""):lower()
     if COMPARED_AS_TEXT[base] then
@@ -85,15 +106,7 @@ function M.equals_sql(col, value, adapter_kind, type_name)
   return col_q .. " = " .. M.quote_value(value, adapter_kind)
 end
 
---- `col = value`, or `col IS NULL` for a NULL key.
-local function key_sql(col, val, adapter_kind, types)
-  local data = require("dadbod-grip.data")
-  if val == nil or val == "" or val == data.NULL_SENTINEL then
-    return M.quote_ident(col) .. " IS NULL"
-  end
-  return M.quote_ident(col) .. " = " .. M.value_sql(val, adapter_kind, types and types[col])
-end
-
+--- Wrap statements in the transaction syntax accepted by the target adapter.
 function M.wrap_transaction(statements, adapter_kind)
   local begin_stmt = adapter_kind == "sqlserver"
       and "SET XACT_ABORT ON;\nBEGIN TRANSACTION;" or "BEGIN;"
@@ -111,6 +124,12 @@ function M.quote_ident(name)
   return table.concat(parts, ".")
 end
 local quote_ident = M.quote_ident
+
+-- A column label is one identifier, even when its spelling contains a dot.
+function M.quote_column(name)
+  return '"' .. tostring(name):gsub('"', '""') .. '"'
+end
+local quote_column = M.quote_column
 
 -- Strip outer quotes from each part of a possibly schema-qualified identifier.
 -- Inverse of quote_ident: "public"."Participant" → public.Participant
@@ -268,282 +287,75 @@ function M.parse_dadbod_url(url, default_port)
   }
 end
 
--- M.build_update(table_name, pk_values, changes, adapter_kind) → string
--- pk_values: { col = "val", ... }
--- changes:   { col = new_val, ... }  (data.NULL_SENTINEL means SQL NULL)
--- opts.types:  { col = type name }, for values that need their type (binaries)
-function M.build_update(table_name, pk_values, changes, adapter_kind, opts)
-  local types = opts and opts.types
-  local set_parts = {}
+local function write_options(settings)
+  if type(settings) == "table" then return settings end
+  return { adapter_kind = settings }
+end
+
+local function where_keys(pk_values, opts)
+  local parts = {}
+  for col, val in pairs(pk_values) do
+    assert(val ~= nil and val ~= vim.NIL, "row identity cannot contain NULL")
+    if opts.adapter_kind == 'sqlite' and opts.key_types and opts.key_types[col] then
+      parts[#parts + 1] = 'typeof(' .. quote_column(col) .. ') = ' .. M.quote_value(opts.key_types[col])
+    end
+    parts[#parts + 1] = quote_column(col) .. " = " .. M.quote_value(val, opts.adapter_kind,
+      opts.key_types and opts.key_types[col], opts.key_exact and opts.key_exact[col])
+  end
+  assert(#parts > 0, "row identity is missing")
+  table.sort(parts)
+  return table.concat(parts, " AND ")
+end
+
+-- Values and predicates are independent structures. Never locate SQL clauses
+-- by searching generated SQL, where the same words can occur inside literals.
+function M.build_update(table_name, pk_values, changes, settings)
+  local opts, set_parts = write_options(settings), {}
   for col, val in pairs(changes) do
-    table.insert(set_parts, quote_ident(col) .. " = " .. M.value_sql(val, adapter_kind, types and types[col]))
+    set_parts[#set_parts + 1] = quote_column(col) .. " = " .. M.quote_value(val, opts.adapter_kind,
+      opts.value_types and opts.value_types[col], opts.value_exact and opts.value_exact[col])
   end
-  -- Sort for deterministic output
   table.sort(set_parts)
-
-  local where_parts = {}
-  for col, val in pairs(pk_values) do
-    table.insert(where_parts, key_sql(col, val, adapter_kind, types))
-  end
-  table.sort(where_parts)
-
-  return string.format(
-    "UPDATE %s SET %s WHERE %s",
-    quote_ident(table_name),
-    table.concat(set_parts, ", "),
-    table.concat(where_parts, " AND ")
-  )
+  local identity_clause = where_keys(pk_values, opts)
+  return "UPDATE " .. quote_ident(table_name) .. " SET " .. table.concat(set_parts, ", ")
+    .. " WHERE " .. (opts.predicate or identity_clause)
 end
 
--- M.build_insert(table_name, values, columns, adapter_kind) → string
--- values:  { col = val, ... }  (data.NULL_SENTINEL means SQL NULL)
--- columns: ordered list of column names (defines INSERT column order)
--- opts.types:  { col = type name };  opts.skip: { col = true } never written
-function M.build_insert(table_name, values, columns, adapter_kind, opts)
-  local types = opts and opts.types
-  local skip = opts and opts.skip
-  local col_parts = {}
-  local val_parts = {}
-
+function M.build_insert(table_name, values, columns, settings, override_identity)
+  local opts, col_parts, val_parts = write_options(settings), {}, {}
   for _, col in ipairs(columns) do
-    local val = values[col]
-    -- Skip columns with nil that aren't explicitly set (let DB use DEFAULT)
-    -- NULL_SENTINEL is non-nil and emits SQL NULL explicitly
-    if val ~= nil and not (skip and skip[col]) then
-      table.insert(col_parts, quote_ident(col))
-      table.insert(val_parts, M.value_sql(val, adapter_kind, types and types[col]))
+    if values[col] ~= nil then
+      col_parts[#col_parts + 1] = quote_column(col)
+      val_parts[#val_parts + 1] = M.quote_value(values[col], opts.adapter_kind,
+        opts.value_types and opts.value_types[col], opts.value_exact and opts.value_exact[col])
     end
   end
-
-  if #col_parts == 0 then
-    -- All defaults: INSERT with no columns
-    return string.format("INSERT INTO %s DEFAULT VALUES", quote_ident(table_name))
-  end
-
-  return string.format(
-    "INSERT INTO %s (%s) VALUES (%s)",
-    quote_ident(table_name),
-    table.concat(col_parts, ", "),
-    table.concat(val_parts, ", ")
-  )
+  if #col_parts == 0 then return "INSERT INTO " .. quote_ident(table_name) .. " DEFAULT VALUES" end
+  return "INSERT INTO " .. quote_ident(table_name) .. " (" .. table.concat(col_parts, ", ") .. ")"
+    .. ((opts.override_identity or override_identity) and " OVERRIDING SYSTEM VALUE" or "")
+    .. " VALUES (" .. table.concat(val_parts, ", ") .. ")"
 end
 
--- M.build_reinsert(table_name, values, columns, adapter_kind) → string
--- The INSERT that undoes a DELETE, original key included. SQL Server refuses
--- an explicit IDENTITY value unless IDENTITY_INSERT is on, and refuses to turn
--- that on for a table without an IDENTITY column, hence the OBJECTPROPERTY test.
-function M.build_reinsert(table_name, values, columns, adapter_kind, opts)
-  local insert = M.build_insert(table_name, values, columns, adapter_kind, opts)
-  if adapter_kind ~= "sqlserver" then return insert end
-  local ident = quote_ident(table_name)
-  local toggle = string.format(
-    "IF OBJECTPROPERTY(OBJECT_ID(N'%s'), 'TableHasIdentity') = 1 SET IDENTITY_INSERT %s",
-    escape_literal(ident), ident)
-  return toggle .. " ON;\n" .. insert .. ";\n" .. toggle .. " OFF"
+function M.build_delete(table_name, pk_values, settings)
+  return "DELETE FROM " .. quote_ident(table_name) .. " WHERE " .. where_keys(pk_values, write_options(settings))
 end
 
---- SELECT that finds the row an INSERT just created when the database
---- generated its key: match every non-key value the INSERT was given, newest
---- key first. Columns in `skip` (types the database cannot compare with =,
---- such as SQL Server text and ntext) are left out. Returns nil when no column
---- is left to match on.
---- The WHERE that finds a row by the values it was inserted with, or nil
---- when no value can be compared.
-local function lookup_where(pks, values, skip, adapter_kind, opts)
-  local NULL_SENTINEL = require("dadbod-grip.data").NULL_SENTINEL
-  local types = opts and opts.types
-  local pk_set = {}
-  for _, pk in ipairs(pks) do pk_set[pk] = true end
-  local EMPTY = require("dadbod-grip.data").EMPTY
-  local where_parts = {}
-  for col, val in pairs(values) do
-    if not pk_set[col] and val and val ~= "" and val ~= NULL_SENTINEL then
-      if not (skip and skip[col]) then
-        table.insert(where_parts, quote_ident(col) .. " = " .. M.value_sql(tostring(val), adapter_kind, types and types[col]))
-      elseif adapter_kind == "sqlserver" and types and types[col] then
-        -- = refuses text, ntext, xml, ...: compare them as text instead.
-        table.insert(where_parts, M.equals_sql(col, val == EMPTY and "" or tostring(val), adapter_kind, types[col]))
-      end
-    end
-  end
-  if #where_parts == 0 then return nil end
-  table.sort(where_parts)
-  return table.concat(where_parts, " AND ")
-end
-
-function M.build_insert_lookup(table_name, pks, values, skip, adapter_kind, opts)
-  local where = lookup_where(pks, values, skip, adapter_kind, opts)
-  if not where then return nil end
-  local pk_cols = table.concat(vim.tbl_map(quote_ident, pks), ", ")
-  return "SELECT " .. pk_cols .. " FROM " .. quote_ident(table_name)
-    .. " WHERE " .. where
-    .. " ORDER BY " .. quote_ident(pks[1]) .. " DESC LIMIT 1"
-end
-
---- One query that lists, for every staged insert the database gives a key
---- (no key value staged), the keys of all rows holding its values. Run it
---- before and after the apply: the new keys are the inserted rows, whatever
---- order the keys have (a GUID's "highest" is not the newest).
---- Returns nil when no insert needs it, else
---- { sql, slots = { [insert_i] = branch }, groups = { [insert_i] = where } }.
-function M.build_inserted_keys(state, adapter_kind)
-  local data = require("dadbod-grip.data")
-  if #state.pks == 0 then return nil end
-  local pk_cols = table.concat(vim.tbl_map(quote_ident, state.pks), ", ")
-  local branches, slots, groups = {}, {}, {}
-  for i, ins in ipairs(data.get_inserts(state)) do
-    local explicit = false
-    for _, pk in ipairs(state.pks) do
-      local v = ins.values[pk]
-      if v ~= nil and v ~= data.NULL_SENTINEL then explicit = true end
-    end
-    local where = not explicit and lookup_where(state.pks, ins.values, state.incomparable_columns,
-      adapter_kind, M.state_opts(state))
-    if where then
-      branches[#branches + 1] = string.format("SELECT %d AS _grip_k, %s FROM %s WHERE %s",
-        #branches + 1, pk_cols, quote_ident(state.table_name), where)
-      slots[i], groups[i] = #branches, where
-    end
-  end
-  if #branches == 0 then return nil end
-  return { sql = table.concat(branches, " UNION ALL "), slots = slots, groups = groups }
-end
-
---- The inserted rows' keys from the build_inserted_keys rows before and
---- after the apply: { [insert_i] = { pk = value } }. Inserts with the same
---- values share their new rows; when the count does not match, they get none
---- rather than a guess.
-function M.match_inserted_keys(plan, before_rows, after_rows, pks)
-  local function by_branch(rows)
-    local out = {}
-    for _, row in ipairs(rows or {}) do
-      local k = tonumber(row[1])
-      if k then
-        out[k] = out[k] or {}
-        table.insert(out[k], table.concat(row, "\31", 2, #pks + 1))
-      end
-    end
-    return out
-  end
-  local before, after = by_branch(before_rows), by_branch(after_rows)
-  local members, order = {}, {}
-  for i = 1, table.maxn(plan.slots) do
-    local g = plan.groups[i]
-    if g then
-      if not members[g] then members[g] = {}; order[#order + 1] = g end
-      table.insert(members[g], i)
-    end
-  end
-  local keys = {}
-  for _, g in ipairs(order) do
-    local k = plan.slots[members[g][1]]
-    local seen = {}
-    for _, t in ipairs(before[k] or {}) do seen[t] = true end
-    local new = {}
-    for _, t in ipairs(after[k] or {}) do if not seen[t] then new[#new + 1] = t end end
-    table.sort(new)
-    if #new == #members[g] then
-      for j, i in ipairs(members[g]) do
-        local parts = vim.split(new[j], "\31", { plain = true })
-        local key = {}
-        for p, pk in ipairs(pks) do key[pk] = parts[p] end
-        keys[i] = key
-      end
-    end
-  end
-  return keys
-end
-
--- M.build_delete(table_name, pk_values, adapter_kind) → string
--- pk_values: { col = "val", ... }
-function M.build_delete(table_name, pk_values, adapter_kind, opts)
-  local types = opts and opts.types
-  local where_parts = {}
-  for col, val in pairs(pk_values) do
-    table.insert(where_parts, key_sql(col, val, adapter_kind, types))
-  end
-  table.sort(where_parts)
-
-  return string.format(
-    "DELETE FROM %s WHERE %s",
-    quote_ident(table_name),
-    table.concat(where_parts, " AND ")
-  )
-end
-
--- M.preview_staged(table_name, updates, deletes, inserts, adapter_kind) → string
+-- M.preview_staged(table_name, updates, deletes, inserts) → string
 -- Generates a multi-line SQL preview of all staged changes.
 -- updates: from data.get_updates(), deletes: from data.get_deletes(), inserts: from data.get_inserts()
-function M.preview_staged(table_name, updates, deletes, inserts, adapter_kind, opts)
+function M.preview_staged(table_name, updates, deletes, inserts)
   local stmts = {}
   for _, del in ipairs(deletes) do
-    table.insert(stmts, M.build_delete(table_name, del.pk_values, adapter_kind, opts) .. ";")
+    table.insert(stmts, M.build_delete(table_name, del.pk_values, del) .. ";")
   end
   for _, upd in ipairs(updates) do
-    table.insert(stmts, M.build_update(table_name, upd.pk_values, upd.changes, adapter_kind, opts) .. ";")
+    table.insert(stmts, M.build_update(table_name, upd.pk_values, upd.changes, upd) .. ";")
   end
   for _, ins in ipairs(inserts) do
-    table.insert(stmts, M.build_insert(table_name, ins.values, ins.columns, adapter_kind, opts) .. ";")
+    table.insert(stmts, M.build_insert(table_name, ins.values, ins.columns, ins) .. ";")
   end
   if #stmts == 0 then return "-- no staged changes" end
   return table.concat(stmts, "\n")
-end
-
--- ── staged changes of a grid state ─────────────────────────────────────────
-
---- The types and never-written columns of a grid state, as builder opts.
-function M.state_opts(state)
-  return { types = state.column_types, skip = state.generated_columns }
-end
-
---- The statements that apply a grid state's staged changes: deletes first
---- (avoids FK conflicts with inserts), then updates, then inserts.
-function M.build_apply(state, adapter_kind)
-  local data = require("dadbod-grip.data")
-  local opts = M.state_opts(state)
-  local stmts = {}
-  for _, del in ipairs(data.get_deletes(state)) do
-    table.insert(stmts, M.build_delete(state.table_name, del.pk_values, adapter_kind, opts))
-  end
-  for _, upd in ipairs(data.get_updates(state)) do
-    table.insert(stmts, M.build_update(state.table_name, upd.pk_values, upd.changes, adapter_kind, opts))
-  end
-  for _, ins in ipairs(data.get_inserts(state)) do
-    table.insert(stmts, M.build_insert(state.table_name, ins.values, ins.columns, adapter_kind, opts))
-  end
-  return stmts
-end
-
---- The statements that undo a grid state's staged deletes and updates once
---- applied: a deleted row goes back in whole, an update gets its old values.
---- Returns reverse, irreversible: the row indexes of deleted rows that cannot
---- be put back because a binary in them only reached the grid as a
---- "<binary N bytes>" placeholder.
-function M.build_undo(state, adapter_kind)
-  local data = require("dadbod-grip.data")
-  local opts = M.state_opts(state)
-  local reverse, irreversible = {}, {}
-  local deletes = data.get_deletes(state)
-  table.sort(deletes, function(a, b) return a.row_idx < b.row_idx end)
-  for _, del in ipairs(deletes) do
-    local values, placeholder = {}, false
-    for _, col in ipairs(state.columns) do
-      local v = data.original_value(state, del.row_idx, col)
-      if type(v) == "string" and v:sub(1, #"<binary ") == "<binary " then placeholder = true end
-      values[col] = v
-    end
-    if placeholder then
-      table.insert(irreversible, del.row_idx)
-    else
-      table.insert(reverse, M.build_reinsert(state.table_name, values, state.columns, adapter_kind, opts))
-    end
-  end
-  for _, upd in ipairs(data.get_updates(state)) do
-    local old = {}
-    for col in pairs(upd.changes) do old[col] = data.original_value(state, upd.row_idx, col) end
-    table.insert(reverse, M.build_update(state.table_name, upd.pk_values, old, adapter_kind, opts))
-  end
-  return reverse, irreversible
 end
 
 return M

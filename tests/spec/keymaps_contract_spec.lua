@@ -23,7 +23,7 @@ end
 test("catalog metadata, defaults, and JSON agree", function()
   local seen = {}
   local defaults = {}
-  local valid_surfaces = { grid = true, query_pad = true, sidebar = true, cell_editor = true }
+  local valid_surfaces = { grid = true, query_pad = true, sidebar = true, welcome = true, cell_editor = true }
   local valid_modes = { n = true, i = true, x = true }
   for _, record in ipairs(keymaps.catalog) do
     assert(type(record.action) == "string" and record.action:match("^[a-z][a-z0-9_]*$"))
@@ -94,10 +94,11 @@ test("declared primary actions cover the corrected surfaces", function()
     end
   end
   assert(vim.deep_equal(record("welcome").surfaces, { "grid", "query_pad", "sidebar" }))
-  assert(vim.deep_equal(record("schema_browser").surfaces, { "grid", "query_pad", "sidebar" }))
+  assert(vim.deep_equal(record("schema_browser").surfaces, { "grid", "query_pad", "sidebar", "welcome" }))
+  assert(vim.deep_equal(record("zoom").surfaces, { "grid", "query_pad", "sidebar", "welcome" }))
   assert(vim.deep_equal(record("goto_grid").surfaces, { "query_pad", "sidebar" }))
   assert(vim.deep_equal(record("open_notebook").surfaces, { "query_pad", "sidebar" }))
-  assert(vim.deep_equal(record("ai").surfaces, { "grid" }))
+  assert(vim.deep_equal(record("ai").surfaces, { "grid", "welcome" }))
   assert(includes(record("qpad_complete").modes, "i"))
 end)
 

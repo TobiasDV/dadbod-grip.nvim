@@ -71,6 +71,73 @@ test("expands a full-URL template", function()
   end)
 end)
 
+-- Literal expectations: comment removal must never rewrite a credential's bytes.
+for _, case in ipairs({
+  { "unquoted comment", "alpha # comment", "alpha" },
+  { "double-quoted comment", '"alpha" # comment', "alpha" },
+  { "single-quoted comment", "'alpha' # comment", "alpha" },
+  { "tabs outside quotes", '\t"alpha"\t# comment', "alpha" },
+  { "unquoted tabs", "alpha\t# comment", "alpha" },
+  { "surrounding whitespace", '  "alpha"  ', "alpha" },
+  { "quoted whitespace", '" alpha " # comment', " alpha " },
+  { "double-quoted literal hash", '"alpha # beta" # comment', "alpha # beta" },
+  { "single-quoted literal hash", "'alpha # beta' # comment", "alpha # beta" },
+  { "unspaced hash", "alpha#beta # comment", "alpha#beta" },
+  { "unspaced hash and text", "alpha# still literal", "alpha# still literal" },
+  { "unspaced leading hash", "#literal", "#literal" },
+  { "other quote is literal", [["alpha' # beta" # comment]], "alpha' # beta" },
+  { "quoted comment text", [["alpha" # "quoted comment"]], "alpha" },
+  { "single quotes in comment", [['alpha' # 'quoted comment']], "alpha" },
+  { "escaped double quote", [["alpha\" # beta" # comment]], [[alpha\" # beta]] },
+  { "escaped single quote", [['alpha\' # beta' # comment]], [[alpha\' # beta]] },
+  { "even backslashes close", [["alpha\\" # comment]], [[alpha\\]] },
+  { "odd backslashes escape", [["alpha\\\" # beta" # comment]], [[alpha\\\" # beta]] },
+  { "literal escape sequences", [["alpha\nbeta" # comment]], [[alpha\nbeta]] },
+  { "literal escaped hash", [[alpha\#beta # comment]], [[alpha\#beta]] },
+  { "no recursive interpolation", "'${GRIP_SPEC_NEVER_LOOK_UP}' # comment", "${GRIP_SPEC_NEVER_LOOK_UP}" },
+  { "malformed quoted tail", '"alpha" trailing # text', '"alpha" trailing # text' },
+  { "malformed tail ending in quotes", '"alpha" trailing "omega"', '"alpha" trailing "omega"' },
+  { "unterminated quote", '"alpha # literal', '"alpha # literal' },
+  { "unterminated escaped quote", [["alpha\" # literal]], [["alpha\" # literal]] },
+  { "unspaced quoted tail", '"alpha"#tail', '"alpha"#tail' },
+}) do
+  test("env value: " .. case[1], function()
+    with_env_file("export GRIP_SPEC_VALUE=" .. case[2], function(path)
+      eq(secrets.expand("${GRIP_SPEC_VALUE}", { env_file = path }), case[3], case[1])
+    end)
+  end)
+end
+
+test("a commented quoted DATABASE_URL expands to a usable scheme", function()
+  with_env_file('DATABASE_URL="postgresql://example.invalid/synthetic" # local fixture', function(path)
+    local resolved, err = secrets.expand("${DATABASE_URL}", { env_file = path })
+    eq(err, nil, "no expansion error")
+    eq(resolved, "postgresql://example.invalid/synthetic", "quotes and comment removed")
+    local adapter, adapt_err = require("dadbod-grip.adapters").resolve(resolved)
+    eq(adapt_err, nil, "scheme accepted without connecting")
+    eq(adapter, require("dadbod-grip.adapters.postgresql"), "real scheme dispatch")
+  end)
+end)
+
+test("env_file values still win and only absent keys fall back to the process", function()
+  vim.fn.setenv("GRIP_SPEC_PRIORITY", "synthetic-process")
+  local ok, err = pcall(function()
+    with_env_file('GRIP_SPEC_PRIORITY="synthetic-file" # comment', function(path)
+      eq(secrets.expand("${GRIP_SPEC_PRIORITY}", { env_file = path }), "synthetic-file", "file wins")
+    end)
+    with_env_file("OTHER=synthetic", function(path)
+      eq(secrets.expand("${GRIP_SPEC_PRIORITY}", { env_file = path }), "synthetic-process", "absent key fallback")
+    end)
+    with_env_file("GRIP_SPEC_PRIORITY= # empty template", function(path)
+      local url, empty_err = secrets.expand("${GRIP_SPEC_PRIORITY}", { env_file = path })
+      eq(url, nil, "empty file value cannot silently use another credential")
+      assert(empty_err and empty_err:find("empty", 1, true), "empty value error")
+    end)
+  end)
+  vim.fn.setenv("GRIP_SPEC_PRIORITY", vim.NIL)
+  if not ok then error(err) end
+end)
+
 test("expands a password embedded in a URL", function()
   with_env_file("PW=s3cr3t", function(path)
     local url = secrets.expand("postgresql://u:${PW}@h:5432/db", { env_file = path })

@@ -53,6 +53,39 @@ test("new: editable when PKs present", function()
   eq(st.readonly, false, "should be editable")
 end)
 
+test("new: missing single projected PK is readonly", function()
+  local st = make_state({ columns = { "name" }, rows = { { "alice" } } })
+  eq(st.readonly, true, "PK metadata alone cannot identify a result row")
+end)
+
+test("new: omitting either part of a composite PK is readonly", function()
+  for _, selected in ipairs({ "order_id", "product_id" }) do
+    local st = make_state({ columns = { selected, "name" }, rows = { { "1", "alice" } },
+      primary_keys = { "order_id", "product_id" } })
+    eq(st.readonly, true, "only selected " .. selected)
+  end
+end)
+
+test("new: empty projection with PK metadata is readonly", function()
+  local st = make_state({ columns = {}, rows = {} })
+  eq(st.readonly, true)
+end)
+
+test("new: complete composite PK remains editable in any column order", function()
+  local st = make_state({ columns = { "name", "product_id", "order_id" },
+    rows = { { "alice", "5", "10" } }, primary_keys = { "order_id", "product_id" } })
+  eq(st.readonly, false)
+end)
+
+test("new: caller-owned columns cannot reuse a stale projected-key map", function()
+  local result = { table_name = "users", columns = { "id", "name" }, primary_keys = { "id" } }
+  local original = data.new(result)
+  eq(original.readonly, false)
+  result.columns[1] = "other"
+  eq(data.new(result).readonly, true, "reused result must check its current projection")
+  eq(original.columns[1], "id", "original state owns its columns")
+end)
+
 test("new: readonly when no table_name", function()
   local st = make_state({ no_table_name = true, primary_keys = { "id" } })
   eq(st.readonly, true, "no table_name should be readonly")
@@ -110,10 +143,10 @@ test("add_change: nil stores as NULL", function()
   eq(data.effective_value(st2, 1, "name"), nil, "nil means NULL")
 end)
 
-test("add_change: empty string stores as NULL", function()
+test("add_change: empty string stays empty text", function()
   local st = make_state({})
   local st2 = data.add_change(st, 1, "name", "")
-  eq(data.effective_value(st2, 1, "name"), nil, "empty string means NULL")
+  eq(data.effective_value(st2, 1, "name"), "", "empty text is distinct from NULL")
 end)
 
 test("add_change: multiple changes on same row", function()
@@ -203,20 +236,15 @@ test("effective_value: returns original for unstaged", function()
   eq(data.effective_value(st, 2, "name"), "bob")
 end)
 
-test("effective_value: NULL original (empty CSV cell) returns nil", function()
-  -- All CSV CLIs emit "" for NULL, and db.parse_csv collapses quoted "" (a
-  -- genuinely empty string) and unquoted empty (NULL) into the same Lua "".
-  -- The distinction is therefore unrecoverable at this layer: "" in original
-  -- rows uniformly means NULL, and the documented contract is that
-  -- effective_value returns nil for NULL.
-  local st = make_state({ rows = { { "1", "", "test@x.com" } } })
+test("effective_value: typed NULL original returns nil", function()
+  local st = make_state({ rows = { { "1", vim.NIL, "test@x.com" } } })
   eq(data.effective_value(st, 1, "name"), nil, "NULL original must come back as nil")
 end)
 
 test("effective_value: staged NULL round-trip", function()
   -- Stage a value over a NULL original, then undo: the cell must read as
   -- NULL (nil) again, not "".
-  local st = make_state({ rows = { { "1", "", "test@x.com" } } })
+  local st = make_state({ rows = { { "1", vim.NIL, "test@x.com" } } })
   local st2 = data.add_change(st, 1, "name", "temp")
   eq(data.effective_value(st2, 1, "name"), "temp", "staged value visible")
   local st3 = data.undo_row(st2, 1)
@@ -378,8 +406,8 @@ test("clone_row: PK values are nil in cloned row", function()
   eq(data.effective_value(st2, ins_idx, "id"), nil, "PK should be nil so DB generates new ID")
 end)
 
-test("clone_row: NULL source values are not stored", function()
-  local st = make_state({ rows = { { "1", "", "alice@test.com" } } })
+test("clone_row: NULL source values are stored explicitly", function()
+  local st = make_state({ rows = { { "1", vim.NIL, "alice@test.com" } } })
   local st2 = data.clone_row(st, 1)
   local ordered = data.get_ordered_rows(st2)
   local ins_idx
@@ -387,7 +415,7 @@ test("clone_row: NULL source values are not stored", function()
     if idx ~= 1 then ins_idx = idx; break end
   end
   assert(ins_idx, "should have an inserted row")
-  -- empty string in original = nil (NULL), should not be stored
+  eq(st2.inserted[ins_idx].values.name, vim.NIL, "clone must override a possible non-NULL default")
   eq(data.effective_value(st2, ins_idx, "name"), nil, "NULL source value should stay nil in clone")
 end)
 
@@ -401,64 +429,55 @@ test("clone_row: inserts after source row_idx", function()
   eq(ordered[3], 2, "original row 2 should be last")
 end)
 
--- ── empty strings and generated columns ────────────────────────────────────
+-- ── SQL Server column metadata and generated columns ───────────────────────
 
 local function sqlserver_state()
   return data.new({
-    rows = { { "1", "", "" }, { "2", "x", "" } },
+    rows = { { "1", "", vim.NIL }, { "2", "x", "" } },
     columns = { "id", "code", "note" },
     primary_keys = { "id" },
     table_name = "t",
-    empty_cells = { [1] = { [2] = true }, [2] = { [3] = true } },
-    required_text_columns = { code = true },
+    storage_adapter = "sqlserver",
     generated_columns = { total = true },
-    column_types = { id = "int", code = "varchar(10)", note = "nvarchar(50)" },
+    column_types = { id = "int", code = "varchar(10)", note = "nvarchar(50)", blob = "varbinary(16)" },
   })
 end
 
-test("empty strings: a marked cell reads as '', an unmarked one as NULL", function()
+test("sqlserver state: '' and NULL stay apart, column types survive edits", function()
   local st = sqlserver_state()
   eq(data.effective_value(st, 1, "code"), "")
   eq(data.effective_value(st, 1, "note"), nil)
   eq(data.effective_value(st, 2, "note"), "")
-  eq(data.original_value(st, 1, "code"), data.EMPTY)
-  eq(data.original_value(st, 1, "note"), data.NULL_SENTINEL)
-  eq(data.original_value(st, 2, "code"), "x")
+  st = data.toggle_delete(data.add_change(st, 2, "code", ""), 1)
+  eq(data.effective_value(st, 2, "code"), "", "staged '' is ''")
+  eq(st.column_types.code, "varchar(10)", "types carried by edit_copy")
+  eq(st.generated_columns.total, true, "generated columns carried by edit_copy")
+  eq(st.storage_adapter, "sqlserver")
 end)
 
-test("empty strings: a staged EMPTY reads as '' and survives edit_copy", function()
-  local st = data.add_change(sqlserver_state(), 2, "code", data.EMPTY)
-  eq(st.changes[2].code, data.EMPTY)
-  eq(data.effective_value(st, 2, "code"), "")
-  st = data.toggle_delete(st, 1)
-  eq(data.effective_value(st, 1, "code"), "", "marks carried by edit_copy")
+test("sqlserver state: staged writes carry the column types for their literals", function()
+  local st = data.add_change(sqlserver_state(), 2, "code", "y")
+  local upd = data.get_updates(st)[1]
+  eq(upd.adapter_kind, "sqlserver")
+  eq(upd.value_types.blob, "varbinary(16)")
+  eq(upd.key_types.id, "int")
+  local ins = data.get_inserts(data.insert_row(sqlserver_state(), 2))[1]
+  eq(ins.adapter_kind, "sqlserver")
+  eq(ins.value_types.blob, "varbinary(16)")
 end)
 
-test("empty strings: clearing gives '' for NOT NULL text or a cell that held ''", function()
-  local st = sqlserver_state()
-  eq(data.cleared_value(st, 2, "code"), data.EMPTY, "NOT NULL text")
-  eq(data.cleared_value(st, 1, "note"), nil, "nullable NULL stays NULL")
-  eq(data.cleared_value(st, 2, "note"), data.EMPTY, "held ''")
-end)
-
-test("empty strings: other adapters keep '' meaning NULL", function()
-  local st = make_state({ rows = { { "1", "", "a@b" } } })
-  eq(data.effective_value(st, 1, "name"), nil)
-  eq(data.cleared_value(st, 1, "name"), nil)
-end)
-
-test("clone_row: copies '' and leaves generated columns out", function()
+test("clone_row: copies '' and NULL, leaves generated columns out", function()
   local st = data.new({
-    rows = { { "1", "", "4", "0x01" } },
-    columns = { "id", "code", "total", "rv" },
+    rows = { { "1", "", "4", "0x01", vim.NIL } },
+    columns = { "id", "code", "total", "rv", "note" },
     primary_keys = { "id" },
     table_name = "t",
-    empty_cells = { [1] = { [2] = true } },
     generated_columns = { total = true, rv = true },
   })
   st = data.clone_row(st, 1)
   local ins = st.inserted[st._next_insert_idx - 1].values
-  eq(ins.code, data.EMPTY)
+  eq(ins.code, "")
+  eq(ins.note, data.NULL_SENTINEL)
   eq(ins.total, nil)
   eq(ins.rv, nil)
 end)

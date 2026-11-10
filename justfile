@@ -126,8 +126,9 @@ e2e-visual: seed-sqlite
     session="grip-e2e-$$-$RANDOM"
     sync="$session"
     expected_columns="${GRIP_E2E_EXPECT_COLUMNS:-100}"
+    exit_receipt="$(mktemp)"
 
-    cleanup() { tmux kill-session -t "$session" 2>/dev/null || true; }
+    cleanup() { tmux kill-session -t "$session" 2>/dev/null || true; rm -f "$exit_receipt"; }
     trap cleanup EXIT INT TERM
 
     tmux new-session -d -s "$session" -c "$PWD" /bin/bash --noprofile --norc
@@ -135,13 +136,20 @@ e2e-visual: seed-sqlite
     tmux set-option -t "$session" remain-on-exit on
     tmux resize-window -t "$session" -x 100 -y 36
 
-    printf -v launch 'exec env GRIP_TMUX_SYNC=%q GRIP_EXPECT_COLUMNS=%q %q --cmd %q -u %q -c %q' \
-      "$sync" "$expected_columns" "$nvim_bin" "set rtp^=." "tests/minimal_init.lua" \
+    printf -v launch 'exec env GRIP_TMUX_SYNC=%q GRIP_EXPECT_COLUMNS=%q bash tests/fixtures/record_exit.sh %q %q --cmd %q -u %q -c %q' \
+      "$sync" "$expected_columns" "$exit_receipt" "$nvim_bin" "set rtp^=." "tests/minimal_init.lua" \
       "lua vim.schedule(function() dofile('tests/fixtures/workspace_layout_integration.lua') end)"
     tmux send-keys -t "$session" "$launch" Enter
 
     wait_for() {
       if ! timeout 8s tmux wait-for "$sync-$1"; then
+        echo "e2e-visual timed out waiting for $1" >&2
+        tmux capture-pane -p -t "$session" >&2 || true
+        exit 1
+      fi
+    }
+    wait_import_stage() {
+      if ! timeout 8s bash tests/fixtures/wait_tmux_stage.sh "$session" "$sync-$1"; then
         echo "e2e-visual timed out waiting for $1" >&2
         tmux capture-pane -p -t "$session" >&2 || true
         exit 1
@@ -184,9 +192,7 @@ e2e-visual: seed-sqlite
     wait_text "Import 2 CSV rows"
     snapshot "GripImport preview prompt"
     tmux send-keys -t "$session" y Enter
-    wait_text "Press ENTER or type command to continue"
-    tmux send-keys -t "$session" Enter
-    wait_for import-staged
+    wait_import_stage import-staged
     tmux send-keys -t "$session" '$'
     wait_text "2 staged"
     snapshot "GripImport staged indicator"
@@ -205,32 +211,28 @@ e2e-visual: seed-sqlite
     send_import
     wait_text "Import 2 CSV rows"
     tmux send-keys -t "$session" y Enter
-    wait_text "Press ENTER or type command to continue"
-    tmux send-keys -t "$session" Enter
-    wait_for import-restaged
+    wait_import_stage import-restaged
     tmux send-keys -t "$session" a
     wait_text "Apply 2 staged change"
     snapshot "GripImport apply confirmation"
     tmux send-keys -t "$session" a
-    wait_text "Press ENTER or type command to continue"
-    tmux send-keys -t "$session" Enter
-    wait_for import-applied
+    wait_import_stage import-applied
     tmux send-keys -t "$session" G
     wait_text "E2E Import One"
     snapshot "GripImport committed rows"
     tmux send-keys -t "$session" :qa! Enter
 
     for _ in {1..100}; do
-      [[ "$(tmux display-message -p -t "$session" '#{pane_dead}')" == 1 ]] && break
+      receipt="$(cat "$exit_receipt")"
+      [[ "$receipt" =~ ^exit:([0-9]+):done$ ]] && break
       sleep 0.05
     done
-    if [[ "$(tmux display-message -p -t "$session" '#{pane_dead}')" != 1 ]]; then
-      echo "e2e-visual Neovim process did not exit" >&2
+    if [[ ! "$receipt" =~ ^exit:([0-9]+):done$ ]]; then
+      echo "e2e-visual Neovim exit status was not recorded" >&2
       tmux capture-pane -p -t "$session" >&2
       exit 1
     fi
-
-    status="$(tmux display-message -p -t "$session" '#{pane_dead_status}')"
+    status="${BASH_REMATCH[1]}"
     if [[ "$status" != 0 ]]; then
       echo "e2e-visual failed with status $status" >&2
       tmux capture-pane -p -t "$session" >&2

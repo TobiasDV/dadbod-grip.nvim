@@ -13,6 +13,10 @@ function M.setup(bufnr, ctx)
   local VIEW_LABELS = ctx.VIEW_LABELS
   local kmap, km = ctx.kmap, ctx.km
 
+  kmap("zoom", function()
+    require("dadbod-grip.zoom").toggle()
+  end, "Zoom pane / restore layout")
+
   -- 1: schema sidebar (already in grid = always primary: open/focus sidebar)
   kmap("tab_1", function()
     local _s = ctx.session()

@@ -7,12 +7,24 @@ local esc = sql.escape_literal
 local db      = require("dadbod-grip.db")
 local qmod    = require("dadbod-grip.query")
 local editor  = require("dadbod-grip.editor")
-local VERSION = require("dadbod-grip.version")
 local ui      = require("dadbod-grip.ui")
 local filetypes = require("dadbod-grip.filetypes")
 
 local M = {}
+
+-- Read consumers follow the snapshot that produced the visible grid. Metadata
+-- navigation flags can outlive a public refresh that repaints Records.
+local function display_context(session)
+  if not session then return nil end
+  local rendered=session._render
+  if rendered and rendered.read_failed then return nil end
+  if rendered and rendered.read_state then return rendered.read_state,rendered.read_metadata_view end
+  if session.current_view and session.current_view~='records' then return session._meta_state,session.current_view end
+  return session.state
+end
+
 M._sessions = {}  -- [bufnr] = { state, url, query_sql }
+require("dadbod-grip.result_hints").attach(M._sessions)
 
 --- Canonical content window finder: unpinned grid > welcome screen > nil.
 --- Pinned sessions are excluded: callers must not auto-replace them.
@@ -199,9 +211,16 @@ end
 -- The accent of the connection currently switched to. Read by
 -- ensure_highlights, so it is re-applied on every :colorscheme too.
 local _accent = nil
+local _highlight_overrides = {}
+local _highlight_groups = {}
 
 local function ensure_highlights()
-  local hl = vim.api.nvim_set_hl
+  -- Resolve the connection's defaults first; an explicit setup definition
+  -- replaces the whole group, including links and empty (cleared) groups.
+  local function hl(ns, group, defaults)
+    _highlight_groups[group] = true
+    vim.api.nvim_set_hl(ns, group, _highlight_overrides[group] or defaults)
+  end
   hl(0, "GripHeader",       { bold = true })
   -- Sticky-header counterpart of GripColHighlight: same bg, so the column the
   -- cursor is in reads the same in the winbar as it does in the grid.
@@ -238,6 +257,29 @@ vim.api.nvim_create_autocmd("ColorScheme", {
   group    = _hl_ag,
   callback = ensure_highlights,
 })
+
+--- Replace setup's highlight map. Validate every entry in an inactive
+--- namespace before changing live state, so one typo cannot half-apply a theme.
+--- @param overrides table<string, table>
+function M.set_highlights(overrides)
+  local copy = vim.deepcopy(overrides)
+  local ns = vim.api.nvim_create_namespace("DadbodGripHLValidation")
+  for group, definition in pairs(copy) do
+    if not _highlight_groups[group] then
+      error("highlights: unknown Grip group " .. vim.inspect(group), 2)
+    end
+    vim.validate({ ["highlights." .. group] = { definition, "table" } })
+    -- These are set_hl control flags, not styling. Overrides must always win
+    -- over the plugin's existing definition, regardless of refresh order.
+    if definition.default ~= nil or definition.force ~= nil then
+      error("highlights." .. group .. ": default and force flags are unsupported", 2)
+    end
+    local ok, err = pcall(vim.api.nvim_set_hl, ns, group, definition)
+    if not ok then error("highlights." .. group .. ": " .. tostring(err), 2) end
+  end
+  _highlight_overrides = copy
+  ensure_highlights()
+end
 
 --- Tint the accent groups for the connection being switched to.
 ---
@@ -286,8 +328,8 @@ local function calc_col_widths(columns, rows, max_width)
   local sample_end = n > 200 and 100 or n
   local function scan_row(row_data)
     for i, col in ipairs(columns) do
-      local v = row_data[i] or ""
-      local display = (v == nil or v == "") and NULL_DISPLAY or tostring(v)
+      local v = row_data[i]
+      local display = (v == nil or v == vim.NIL) and NULL_DISPLAY or (v == "" and '""' or tostring(v):gsub("%z", "␀"))
       local dw = vim.fn.strdisplaywidth(display)
       if dw > natural[col] then natural[col] = dw end
       widths[col] = math.min(math.max(widths[col], dw), max_width)
@@ -325,20 +367,24 @@ function M._distribute_slack(columns, widths, natural, configured_max, available
 end
 
 -- ── cell display formatting ───────────────────────────────────────────────
-local function format_cell(value, width, is_null_staged)
-  if is_null_staged or value == nil then
+local function format_cell(value, width, is_null_staged, storage_type)
+  if is_null_staged or value == nil or value == vim.NIL then
     local s = pad_display(NULL_DISPLAY, width)
     return s, "GripNull"
   end
-  value = tostring(value)
+  if storage_type == "blob" then value = "<binary:" .. #value .. " bytes>" end
+  if storage_type == 'raw_unknown' then
+    value='<raw bytes: '..require('dadbod-grip.transport').hex(tostring(value))..'>'
+    return pad_display(value,width,false),'GripReadonly'
+  end
+  value = tostring(value):gsub("%z", "␀")
   if value:sub(1, #BINARY_PREFIX) == BINARY_PREFIX then
     local s = pad_display(value, width, false)
     return s, "GripReadonly"
   end
-  -- "" here is a real empty string: data.effective_value turns the ""
-  -- adapters use for NULL into nil.
-  local display = value:gsub("\n", "↵"):gsub("\r", "")
-  return pad_display(display, width), nil
+  local display = value ~= "" and value:gsub("\n", "↵"):gsub("\r", "") or '""'
+  local hl = nil
+  return pad_display(display, width), hl
 end
 
 --- Classify a cell value for conditional formatting.
@@ -413,7 +459,14 @@ local function is_editable(session)
   return session.write_mode == true
     and filetypes.write_format(session.file_path) ~= nil
 end
-M._is_editable = is_editable  -- exposed for cell_buffer.lua
+-- Editing requires a visible Records snapshot. Metadata is readable but is not
+-- the canonical mutation target; a failed paint has no reliable row mapping.
+-- Keep this separate from formatting eligibility so a new render can recover.
+local function displayed_is_editable(session)
+  local state, metadata_view = display_context(session)
+  return state ~= nil and metadata_view == nil and is_editable(session)
+end
+M._is_editable = displayed_is_editable  -- exposed for cell_buffer.lua
 
 -- Build the title bar with connection/table info and staged count.
 local function title_line(session, columns, widths, total_width)
@@ -498,8 +551,8 @@ local function title_line(session, columns, widths, total_width)
   -- If still too wide (e.g. available <= 4: very narrow grid), show gH hint if it fits
   if title_dw > available then
     if inner >= 4 then
-      title = " gH "
-      title_dw = 4
+      title = require("dadbod-grip").get_opts().show_hints and " gH " or truncate_display(base_name, inner)
+      title_dw = vim.fn.strdisplaywidth(title)
     else
       title = ""
       title_dw = 0
@@ -514,7 +567,7 @@ end
 
 -- ── main render ──────────────────────────────────────────────────────────
 -- Returns {lines=[], extmarks=[{row, col, end_col, hl_group}]}
-local function build_render(session, opts)
+local function build_render(session, opts, bufnr)
   local configured_max = (opts and opts.max_col_width) or MAX_COL_WIDTH
   local st = session.state
   local hidden = session.hidden_columns or {}
@@ -545,7 +598,9 @@ local function build_render(session, opts)
     for i, col in ipairs(columns) do
       local eff = data.effective_value(st, row_idx, col)
       er[i] = eff
-      dr[i] = eff or ""
+      local kind=data.cell_type(st,row_idx,col)
+      dr[i] = eff==nil and vim.NIL or (kind == 'raw_unknown' and require('dadbod-grip.provenance').raw_display(eff)
+        or (kind == "blob" and ("<binary:" .. #eff .. " bytes>") or eff))
     end
     effs[di] = er
     display_rows[di] = dr
@@ -701,7 +756,7 @@ local function build_render(session, opts)
         local w = widths[col]
         -- format_cell also returns a highlight group, but the authoritative
         -- one is computed in the highlight pass below; ignore it here.
-        local cell_str = format_cell(eff, w, eff == nil)
+        local cell_str = format_cell(eff, w, eff == nil, data.cell_type(st, row_idx, col))
 
         line_byte_positions[col] = { start = byte_pos, finish = byte_pos + #cell_str - 1 }
 
@@ -760,14 +815,18 @@ local function build_render(session, opts)
   -- ── Status line ──
   local staged_count = data.count_staged(st)
   local status_parts = {}
+  local display_opts = require("dadbod-grip").get_opts()
+  local show_result_time, show_hints = display_opts.show_result_time, display_opts.show_hints
 
+  -- Metadata rows are not a page of the underlying records query.
+  local records_view = not session.current_view or session.current_view == "records"
   -- Row/page info
-  if session.query_spec and session.total_rows then
+  if records_view and session.query_spec and session.total_rows then
     local page_str = qmod.page_info(session.query_spec, session.total_rows)
     -- Directional hints when result spans multiple pages
     local spec = session.query_spec
     local total_pages = math.max(1, math.ceil(session.total_rows / spec.page_size))
-    if total_pages > 1 then
+    if show_hints and total_pages > 1 then
       local nav = {}
       if spec.page > 1 then nav[#nav + 1] = "H←" end
       if spec.page < total_pages then nav[#nav + 1] = "→L" end
@@ -777,17 +836,24 @@ local function build_render(session, opts)
   else
     local row_str = #st.rows .. " rows"
     -- Safety hint: if result maxed out page_size, more data likely exists
-    if session.query_spec and #st.rows >= session.query_spec.page_size then
-      row_str = row_str .. "  →L?"
+    if records_view and session.query_spec and #st.rows >= session.query_spec.page_size then
+      row_str = row_str .. (show_hints and "  →L?" or " (more possible)")
     end
     table.insert(status_parts, row_str)
   end
 
   local timing_str
-  if session.elapsed_ms then
-    local action = session.last_action or "query"
-    timing_str = session.elapsed_ms .. "ms " .. action
+  if session.elapsed_ms and session.last_action and session.last_action ~= "query" then
+    local action = session.last_action
+    timing_str = show_result_time and (session.elapsed_ms .. "ms " .. action) or action
     table.insert(status_parts, timing_str)
+  end
+  local write_ms = session._write_times and session._write_times[st.rows]
+  local write_str
+  if write_ms ~= nil and show_result_time then
+    local duration = write_ms < 1000 and (write_ms .. "ms") or ui.format_elapsed(write_ms)
+    write_str = "Write: " .. duration .. " client"
+    table.insert(status_parts, write_str)
   end
   if staged_count > 0 then table.insert(status_parts, staged_count .. " staged") end
   if st.readonly and not is_editable(session) then table.insert(status_parts, "read-only") end
@@ -798,9 +864,34 @@ local function build_render(session, opts)
   if hidden_n > 0 then table.insert(status_parts, hidden_n .. " hidden") end
 
   local status_str = " " .. table.concat(status_parts, "  │  ")
+  local status_row = #lines
+  local status_items
+  if not show_hints then
+    status_items = {}
+    local function essential(text, hl) status_items[#status_items + 1] = {text, hl} end
+    if staged_count > 0 then essential(staged_count .. " staged", "GripStatusChg") end
+    if st.readonly and not is_editable(session) then essential("read-only", "GripReadonly") end
+    if hidden_n > 0 then essential(hidden_n .. " hidden", "GripReadonly") end
+    if records_view and session.query_spec and session.total_rows then
+      essential(string.format("Page %d/%d", session.query_spec.page,
+        math.max(1, math.ceil(session.total_rows / session.query_spec.page_size))))
+      essential(session.total_rows .. " rows")
+    else
+      essential(status_parts[1])
+    end
+    if timing_str then essential(timing_str, "GripBoolTrue") end
+    if write_str then essential(write_str, "GripBoolTrue") end
+  end
+  local status_rows = 1
   table.insert(lines, status_str)
+  if status_items then
+    local footer = require("dadbod-grip.result_hints")
+    local rows = footer.status(status_items, footer.status_width(bufnr))
+    status_rows = #rows
+    for _ = 2, status_rows do table.insert(lines, "") end
+  end
   -- Highlight timing badge: query=yellow, applied=green
-  if timing_str then
+  if timing_str and not status_items then
     local ts, te = status_str:find(timing_str, 1, true)
     if ts then
       local action = session.last_action or "query"
@@ -809,10 +900,32 @@ local function build_render(session, opts)
     end
   end
   -- Highlight "N staged" segment in GripStatusChg color
-  if staged_count > 0 then
+  if staged_count > 0 and not status_items then
     local staged_text = staged_count .. " staged"
     local s, e = status_str:find(staged_text, 1, true)
     if s then push_mark(#lines, s - 1, e, "GripStatusChg") end
+  end
+
+  -- One result owns its query timing. Ordinary staged edits share immutable
+  -- rows; FK/metadata results have different rows, and nav-back restores the
+  -- original rows. Weak keys keep only durations whose results are still held.
+  local query_elapsed_ms = session._query_times and session._query_times[st.rows]
+  local query_time_row
+  if show_result_time and query_elapsed_ms ~= nil then
+    query_time_row = #lines
+    table.insert(lines, require("dadbod-grip.result_hints").query_time(query_elapsed_ms, math.huge))
+  end
+  local engine = session._query_engine_times and session._query_engine_times[st.rows]
+  local engine_time_row
+  if engine and show_result_time then
+    engine_time_row = #lines
+    table.insert(lines, require("dadbod-grip.result_hints").engine_time(engine, math.huge))
+  end
+  local write_engine = session._write_engine_times and session._write_engine_times[st.rows]
+  local write_engine_time_row
+  if write_engine and show_result_time then
+    write_engine_time_row = #lines
+    table.insert(lines, require("dadbod-grip.result_hints").engine_time(write_engine, math.huge, "Write engine"))
   end
 
   -- ── Filter lines (one per active clause: always fully visible, never truncated) ──
@@ -826,34 +939,50 @@ local function build_render(session, opts)
     end
   end
 
-  -- ── Hint line ──
-  local hints
+  -- Resolve configured bindings outside redraw; only packing varies per window.
+  local km, hints = require("dadbod-grip.keymaps"), {}
+  local function add(action, label, prefix)
+    if not show_hints then return end
+    local key = km.get(action)
+    if key then
+      key = vim.fn.keytrans(vim.api.nvim_replace_termcodes(key, true, true, true))
+      hints[#hints + 1] = (prefix or "") .. key .. ":" .. label
+    end
+  end
+  if km.get("help") then add("help", "help") else hints[#hints + 1] = ":help dadbod-grip" end
+  local function views(current)
+    local defaults = true
+    for i = 4, 9 do if km.get("tab_" .. i) ~= tostring(i) then defaults = false end end
+    if not current and defaults then hints[#hints + 1] = "4-9:views"; return end
+    for i = 4, 9 do
+      local name = VIEW_KEYS[i]
+      add("tab_" .. i, VIEW_LABELS[name] or name, name == current and "▶" or nil)
+    end
+  end
   local cv = session.current_view
   if cv and cv ~= "records" then
-    -- Metadata view: compact tab bar with current view marked (▶)
-    local parts = {}
-    for i = 4, 9 do
-      local vn = VIEW_KEYS[i]
-      local label = VIEW_LABELS[vn] or vn
-      if vn == cv then
-        table.insert(parts, "▶" .. i .. ":" .. label)
-      else
-        table.insert(parts, i .. ":" .. label)
-      end
-    end
-    hints = " " .. table.concat(parts, "  ") .. "  │  r:refresh  q:query  ?:help"
+    add("query_pad", "query"); add("grid_refresh", "refresh"); views(cv)
   elseif session.pending_mutation then
-    local mt = session.pending_mutation.type or "SQL"
-    hints = " a:execute " .. mt .. "  U:cancel  gs:preview SQL  q:query"
+    add("grid_apply", "execute " .. (session.pending_mutation.type or "SQL"))
+    add("grid_undo_all", "cancel"); add("grid_preview_sql", "preview SQL"); add("query_pad", "query")
   elseif st.readonly and not is_editable(session) then
-    hints = " r:refresh  Tab/w:col  gy:markdown  gq:saved  q:query  A:ai  gL:pin  gJ:switch  4-9:views  ?:help"
+    add("query_pad", "query"); add("grid_refresh", "refresh")
+    add("grid_col_next", "col"); add("grid_yank_md", "markdown")
+    add("load_saved", "saved"); add("ai", "ai"); add("grid_pin", "pin"); add("grid_results", "switch"); views()
   else
-    hints = " i:edit  c:clone  d:delete  a:apply  r:refresh  gq:saved  q:query  A:ai  gL:pin  gJ:switch  4-9:views  ?:help"
+    add("grid_edit", "edit"); add("grid_apply", "apply"); add("query_pad", "query"); add("grid_refresh", "refresh")
+    add("grid_clone", "clone"); add("grid_delete", "delete"); add("load_saved", "saved")
+    add("ai", "ai"); add("grid_pin", "pin"); add("grid_results", "switch"); views()
   end
-  table.insert(lines, hints)
+  local hint_row
+  if show_hints then
+    hint_row = #lines
+    table.insert(lines, "")
+    table.insert(lines, "")
+  end
 
   local data_start = has_type_row and 5 or 4
-  return { lines = lines, marks = marks, widths = widths, ordered = ordered, byte_positions = row_byte_positions, hdr_byte_positions = hdr_byte_positions, type_row_byte_positions = type_row_byte_positions, data_start = data_start, visible_columns = columns }
+  return { lines = lines, marks = marks, widths = widths, ordered = ordered, byte_positions = row_byte_positions, hdr_byte_positions = hdr_byte_positions, type_row_byte_positions = type_row_byte_positions, data_start = data_start, visible_columns = columns, hint_row = hint_row, hint_items = hints, hint_cache = {}, query_time_row = query_time_row, query_elapsed_ms = query_elapsed_ms, engine_time_row = engine_time_row, engine_timing = engine, write_engine_time_row = write_engine_time_row, write_engine_timing = write_engine, status_row = status_row, status_items = status_items, status_rows = status_rows }
 end
 
 -- ── namespace for extmarks ───────────────────────────────────────────────
@@ -894,6 +1023,7 @@ function M.render(bufnr, state)
 
   -- Save cursor position before re-render
   local saved_cursor
+  local previous_render = session._render
   local win = vim.fn.bufwinid(bufnr)
   if win ~= -1 then
     saved_cursor = vim.api.nvim_win_get_cursor(win)
@@ -901,8 +1031,12 @@ function M.render(bufnr, state)
 
   local opts = session.opts or {}
   local rendered = profile("build_render", function()
-    return build_render(session, opts)
+    return build_render(session, opts, bufnr)
   end)
+  rendered.read_state = state
+  if state == session._meta_state and session.current_view ~= 'records' then
+    rendered.read_metadata_view = session.current_view
+  end
   session._render = rendered  -- cache for get_cell
   session._col_hl = nil       -- column-highlight memo belongs to the old render
 
@@ -927,10 +1061,29 @@ function M.render(bufnr, state)
 
   -- Restore cursor position
   if saved_cursor and win ~= -1 then
+    -- Page turns and refreshes can replace a full page with fewer rows. Keep
+    -- an existing data-cell cursor in the data range, rather than on a border
+    -- or footer that now occupies the same buffer line. Header inspection is
+    -- left alone, and an empty result never supplies a selectable data row.
+    local old_row = previous_render and saved_cursor[1] - previous_render.data_start + 1
+    if old_row and old_row >= 1 and old_row <= #previous_render.ordered and #rendered.ordered > 0 then
+      local new_row = math.min(old_row, #rendered.ordered)
+      saved_cursor[1] = rendered.data_start + new_row - 1
+      local old_positions = previous_render.byte_positions[old_row] or {}
+      local new_positions = rendered.byte_positions[new_row] or {}
+      for column, pos in pairs(old_positions) do
+        if saved_cursor[2] >= pos.start and saved_cursor[2] <= pos.finish and new_positions[column] then
+          local next_pos = new_positions[column]
+          saved_cursor[2] = next_pos.start + math.min(saved_cursor[2] - pos.start, next_pos.finish - next_pos.start)
+          break
+        end
+      end
+    end
     pcall(vim.api.nvim_win_set_cursor, win, saved_cursor)
   end
 
   if not ok then
+    rendered.read_state, rendered.read_failed = nil, true
     vim.notify("Grip: render error: " .. tostring(err), vim.log.levels.WARN)
   end
 
@@ -974,8 +1127,7 @@ function M._update_live_sql_float(session)
       st.table_name,
       data.get_updates(st),
       data.get_deletes(st),
-      data.get_inserts(st),
-      require("dadbod-grip.adapters").kind(db.resolved_url(st.url))
+      data.get_inserts(st)
     )
     content_lines = {}
     for line in (preview .. "\n"):gmatch("([^\n]*)\n") do
@@ -1061,7 +1213,7 @@ end
 -- M.get_cell(bufnr) → {row_idx, col_name, col_idx, value} | nil
 function M.get_cell(bufnr)
   local session = M._sessions[bufnr]
-  if not session or not session._render then return nil end
+  if not session or not session._render or session._render.read_failed then return nil end
 
   local r = session._render
   local st = session.state
@@ -1092,6 +1244,7 @@ function M.get_cell(bufnr)
           col_name = col,
           col_idx = i,
           value = value,
+          storage_type = data.cell_type(st, row_idx, col),
         }
       end
     end
@@ -1103,11 +1256,25 @@ function M.get_cell(bufnr)
         col_name = snap.col_name,
         col_idx  = snap.col_idx,
         value    = data.effective_value(st, row_idx, snap.col_name),
+        storage_type = data.cell_type(st, row_idx, snap.col_name),
       }
     end
   end
 
   return nil
+end
+
+--- Read context only: editing continues to use the canonical Records state.
+function M.get_display_state(bufnr)
+  return display_context(M._sessions[bufnr])
+end
+function M.get_display_cell(bufnr)
+  local state=M.get_display_state(bufnr)
+  local cell=M.get_cell(bufnr)
+  if not cell or not state then return nil end
+  cell.value=data.effective_value(state,cell.row_idx,cell.col_name)
+  cell.storage_type=data.cell_type(state,cell.row_idx,cell.col_name)
+  return cell
 end
 
 --- Pure helper: given visible columns, their byte positions, and a cursor byte offset,
@@ -1397,6 +1564,14 @@ function M.open(state, url, query_sql, opts)
     opts = opts or {},
     hidden_columns = {},
     elapsed_ms = opts and opts.elapsed_ms or nil,
+    _query_times = setmetatable(opts and opts.elapsed_ms ~= nil and { [state.rows] = opts.elapsed_ms } or {},
+      { __mode = "k" }),
+    _query_engine_times = setmetatable(opts and opts.engine_timing and { [state.rows] = opts.engine_timing } or {},
+      { __mode = "k" }),
+    _write_times = setmetatable(opts and opts.write_elapsed_ms ~= nil and { [state.rows] = opts.write_elapsed_ms } or {},
+      { __mode = "k" }),
+    _write_engine_times = setmetatable(opts and opts.write_engine_timing and { [state.rows] = opts.write_engine_timing } or {},
+      { __mode = "k" }),
     write_mode = (opts and opts.write == true) and true or false,
     pinned = false,
     query_spec = opts and opts.query_spec or nil,
@@ -1516,45 +1691,43 @@ M._json_to_lines = json_to_lines
 -- rather than iterating the row. Returns a list of strings (lines).
 -- The single formatter behind :GripExport / gX (file), gE (clipboard) and gy
 -- (markdown yank); `format` is one of csv, tsv, json, sql, markdown, grip.
--- opts.kind / opts.types: the adapter kind and { col = type }, so the SQL
--- format can write the adapter's literals (N'...', 0x... on SQL Server).
-local function format_export(rows, cols, format, table_name, opts)
+local function format_export(rows, cols, format, table_name, metadata)
+  local problem=require('dadbod-grip.provenance').export_error(metadata,format,rows,cols);assert(not problem,problem)
   local tbl = table_name or "_grip_result"
-  opts = opts or {}
 
-  if format == "csv" then
-    local lines = { table.concat(cols, ",") }
-    for _, row in ipairs(rows) do
-      local parts = {}
-      for ci = 1, #cols do
-        local v = row[ci]
-        local s = v or ""
-        if tostring(s):find('[,"\n]') then
-          s = '"' .. tostring(s):gsub('"', '""') .. '"'
-        end
-        table.insert(parts, tostring(s))
+  local function delimited(separator)
+    local function cell(value)
+      if value == nil or value == vim.NIL then return "" end
+      local text = tostring(value)
+      if text == "" or text:find(separator, 1, true) or text:find('["\r\n]') then
+        return '"' .. text:gsub('"', '""') .. '"'
       end
-      table.insert(lines, table.concat(parts, ","))
+      return text
+    end
+    local header = {}; for ci, col in ipairs(cols) do header[ci] = cell(col) end
+    local lines = { table.concat(header, separator) }
+    for _, row in ipairs(rows) do
+      local values = {}; for ci = 1, #cols do values[ci] = cell(row[ci]) end
+      lines[#lines + 1] = table.concat(values, separator)
     end
     return lines
+  end
+  if format == "csv" then
+    return delimited(",")
 
   elseif format == "json" then
     local objects = {}
     for _, row in ipairs(rows) do
       local obj_parts = {}
       for ci, col in ipairs(cols) do
-        local v = row[ci]  -- may be nil
+        local v = row[ci]; if v == vim.NIL then v = nil end  -- may be nil
         local json_val
         if v == nil then
           json_val = "null"
-        elseif tonumber(v) then
-          json_val = tostring(v)
-        elseif v == "true" or v == "false" then
-          json_val = v
         else
-          json_val = '"' .. tostring(v):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t') .. '"'
+          json_val = vim.json.encode(v)
         end
-        table.insert(obj_parts, '    "' .. col .. '": ' .. json_val)
+        table.insert(obj_parts, '    ' .. vim.json.encode(col) .. ': ' .. json_val)
       end
       table.insert(objects, "  {\n" .. table.concat(obj_parts, ",\n") .. "\n  }")
     end
@@ -1568,19 +1741,20 @@ local function format_export(rows, cols, format, table_name, opts)
   elseif format == "sql" then
     local sql_mod = require("dadbod-grip.sql")
     local col_list = table.concat(
-      vim.tbl_map(function(c) return sql_mod.quote_ident(c) end, cols), ", ")
+      vim.tbl_map(function(c) return sql_mod.quote_column(c) end, cols), ", ")
     local lines = {}
-    for _, row in ipairs(rows) do
+    for ri, row in ipairs(rows) do
       local vals = {}
       for ci = 1, #cols do
-        local v = row[ci]
-        if v == nil then
-          table.insert(vals, "NULL")
-        elseif opts.kind then
-          table.insert(vals, sql_mod.value_sql(tostring(v), opts.kind, opts.types and opts.types[cols[ci]]))
-        else
-          table.insert(vals, "'" .. esc(tostring(v)) .. "'")
-        end
+        local v = row[ci]; if v == vim.NIL then v = nil end
+        local types = metadata and metadata.cell_types and metadata.cell_types[ri]
+        local exact = metadata and metadata.cell_exact and metadata.cell_exact[ri]
+        -- SQL Server has no per-cell storage types: the column's type name
+        -- (metadata.column_types) picks N'...' or a 0x binary literal.
+        local column_type = metadata and metadata.storage_adapter == "sqlserver"
+          and metadata.column_types and metadata.column_types[cols[ci]]
+        vals[#vals+1] = sql_mod.quote_value(v,metadata and metadata.storage_adapter,
+          (types and types[ci]) or column_type or nil,exact and exact[ci])
       end
       table.insert(lines, string.format(
         "INSERT INTO %s (%s) VALUES (%s);",
@@ -1589,13 +1763,7 @@ local function format_export(rows, cols, format, table_name, opts)
     return lines
 
   elseif format == "tsv" then
-    local lines = { table.concat(cols, "\t") }
-    for _, row in ipairs(rows) do
-      local parts = {}
-      for ci = 1, #cols do table.insert(parts, row[ci] or "") end
-      table.insert(lines, table.concat(parts, "\t"))
-    end
-    return lines
+    return delimited("\t")
 
   elseif format == "markdown" then
     local function pipe_esc(s) return (tostring(s):gsub("|", "\\|")) end
@@ -1605,7 +1773,7 @@ local function format_export(rows, cols, format, table_name, opts)
     }
     for _, row in ipairs(rows) do
       local parts = {}
-      for ci = 1, #cols do table.insert(parts, pipe_esc(row[ci] or "")) end
+      for ci = 1, #cols do table.insert(parts, pipe_esc((row[ci] == nil or row[ci] == vim.NIL) and NULL_DISPLAY or row[ci])) end
       table.insert(lines, "| " .. table.concat(parts, " | ") .. " |")
     end
     return lines
@@ -1619,7 +1787,7 @@ local function format_export(rows, cols, format, table_name, opts)
     end
     for _, row in ipairs(rows) do
       for ci = 1, #cols do
-        widths[ci] = math.max(widths[ci], vim.fn.strdisplaywidth(tostring(row[ci] or "NULL")))
+        widths[ci] = math.max(widths[ci], vim.fn.strdisplaywidth(tostring((row[ci] == nil or row[ci] == vim.NIL) and NULL_DISPLAY or row[ci])))
       end
     end
     local rule_parts = {}
@@ -1639,8 +1807,8 @@ local function format_export(rows, cols, format, table_name, opts)
     for _, row in ipairs(rows) do
       local row_parts = {}
       for ci = 1, #cols do
-        local v = row[ci]
-        local display = v or "NULL"
+        local v = row[ci]; if v == vim.NIL then v = nil end
+        local display = v == nil and NULL_DISPLAY or tostring(v)
         local pad = widths[ci] - vim.fn.strdisplaywidth(display)
         if v and tonumber(v) then
           table.insert(row_parts, " " .. string.rep(" ", pad) .. display .. " ")
@@ -1660,41 +1828,29 @@ end
 -- Expose for testing
 M._format_export = format_export
 
---- A query result's rows as the grid reads them: nil for NULL, "" only for a
---- real empty string (data.effective_value), like current_export_rows.
-local function export_rows_from_result(result)
-  local st = data.new({ rows = result.rows, columns = result.columns, empty_cells = result.empty_cells })
-  local rows = {}
-  for r = 1, #st.rows do
-    local row = {}
-    for ci, col in ipairs(st.columns) do row[ci] = data.effective_value(st, r, col) end
-    rows[r] = row
-  end
-  return rows
-end
-M._export_rows_from_result = export_rows_from_result
-
---- What the SQL export needs to write SQL Server's literals; other adapters
---- keep the plain '...' export.
-local function export_opts(session, result)
-  local kind = require("dadbod-grip.adapters").kind(db.resolved_url(session.url or session.state.url))
-  if kind ~= "sqlserver" then return nil end
-  return { kind = kind, types = (result and result.column_types) or session.state.column_types }
-end
-
 local function current_export_rows(session)
   local rows = {}
-  local cols = session.state.columns or {}
+  local state, metadata_view = display_context(session)
+  local metadata = require('dadbod-grip.provenance').copy(state,true)
+  if metadata_view then
+    metadata.export_view = metadata_view
+    metadata.restorable = false -- metadata has no physical insertion target
+  end
+  metadata.cell_types,metadata.cell_exact={},{}
+  local cols = state.columns or {}
+  metadata.columns=cols -- export span only; never copy projected columns into a write plan
   local ordered = session._render and session._render.ordered
-  if not ordered then return session.state.rows or {}, cols end
+  if not ordered then return state.rows or {}, cols, metadata_view and metadata or state end
   for _, row_idx in ipairs(ordered) do
-    local row = {}
+    local row,types,exact = {},{},{}
     for ci, col in ipairs(cols) do
-      row[ci] = data.effective_value(session.state, row_idx, col)
+      row[ci] = data.effective_value(state, row_idx, col)
+      types[ci],exact[ci] = data.cell_type(state,row_idx,col),data.cell_exact(state,row_idx,col)
     end
     rows[#rows + 1] = row
+    metadata.cell_types[#rows],metadata.cell_exact[#rows] = types,exact
   end
-  return rows, cols
+  return rows, cols, metadata
 end
 
 local function matching_count(session)
@@ -1706,12 +1862,33 @@ local function matching_count(session)
 end
 
 --- Prompt for page/all scope before any format prompt, then provide the rows.
-local function request_export_rows(session, destination, callback)
+local function request_export_rows(session, destination, callback, bufnr)
+  local requested_state, requested_view = display_context(session)
+  if not requested_state then
+    vim.notify('Export failed: visible metadata/result snapshot is unavailable', vim.log.levels.ERROR)
+    return
+  end
+  local metadata_view = requested_view ~= nil
+  local function current()
+    local active_state, active_view = display_context(session)
+    if (bufnr and M._sessions[bufnr] ~= session)
+        or active_view ~= requested_view or active_state ~= requested_state then
+      vim.notify('Export canceled: the visible result changed; choose the export scope again', vim.log.levels.WARN)
+      return false
+    end
+    return true
+  end
   vim.ui.select({ "Current page", "All matching rows" }, { prompt = "Export scope:" }, function(scope)
     if not scope then return end
+    if not current() then return end
 
-    local rows, cols, count
-    if scope == "All matching rows" then
+    local rows, cols, count, metadata
+    if metadata_view then
+      -- Metadata views are fully fetched, not pages of the records query.
+      -- Both choices export the shown metadata snapshot without re-querying records.
+      rows, cols, metadata = current_export_rows(session)
+      count = #rows
+    elseif scope == "All matching rows" then
       local count_err
       count, count_err = matching_count(session)
       if count == nil then
@@ -1737,8 +1914,8 @@ local function request_export_rows(session, destination, callback)
         vim.notify("Export failed: " .. tostring(err or "query failed"), vim.log.levels.ERROR)
         return
       end
-      rows, cols = export_rows_from_result(result), result.columns or session.state.columns or {}
-      session._export_result = result
+      rows, cols = result.rows or {}, result.columns or session.state.columns or {}
+      metadata = result
       local fetched_count = #rows
       if destination == "clipboard" and fetched_count > 100000 then
         vim.notify("Clipboard export is limited to 100,000 rows; export to a file instead",
@@ -1749,7 +1926,7 @@ local function request_export_rows(session, destination, callback)
           "Export %d matching rows? (y/N): ", fetched_count)) then return end
       count = fetched_count
     else
-      rows, cols = current_export_rows(session)
+      rows, cols, metadata = current_export_rows(session)
       count = #rows
       if destination == "clipboard" and count > 100000 then
         vim.notify("Clipboard export is limited to 100,000 rows; export to a file instead",
@@ -1764,15 +1941,15 @@ local function request_export_rows(session, destination, callback)
       vim.notify("No rows to export", vim.log.levels.WARN)
       return
     end
-    local result = scope == "All matching rows" and session._export_result or nil
-    session._export_result = nil
-    callback(rows, cols, scope, export_opts(session, result))
+    callback(rows, cols, scope, metadata, current)
   end)
 end
 
 --- Stream an export to a same-directory temporary file, then atomically rename
 --- it into place. Any formatter/write/rename failure removes only the temp file.
-local function write_export_file(rows, cols, format, table_name, path, opts)
+local function write_export_file(rows, cols, format, table_name, path, metadata)
+  local problem=require('dadbod-grip.provenance').export_error(metadata,format,rows,cols)
+  if problem then return nil,problem end -- validate even an empty stream, before creating a file
   local temp = string.format("%s.grip-tmp-%d-%d", path, vim.fn.getpid(), vim.uv.hrtime())
   local file, open_err = io.open(temp, "wb")
   if not file then return nil, open_err end
@@ -1789,8 +1966,19 @@ local function write_export_file(rows, cols, format, table_name, path, opts)
     local first_batch = true
     for start = 1, #rows, batch_size do
       local batch = {}
-      for i = start, math.min(start + batch_size - 1, #rows) do batch[#batch + 1] = rows[i] end
-      local lines = format_export(batch, cols, format, table_name, opts)
+      local batch_meta = metadata and require('dadbod-grip.provenance').copy(metadata,true)
+      if batch_meta then
+        batch_meta.columns=cols -- retain positions even when all type/proof vectors are absent
+        batch_meta.cell_types,batch_meta.cell_exact={},{}
+      end
+      for i = start, math.min(start + batch_size - 1, #rows) do
+        batch[#batch + 1] = rows[i]
+        if batch_meta then
+          batch_meta.cell_types[#batch]=metadata.cell_types and metadata.cell_types[i]
+          batch_meta.cell_exact[#batch]=metadata.cell_exact and metadata.cell_exact[i]
+        end
+      end
+      local lines = format_export(batch, cols, format, table_name, batch_meta)
       if format == "csv" and not first_batch then table.remove(lines, 1) end
       if format == "json" then
         table.remove(lines, 1)
@@ -1827,21 +2015,23 @@ function M.export_to_clipboard(bufnr)
     vim.notify("No grip result to export", vim.log.levels.WARN)
     return
   end
-  request_export_rows(session, "clipboard", function(rows, cols, _, opts)
+  request_export_rows(session, "clipboard", function(rows, cols, _, metadata, current)
     local formats = { "CSV", "TSV", "JSON", "SQL INSERT", "Markdown", "Grip Table" }
     vim.ui.select(formats, { prompt = "Export format:" }, function(choice)
       if not choice then return end
+      if not current() then return end
       local ids = {
         ["CSV"] = "csv", ["TSV"] = "tsv", ["JSON"] = "json",
         ["SQL INSERT"] = "sql", ["Markdown"] = "markdown", ["Grip Table"] = "grip",
       }
-      local output = table.concat(format_export(
-        rows, cols, ids[choice], session.state.table_name or "table_name", opts), "\n")
+      local problem=require('dadbod-grip.provenance').export_error(metadata,ids[choice],rows,cols)
+      if problem then vim.notify(problem,vim.log.levels.ERROR);return end
+      local output = table.concat(format_export(rows,cols,ids[choice],session.state.table_name or 'table_name',metadata),'\n')
       vim.fn.setreg("+", output)
       vim.notify(string.format("Exported %d rows as %s to clipboard", #rows, choice),
         vim.log.levels.INFO)
     end)
-  end)
+  end, bufnr)
 end
 
 --- Export a page or all matching rows to a file.
@@ -1853,16 +2043,22 @@ function M.do_export(bufnr)
     return
   end
 
-  request_export_rows(session, "file", function(rows, cols, _, opts)
+  request_export_rows(session, "file", function(rows, cols, _, metadata, current)
     -- Scope is intentionally chosen before format.
     local fmt = ui.input({ prompt = "Export format [csv/json/sql]: " })
     if not fmt then return end
+    if not current() then return end
     fmt = fmt:lower()
     if fmt ~= "csv" and fmt ~= "json" and fmt ~= "sql" then
       vim.notify("Unknown format: " .. fmt .. " (use csv, json, or sql)", vim.log.levels.ERROR)
       return
     end
 
+    local problem = require('dadbod-grip.provenance').export_error(metadata, fmt, rows, cols)
+    if problem then
+      vim.notify('Export failed: ' .. problem, vim.log.levels.ERROR)
+      return
+    end
     local ext = fmt == "sql" and "sql" or fmt
     local path = ui.input({
       prompt = "Save to: ",
@@ -1870,15 +2066,16 @@ function M.do_export(bufnr)
       completion = "file",
     })
     if not path then return end
+    if not current() then return end
 
     local ok, err = write_export_file(
-      rows, cols, fmt, session.query_spec and session.query_spec.table_name, path, opts)
+      rows, cols, fmt, session.query_spec and session.query_spec.table_name, path, metadata)
     if ok then
       vim.notify(string.format("Exported %d rows → %s", #rows, path), vim.log.levels.INFO)
     else
       vim.notify("Export failed: " .. tostring(err), vim.log.levels.ERROR)
     end
-  end)
+  end, bufnr)
 end
 
 -- ── focused info float helper ────────────────────────────────────────────
@@ -1951,7 +2148,7 @@ local function make_meta_state(table_name, columns, rows)
 end
 
 -- Update the buffer name to reflect the current view.
-local function update_buf_name(bufnr, table_name, view_name)
+local function update_buf_name(bufnr, table_name, view_name, unique)
   local base = table_name or "result"
   local name
   if view_name and view_name ~= "records" then
@@ -1963,7 +2160,26 @@ local function update_buf_name(bufnr, table_name, view_name)
   else
     name = "grip://" .. base
   end
+  if unique then
+    local other = vim.fn.bufnr(name)
+    if other ~= -1 and other ~= bufnr then name = name .. "#" .. bufnr end
+  end
   pcall(vim.api.nvim_buf_set_name, bufnr, name)
+end
+
+-- A successful Records refresh replaces any metadata result currently shown.
+-- Its identity and canonical payload must move with the already-fetched rows.
+function M.render_records(bufnr, state)
+  local session = M._sessions[bufnr]
+  if not session then return end
+  local leaving_metadata = session.current_view and session.current_view ~= "records"
+  session.current_view = "records"
+  session._meta_state = nil
+  session._records_state = state
+  M.render(bufnr, state)
+  if leaving_metadata and M._sessions[bufnr] == session then
+    update_buf_name(bufnr, state.table_name, nil, true)
+  end
 end
 
 -- Per-view data fetchers. Each returns (columns, rows, err).
@@ -2149,7 +2365,9 @@ function M.switch_view(bufnr, view_name)
       indexes = "Indexes", constraints = "Constraints", stats = "Stats", explain = "Explain",
     }
     local label = full_labels[view_name] or view_name
-    vim.notify("Already on " .. label .. " · press 2 for Records", vim.log.levels.INFO)
+    local records_key = require("dadbod-grip.keymaps").get("tab_3")
+    local hint = records_key and (" · press " .. records_key .. " for Records") or ""
+    vim.notify("Already on " .. label .. hint, vim.log.levels.INFO)
     return
   end
 
@@ -2450,7 +2668,7 @@ end
 function M._column_set(bufnr)
   local session = M._sessions[bufnr]
   if not session or not session._render then return end
-  if not is_editable(session) then
+  if not displayed_is_editable(session) then
     vim.notify("Read-only: no primary key detected", vim.log.levels.INFO)
     return
   end
@@ -2599,6 +2817,10 @@ local function make_keymap_ctx(bufnr)
   -- sections live in their own modules. Named for its subject: it answers for
   -- ctx.session(), not for whatever session the caller happens to be holding.
   function ctx.session_is_editable()
+    return displayed_is_editable(M._sessions[bufnr])
+  end
+  -- Apply targets already staged canonical Records, not the displayed facet.
+  function ctx.session_can_apply()
     return is_editable(M._sessions[bufnr])
   end
 
@@ -2708,280 +2930,88 @@ function M._setup_keymaps(bufnr)
 end
 
 --- Open the full help popup. Called from grid, query pad, and schema sidebar.
---- opts.readonly = true → show read-only notice instead of editing section.
+--- opts.readonly = true adds a read-only notice; opts.surface selects sidebar help.
 function M.show_help(opts)
   opts = opts or {}
   local grip_win = vim.api.nvim_get_current_win()
   local ro = opts.readonly
-  local help = {
-      "",
-      "    D   ███████╗███████╗██╗███████╗",
-      "    A  ██╔═════╝██╔══██║██║██╔══██║",
-      "    D  ██║  ███╗██████╔╝██║███████║",
-      "    b  ██║   ██║██╔══██╗██║██╔════╝",
-      "    o  ╚██████╔╝██║  ██║██║██║",
-      "    d   ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝",
-      "",
-      " ───────────────────────────────────────────",
-      "",
-      "  Navigation",
-      "  j/k       Move between rows",
-      "  h/l       Move cursor within row",
-      "  w/b       Next / previous column",
-      "  Tab/S-Tab Next / previous column",
-      "  gg        First data row",
-      "  G         Last data row",
-      "  0/^       First column",
-      "  -         Hide column under cursor",
-      "  g-        Restore all hidden columns",
-      "  gH        Column visibility picker",
-      "  =         Cycle column width: compact → expanded → reset",
-      "  $         Last column",
-      "  e         Next column, land at end of cell",
-      "  {/}       Prev / next modified row",
-      "  <CR> / i  Edit cell under cursor (JSON cells: pretty-printed in editor)",
-      "  gB        Open cell value in split buffer (JSON: ft=json; :w stages)",
-      "  gU        Set current column across all visible rows",
-      "  K         Row view (vertical transpose; JSON cells auto-expanded)",
-      "  gK        JSON tree drilldown (expand/collapse keys, yank value or JSONPath)",
-      "  y         Yank cell value to clipboard",
-      "  Y         Yank row as CSV",
-      "  gY        Yank entire table as CSV",
-      "  gy        Yank table as Markdown pipe table",
-      "",
-      "  Sort / Filter / Pagination",
-      "  s         Toggle sort on column (ASC→DESC→off)",
-      "  S         Stack sort on column (stackable: press S on multiple cols for ▲1 ▼2 ▲3)",
-      "  f         Quick filter by cell value",
-      "  gn        Filter: column IS NULL",
-      "  gF        Filter builder (=, !=, >, <, LIKE, IN, BETWEEN, NULL, NOT NULL)",
-      "  <C-f>     Freeform WHERE clause filter",
-      "            ↳ e.g.: status = 'active'",
-      "            ↳ e.g.: created_at > '2024-01-01' AND amount > 100",
-      "            ↳ e.g.: name ILIKE '%alice%'",
-      "            ↳ F clears all filters",
-      "  F         Clear all filters",
-      "  gp        Load saved filter preset",
-      "  gP        Save current filter as preset",
-      "  X         Reset view (clear sort/filter/page)",
-      "  L / H     Next / previous page",
-      "  ]p / [p   Next / previous page (bracket alias)",
-      "  ]P / [P   Last / first page",
-      "",
-      "  FK Navigation",
-      "  gf        Follow foreign key under cursor",
-      "  gm        Open rows that reference the current row",
-      "  <C-o>     Go back in FK navigation stack",
-      "",
-      "  Analysis & Export",
-      "  ga        Aggregate selected cells (visual mode)",
-      "  gS        Column statistics popup",
-      "  gR        Table profile (sparkline distributions)",
-      "  gV        Show CREATE TABLE DDL",
-      "  gQ        Explain current query plan",
-      "  gx        Open URL in current cell (http/https/ftp)",
-      "  gD        Diff against another table",
-      "  gE        Export to clipboard (CSV, TSV, JSON, SQL, Markdown, Grip Table)",
-      "  gX        Export to file (csv/json/sql)  :GripExport",
-      "",
-      "  Tab Views (1-9)",
-      "  Surface navigation (press again = secondary action):",
-      "  1         Schema sidebar  (again: connections picker)",
-      "  2         Query pad       (again: query history)",
-      "  3         Grid / records  (again: table picker)",
-      "  Depth views (consistent across grid, sidebar, query pad):",
-      "  4         ER diagram: all tables and FK relationships",
-      "  5         Column Stats: count, nulls%, distinct, min, max",
-      "  6         Columns: name, type, nullable, default, key",
-      "  7         Foreign Keys: outbound and inbound",
-      "  8         Indexes: name, type, columns covered",
-      "  9         Constraints: CHECK, UNIQUE, NOT NULL",
-      "  (explain query plan: gQ)",
-      "",
-      "  Schema & Workflow",
-      "  go/gT/gt  Pick table (floating picker)",
-      "  gb        Schema browser (toggle/focus)",
-      "  gG        ER diagram: focus current table neighborhood",
-      "            ↳ <CR> on a table header to open that table",
-      "            ↳ press gG again from the grid to return to the map",
-      "  gO        Open as editable table (read-only → table)",
-      "  gC/<C-g>  Switch database connection",
-      "  gW        Toggle watch mode (auto-refresh on timer)",
-      "  gL        Pin / unpin result (pinned: survives next query execution)",
-      "  gJ        Result switcher (all open results, pick to focus)",
-      "  g!        Toggle write mode (apply overwrites file)",
-      "  Q         Welcome screen (home)",
-      "  q         Open query pad",
-      "  gq        Load saved query",
-      "  gh        Query history browser",
-      "  A         AI SQL generation",
-      "  gA        AI row fill: stage 1 generated row  :GripFill N for more",
-      "            ↳ context: schema DDL for <=30 tables (cols, types, PKs, FKs)",
-      "            ↳ provider: ANTHROPIC_API_KEY -> OPENAI -> GEMINI -> Ollama",
-      "            ↳ disable: setup({ ai = false }) skips schema pre-warm",
-      "  :GripAttach  Attach external DB to DuckDB session",
-      "  :GripDetach  Detach attached database",
-      "  :GripOpen    Open file/HTTPS/s3:// without saving to connections",
-      "",
-      "  Actions",
-      "  r         Refresh (re-run query)",
-      "  :q        Close grip buffer",
-      "  ?         Toggle this help",
-    }
-    if ro then
-      vim.list_extend(help, {
-        "",
-        " ┌─ Read-Only Mode ────────────────────────┐",
-        " │ This table has no primary key detected.  │",
-        " │ Grip needs a PK to build WHERE clauses   │",
-        " │ for UPDATE and DELETE statements.         │",
-        " │ Without a PK, edits cannot target a      │",
-        " │ specific row safely.                      │",
-        " └──────────────────────────────────────────┘",
-        "",
-        "  Connections",
-        "  gc / gC     connection picker (* ok  o unknown  x fail)",
-        "  T           retest file connection health (in picker)",
-        "  s           save local file as named connection (in picker)",
-        "  Softrear Inc. Analyst Portal\xe2\x84\xa2",
-        "  :GripStart   Built-in case file (see docs/softrear-internal.md)",
-        "",
-        " ───────────────────────────────────────────",
-        "",
-        "  ╔═╦═╦═╗",
-        '  ║d║b║g║  dadbod-grip v' .. VERSION,
-        "  ╚═╩═╩═╝",
-        "  docs: jorypestorious.com/dadbod-grip-web",
-      })
+  local name = vim.api.nvim_buf_get_name(0)
+  local surface = opts.surface or (name == "grip://query" and "query_pad")
+    or (name == "grip://welcome" and "welcome") or "grid"
+  local help = require("dadbod-grip.keymaps").help_lines(surface, math.max(32, vim.o.columns - 12))
+  if ro then
+    table.insert(help, 6, "  Read-only: editing requires a writable table with a primary key.")
+  end
+  local max_w = 0
+  for _, line in ipairs(help) do max_w = math.max(max_w, vim.fn.strdisplaywidth(line)) end
+  max_w = math.max(max_w + 2, 46)
+  local popup_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, help)
+  -- Help highlights: logo, section headers, keymap keys, and separators.
+  local ns_h = vim.api.nvim_create_namespace("grip_help_hl")
+  local function hadd(ln, group, s, e)
+    -- Missing or negative end column means "to the end of the line": add_highlight
+    -- took col_end = -1 for that, set_extmark wants end_row = ln + 1 / end_col = 0.
+    local ext = { hl_group = group }
+    if e and e >= 0 then ext.end_col = e else ext.end_row, ext.end_col = ln + 1, 0 end
+    vim.api.nvim_buf_set_extmark(popup_buf, ns_h, ln, s or 0, ext)
+  end
+  for i, line in ipairs(help) do
+    local ln = i - 1
+    if    line:match("^    %a") then                                           hadd(ln, "Special")
+    elseif line:find("╔═╦") or line:find("║d║") or line:find("╚═╩") then     hadd(ln, "Special")
+    elseif line:match("^%s+[─═]") then hadd(ln, "Comment")
+    elseif line:find("\xe2\x86\xb3") then hadd(ln, "Comment")   -- ↳ continuation
+    elseif line:find("Colors:")    then hadd(ln, "Comment")
+    elseif line:find("Softrear Inc. Analyst Portal", 1, true) then hadd(ln, "Special")
+    elseif line:find(":GripStart", 1, true) then
+      local s, e = line:find(":GripStart")
+      if s then hadd(ln, "Statement", s - 1, e) end
+      if e then hadd(ln, "Comment",   e, -1) end
+    elseif line:match("^  %S") and not line:find("%s%s", 3) then  hadd(ln, "Title")
+    elseif line:match("^  %S") then
+      local key_end = line:find("%s%s", 3)
+      if key_end then hadd(ln, "Identifier", 2, key_end - 1) end
+    end
+  end
+  local win = ui.info_float({
+    buf = popup_buf,
+    width = max_w,
+    height = #help,
+    title = " Help ",
+    title_pos = "center",
+    zindex = 50,
+  })
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+  end
+
+  vim.api.nvim_create_autocmd("WinLeave", {
+    group  = _ag,
+    buffer = popup_buf,
+    once = true,
+    callback = function() vim.schedule(close) end,
+  })
+
+  for _, key in ipairs({ "q", "?", "<Esc>" }) do
+    vim.keymap.set("n", key, function()
+      close()
+      if vim.api.nvim_win_is_valid(grip_win) then
+        vim.api.nvim_set_current_win(grip_win)
+      end
+    end, { buffer = popup_buf })
+  end
+
+  vim.keymap.set("n", "gx", function()
+    local url = "https://jorypestorious.com/dadbod-grip-web"
+    if vim.ui.open then
+      vim.ui.open(url)
+    elseif vim.fn.has("mac") == 1 then
+      vim.fn.jobstart({ "open", url }, { detach = true })
     else
-      vim.list_extend(help, {
-        "",
-        "  Editing",
-        "  <CR> / i  Edit cell under cursor",
-        "  gB        Open cell value in split buffer (:w stages the change)",
-        "  x         Set cell to NULL",
-        "  p         Paste clipboard into cell",
-        "  P         Paste multi-line into rows",
-        "  o         Insert new row after cursor",
-        "  c         Clone row (copy values, clear PKs)",
-        "  d         Toggle delete on current row",
-        "  u         Undo last edit (multi-level)",
-        "  <C-r>     Redo",
-        "  U         Undo all (reset to original)",
-        "  a         Apply all staged changes to DB",
-        "",
-        "  Batch Edit (visual mode)",
-        "  e         Set selected cells to same value",
-        "  d         Toggle delete on selected rows",
-        "  x         Set selected cells to NULL",
-        "  y         Yank selected cells in column",
-        "  gd        Diff exactly 2 rows (highlights differing cells)",
-        "  K         Stack selected rows in one float (vertical inspect)",
-        "",
-        "  Inspection",
-        "  gs        Preview staged SQL",
-        "  gc        Copy staged SQL to clipboard",
-        "  gi        Table info (columns, types, PKs)",
-        "  gI        Table properties (full detail)",
-        "  gN        Rename column under cursor",
-        "  ge        Explain cell under cursor",
-        "",
-        "  Advanced",
-        "  gl        Toggle live SQL preview",
-        "  T         Toggle column type annotations",
-        "",
-        "  Colors: modified=violet  deleted=red  inserted=green",
-        "          negative=red  true=green  false=red",
-        "          past-date=dim  url=underline",
-        "",
-        "  Connections",
-        "  gc / gC     connection picker (* ok  o unknown  x fail)",
-        "  T           retest file connection health (in picker)",
-        "  s           save local file as named connection (in picker)",
-        "  Softrear Inc. Analyst Portal\xe2\x84\xa2",
-        "  :GripStart   Built-in case file (see docs/softrear-internal.md)",
-        "",
-        " ───────────────────────────────────────────",
-        "",
-        "  ╔═╦═╦═╗",
-        '  ║d║b║g║  dadbod-grip v' .. VERSION,
-        "  ╚═╩═╩═╝",
-        "  docs: jorypestorious.com/dadbod-grip-web",
-      })
+      vim.fn.jobstart({ "xdg-open", url }, { detach = true })
     end
-    local max_w = 0
-    for _, line in ipairs(help) do max_w = math.max(max_w, #line) end
-    max_w = math.max(max_w + 2, 46)
-    local popup_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(popup_buf, 0, -1, false, help)
-    -- Full help highlights: logo, section headers, keymap keys, separators, RO box, portal
-    local ns_h = vim.api.nvim_create_namespace("grip_help_hl")
-    local function hadd(ln, group, s, e)
-      -- Missing or negative end column means "to the end of the line": add_highlight
-      -- took col_end = -1 for that, set_extmark wants end_row = ln + 1 / end_col = 0.
-      local ext = { hl_group = group }
-      if e and e >= 0 then ext.end_col = e else ext.end_row, ext.end_col = ln + 1, 0 end
-      vim.api.nvim_buf_set_extmark(popup_buf, ns_h, ln, s or 0, ext)
-    end
-    local in_ro_box = false
-    for i, line in ipairs(help) do
-      local ln = i - 1
-      if    line:match("^    %a") then                                           hadd(ln, "Special")
-      elseif line:find("╔═╦") or line:find("║d║") or line:find("╚═╩") then     hadd(ln, "Special")
-      elseif line:find("┌─") then    in_ro_box = true;  hadd(ln, "DiagnosticWarn")
-      elseif in_ro_box then          hadd(ln, "DiagnosticWarn"); if line:find("└──") then in_ro_box = false end
-      elseif line:match("^%s+[─═]") then hadd(ln, "Comment")
-      elseif line:find("\xe2\x86\xb3") then hadd(ln, "Comment")   -- ↳ continuation
-      elseif line:find("Colors:")    then hadd(ln, "Comment")
-      elseif line:find("Softrear Inc. Analyst Portal", 1, true) then hadd(ln, "Special")
-      elseif line:find(":GripStart", 1, true) then
-        local s, e = line:find(":GripStart")
-        if s then hadd(ln, "Statement", s - 1, e) end
-        if e then hadd(ln, "Comment",   e, -1) end
-      elseif line:match("^  %S") and not line:find("%s%s", 3) then  hadd(ln, "Title")
-      elseif line:match("^  %S") then
-        local key_end = line:find("%s%s", 3)
-        if key_end then hadd(ln, "Identifier", 2, key_end - 1) end
-      end
-    end
-    local win = ui.info_float({
-      buf = popup_buf,
-      width = max_w,
-      height = #help,
-      title = " Help ",
-      title_pos = "center",
-      zindex = 50,
-    })
-    local function close()
-      if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
-    end
-
-    vim.api.nvim_create_autocmd("WinLeave", {
-      group  = _ag,
-      buffer = popup_buf,
-      once = true,
-      callback = function() vim.schedule(close) end,
-    })
-
-    for _, key in ipairs({ "q", "?", "<Esc>" }) do
-      vim.keymap.set("n", key, function()
-        close()
-        if vim.api.nvim_win_is_valid(grip_win) then
-          vim.api.nvim_set_current_win(grip_win)
-        end
-      end, { buffer = popup_buf })
-    end
-
-    vim.keymap.set("n", "gx", function()
-      local url = "https://jorypestorious.com/dadbod-grip-web"
-      if vim.ui.open then
-        vim.ui.open(url)
-      elseif vim.fn.has("mac") == 1 then
-        vim.fn.jobstart({ "open", url }, { detach = true })
-      else
-        vim.fn.jobstart({ "xdg-open", url }, { detach = true })
-      end
-    end, { buffer = popup_buf, desc = "Open docs" })
+  end, { buffer = popup_buf, desc = "Open docs" })
 end
 
 -- Register callbacks for edit/delete/insert/apply/refresh from init.

@@ -8,6 +8,13 @@ local ui       = require("dadbod-grip.ui")
 
 local M = {}
 
+-- A confirmed DDL wait can dispatch navigation before its callback returns.
+local function current_owner()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local session = require("dadbod-grip.view")._sessions[bufnr]
+  return session and require("dadbod-grip.write").capture_owner(bufnr, session)
+end
+
 -- CLI adapters whose DROP TABLE actually understands CASCADE. sqlite rejects
 -- it as a syntax error; mysql parses but silently ignores it (misleading);
 -- sqlserver has no such clause at all.
@@ -235,6 +242,7 @@ local function build_rename_column_sql(table_name, old_name, new_name, adapter_k
 end
 
 function M.rename_column(table_name, old_name, url, on_done)
+  local is_current = current_owner()
   local new_name = ui.input({ prompt = "Rename '" .. old_name .. "' to: " })
   if not new_name or new_name == old_name then return end
 
@@ -242,13 +250,13 @@ function M.rename_column(table_name, old_name, url, on_done)
   local ddl_sql = build_rename_column_sql(table_name, old_name, new_name, adapter_kind)
 
   confirm_ddl("Rename Column", ddl_sql, function()
-    local _, err = db.execute(ddl_sql, url)
+    local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "DDL")
     if err then
-      vim.notify("Rename failed: " .. err, vim.log.levels.ERROR)
+      vim.notify((unknown and "" or "Rename failed: ") .. err, vim.log.levels.ERROR)
       return
     end
     vim.notify("Renamed " .. old_name .. " to " .. new_name, vim.log.levels.INFO)
-    if on_done then on_done() end
+    if on_done and (not is_current or is_current()) then on_done() end
   end)
 end
 
@@ -267,6 +275,7 @@ local function build_rename_table_sql(old_name, new_name, adapter_kind)
 end
 
 function M.rename_table(old_name, url, on_done)
+  local is_current = current_owner()
   local new_name = ui.input({ prompt = "Rename table '" .. old_name .. "' to: " })
   if not new_name or new_name == old_name then return end
 
@@ -274,13 +283,13 @@ function M.rename_table(old_name, url, on_done)
   local ddl_sql = build_rename_table_sql(old_name, new_name, adapter_kind)
 
   confirm_ddl("Rename Table", ddl_sql, function()
-    local _, err = db.execute(ddl_sql, url)
+    local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "DDL")
     if err then
-      vim.notify("Rename failed: " .. err, vim.log.levels.ERROR)
+      vim.notify((unknown and "" or "Rename failed: ") .. err, vim.log.levels.ERROR)
       return
     end
     vim.notify("Renamed table '" .. old_name .. "' → '" .. new_name .. "'", vim.log.levels.INFO)
-    if on_done then on_done(new_name) end
+    if on_done and (not is_current or is_current()) then on_done(new_name) end
   end)
 end
 
@@ -298,6 +307,7 @@ local function build_add_column_sql(table_name, col_name, col_type, default_val,
 end
 
 function M.add_column(table_name, url, on_done)
+  local is_current = current_owner()
   local col_name = ui.input({ prompt = "Column name: " })
   if not col_name then return end
 
@@ -312,19 +322,20 @@ function M.add_column(table_name, url, on_done)
   local ddl_sql = build_add_column_sql(table_name, col_name, col_type, default_val, adapter_kind)
 
   confirm_ddl("Add Column", ddl_sql, function()
-    local _, err = db.execute(ddl_sql, url)
+    local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "DDL")
     if err then
-      vim.notify("Add column failed: " .. err, vim.log.levels.ERROR)
+      vim.notify((unknown and "" or "Add column failed: ") .. err, vim.log.levels.ERROR)
       return
     end
     vim.notify("Added column " .. col_name, vim.log.levels.INFO)
-    if on_done then on_done() end
+    if on_done and (not is_current or is_current()) then on_done() end
   end)
 end
 
 -- ── column drop ─────────────────────────────────────────────────────────────
 
 function M.drop_column(table_name, col_name, url, on_done)
+  local is_current = current_owner()
   local ddl_sql = string.format(
     'ALTER TABLE %s DROP COLUMN %s',
     sql.quote_ident(table_name),
@@ -332,13 +343,13 @@ function M.drop_column(table_name, col_name, url, on_done)
   )
 
   destructive_confirm("DROP COLUMN", ddl_sql, col_name, function()
-    local _, err = db.execute(ddl_sql, url)
+    local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "DDL")
     if err then
-      vim.notify("Drop column failed: " .. err, vim.log.levels.ERROR)
+      vim.notify((unknown and "" or "Drop column failed: ") .. err, vim.log.levels.ERROR)
       return
     end
     vim.notify("Dropped column " .. col_name, vim.log.levels.INFO)
-    if on_done then on_done() end
+    if on_done and (not is_current or is_current()) then on_done() end
   end)
 end
 
@@ -355,6 +366,7 @@ local function build_drop_sql(table_name, kind, has_referencing)
 end
 
 function M.drop_table(table_name, url, on_done)
+  local is_current = current_owner()
   -- Dialect decisions need the real scheme, so a "${DATABASE_URL}" template
   -- has to be resolved first: a nil kind would silently drop CASCADE from the
   -- generated SQL, discard every schema-qualified FK dependent below, and
@@ -381,19 +393,20 @@ function M.drop_table(table_name, url, on_done)
   end
 
   destructive_confirm("DROP TABLE", ddl_sql, table_name, function()
-    local _, err = db.execute(ddl_sql, url)
+    local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "DDL")
     if err then
-      vim.notify("Drop table failed: " .. err, vim.log.levels.ERROR)
+      vim.notify((unknown and "" or "Drop table failed: ") .. err, vim.log.levels.ERROR)
       return
     end
     vim.notify("Dropped table " .. table_name, vim.log.levels.INFO)
-    if on_done then on_done() end
+    if on_done and (not is_current or is_current()) then on_done() end
   end, note)
 end
 
 -- ── create table ────────────────────────────────────────────────────────────
 
 local function build_create_sql(table_name, columns, url, on_done)
+  local is_current = current_owner()
   local col_defs = {}
   local pk_cols = {}
 
@@ -416,13 +429,13 @@ local function build_create_sql(table_name, columns, url, on_done)
   )
 
   confirm_ddl("Create Table", ddl_sql, function()
-    local _, err = db.execute(ddl_sql, url)
+    local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "DDL")
     if err then
-      vim.notify("Create table failed: " .. err, vim.log.levels.ERROR)
+      vim.notify((unknown and "" or "Create table failed: ") .. err, vim.log.levels.ERROR)
       return
     end
     vim.notify("Created table " .. table_name, vim.log.levels.INFO)
-    if on_done then on_done() end
+    if on_done and (not is_current or is_current()) then on_done() end
   end)
 end
 

@@ -71,6 +71,7 @@ local function _build_actions()
   local raw = {
 
     -- ── Navigation (all surfaces) ──────────────────────────────────────────
+    act("[nav]      Zoom pane / restore",     k("zoom"),             "Maximize the current split or restore its previous layout", { "all" }),
     act("[nav]      Switch connection",      k("connections"),      "Pick a database connection",                { "all" }),
     act("[nav]      ER diagram",             k("er_diagram"),       "Show entity-relationship diagram float",    { "all" }),
     act("[nav]      Table picker",           k("table_picker"),     "Pick a table to open in the grid",          { "all" }),
@@ -80,7 +81,7 @@ local function _build_actions()
 
     -- ── Query pad ─────────────────────────────────────────────────────────
     act("[query]    Open query pad",         k("query_pad"),        "Open query editor (pre-filled with current SQL)",             { "grid", "sidebar" }),
-    act("[query]    Execute SQL",            k("qpad_execute"),     "Run the full query buffer",                                   { "query" }),
+    act("[query]    Execute SQL",            k("qpad_execute"),     "Run the cursor's SQL block or selected lines",                 { "query" }),
     act("[query]    Save query",             k("qpad_save"),        "Save current buffer as a named query",                        { "query" }),
     act("[query]    AI SQL generation",      k("qpad_ai"),          "Generate SQL from a plain-English description",               { "query" }),
     act("[query]    Jump to grid",           k("goto_grid"),        "Focus the grid window",                                       { "query" }),

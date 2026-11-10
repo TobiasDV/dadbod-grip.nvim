@@ -23,6 +23,7 @@ local function add(category, surfaces, modes, entries, requires)
 end
 
 local all = { "grid", "query_pad", "sidebar" }
+local main = { "grid", "query_pad", "sidebar", "welcome" }
 local grid = { "grid" }
 local query_pad = { "query_pad" }
 local sidebar = { "sidebar" }
@@ -32,10 +33,6 @@ local visual = { "x" }
 
 add("navigation", all, normal, {
   { "palette", "<C-p>", "Opens the searchable command palette." },
-  { "help", "?", "Opens the keymap help." },
-  { "er_diagram", "gG", "Opens the entity-relationship diagram." },
-  { "connections", "gC", "Opens the connection picker." },
-  { "connections_alt", "<C-g>", "Opens the connection picker with its alternate key." },
   { "table_picker", "gT", "Opens the table picker." },
   { "table_picker_alt", "gt", "Opens the table picker with its alternate key." },
   { "query_history", "gh", "Opens the query history." },
@@ -43,16 +40,37 @@ add("navigation", all, normal, {
   { "welcome", "Q", "Returns to the welcome screen." },
 })
 
+add("navigation", main, normal, {
+  { "help", "?", "Opens the keymap help." },
+  { "er_diagram", "gG", "Opens the entity-relationship diagram." },
+  { "connections", "gC", "Opens the connection picker." },
+  { "connections_alt", "<C-g>", "Opens the connection picker with its alternate key." },
+})
+
+add("welcome", { "welcome" }, normal, {
+  { "welcome_activate", "<CR>", "Runs the selected welcome action." },
+  { "welcome_next", "<Tab>", "Selects the next welcome action." },
+  { "welcome_prev", "<S-Tab>", "Selects the previous welcome action." },
+  { "welcome_close", "q", "Closes the welcome screen." },
+  { "welcome_close_esc", "<Esc>", "Closes the welcome screen with Escape." },
+  { "welcome_connect", "gc", "Opens the connection picker from welcome." },
+  { "welcome_secret", ";", "Shows Chonk's hidden welcome cameo." },
+})
+
 add("navigation", { "grid", "sidebar" }, normal, {
   { "query_pad", "q", "Opens or focuses the query pad." },
 })
 
-add("ai", grid, normal, {
-  { "ai", "A", "Generates SQL from the grid with the configured AI provider." },
+add("ai", { "grid", "welcome" }, normal, {
+  { "ai", "A", "Generates SQL with the configured AI provider." },
 })
 
-add("navigation", all, normal, {
+add("navigation", main, normal, {
   { "schema_browser", "gb", "Opens, focuses, or closes the schema browser." },
+})
+
+add("navigation", { "grid", "query_pad", "sidebar", "welcome" }, normal, {
+  { "zoom", "gz", "Zooms the current pane or restores its split layout." },
 })
 
 add("navigation", { "query_pad", "sidebar" }, normal, {
@@ -60,11 +78,11 @@ add("navigation", { "query_pad", "sidebar" }, normal, {
   { "open_notebook", "gn", "Opens a SQL or Markdown notebook in the query pad." },
 })
 
-add("navigation", { "grid", "query_pad" }, normal, {
+add("navigation", { "grid", "query_pad", "welcome" }, normal, {
   { "table_picker_go", "go", "Opens the table picker with the short key." },
 })
 
-add("views", all, normal, {
+add("views", main, normal, {
   { "tab_1", "1", "Opens the first surface-specific view." },
   { "tab_2", "2", "Opens the second surface-specific view." },
   { "tab_3", "3", "Opens the third surface-specific view." },
@@ -103,7 +121,7 @@ add("grid editing", grid, normal, {
   { "grid_edit_enter", "<CR>", "Opens the current cell for editing with Enter." },
   { "grid_cell_buffer", "gB", "Opens the current cell in a split buffer." },
   { "grid_null", "x", "Stages NULL for the current cell." },
-  { "grid_column_set", "gU", "Stages one value across the visible column." },
+  { "grid_column_set", "gU", "Stages one value in this column across all visible rows." },
   { "grid_paste", "p", "Pastes the clipboard into the current cell." },
   { "grid_paste_rows", "P", "Pastes lines into consecutive rows." },
   { "grid_insert", "o", "Stages a new blank row." },
@@ -162,7 +180,7 @@ add("grid inspection", grid, normal, {
   { "grid_copy_sql", "gc", "Copies the staged SQL." },
   { "grid_table_info", "gi", "Opens compact table information." },
   { "grid_table_props", "gI", "Opens detailed table properties." },
-  { "grid_rename_col", "gN", "Renames the displayed column header." },
+  { "grid_rename_col", "gN", "Renames the database column after confirmation." },
   { "grid_col_stats", "gS", "Opens statistics for the current column." },
   { "grid_profile", "gR", "Profiles every column in the current table." },
   { "grid_show_ddl", "gV", "Shows the CREATE TABLE statement." },
@@ -212,7 +230,7 @@ add("query pad", query_pad, normal, {
   { "qpad_save", "<C-s>", "Saves the query." },
   { "qpad_ai", "gA", "Generates SQL in the query pad with the configured AI provider." },
   { "qpad_format", "gF", "Formats the query pad SQL." },
-  { "qpad_close", "q", "Closes the query pad and returns to the welcome screen." },
+  { "qpad_close", "q", "Returns to the welcome screen from the query pad." },
 })
 
 add("query completion", query_pad, { "i" }, {
@@ -225,18 +243,18 @@ add("query completion", query_pad, { "i" }, {
 }, "completion")
 
 add("sidebar", sidebar, normal, {
-  { "sidebar_open", "<CR>", "Opens the table under the cursor." },
+  { "sidebar_open", "<CR>", "Opens the object or toggles the group under the cursor." },
   { "sidebar_open_spl", "<S-CR>", "Opens the table under the cursor in a new split." },
-  { "sidebar_expand", "l", "Expands the table under the cursor." },
-  { "sidebar_collapse", "h", "Collapses the table under the cursor." },
-  { "sidebar_expand_z", "zo", "Expands the table with the fold-style key." },
-  { "sidebar_collap_z", "zc", "Collapses the table with the fold-style key." },
-  { "sidebar_expand_all", "L", "Expands every table." },
-  { "sidebar_collap_all", "H", "Collapses every table." },
-  { "sidebar_filter", "/", "Filters tables by name." },
-  { "sidebar_filter_c", "F", "Clears the sidebar filter." },
-  { "sidebar_next", "n", "Moves to the next table." },
-  { "sidebar_prev", "N", "Moves to the previous table." },
+  { "sidebar_expand", "l", "Expands the group or table columns under the cursor." },
+  { "sidebar_collapse", "h", "Collapses the item or moves to its parent." },
+  { "sidebar_expand_z", "zo", "Expands the group or table columns with the fold-style key." },
+  { "sidebar_collap_z", "zc", "Collapses the item or moves to its parent with the fold-style key." },
+  { "sidebar_expand_all", "L", "Expands every schema and partition level without loading columns." },
+  { "sidebar_collap_all", "H", "Collapses all groups and table columns." },
+  { "sidebar_filter", "/", "Searches hidden objects by name or routine signature." },
+  { "sidebar_filter_c", "F", "Clears the sidebar filter and restores the original view." },
+  { "sidebar_next", "n", "Moves to the next visible table or routine." },
+  { "sidebar_prev", "N", "Moves to the previous visible table or routine." },
   { "sidebar_refresh", "r", "Refreshes the schema." },
   { "sidebar_refresh2", "R", "Force-refreshes the schema." },
   { "sidebar_yank", "y", "Yanks the current table or column name." },
@@ -314,6 +332,71 @@ function M.bind(surface, bufnr, action, mode, fn, opts)
   if not map_opts.desc then map_opts.desc = "Grip: " .. record.description end
   vim.keymap.set(mode, key, fn, map_opts)
   return true
+end
+
+--- Render effective keys for the calling surface; never advertise a disabled key.
+function M.help_lines(surface, width)
+  local titles = { grid = "Grid", sidebar = "Schema sidebar", query_pad = "SQL pad", welcome = "Welcome" }
+  local tabs = {
+    grid = { "Opens or focuses the schema sidebar.", "Opens or focuses the SQL pad.",
+      "Returns to records, or picks a table from records." },
+    sidebar = { "Opens the connection picker.", "Opens or focuses the SQL pad.",
+      "Focuses results, or opens the selected table." },
+    query_pad = { "Opens or focuses the schema sidebar.", "Opens query history.",
+      "Focuses results, or picks a table if none is open." },
+    welcome = { "Opens or focuses the schema sidebar.", "Opens the SQL pad.", "Picks a table." },
+  }
+  local lines = { "", "  ╔═╦═╦═╗", "  ║d║b║g║  dadbod-grip v" .. require("dadbod-grip.version"),
+    "  ╚═╩═╩═╝", "", "  " .. titles[surface] .. " mappings", "" }
+  local categories, grouped = {}, {}
+  for _, record in ipairs(M.catalog) do
+    if contains(record.surfaces, surface) and M.get(record.action)
+        and (not record.requires or require("dadbod-grip").get_opts()[record.requires]) then
+      if not grouped[record.category] then
+        grouped[record.category] = {}
+        categories[#categories + 1] = record.category
+      end
+      grouped[record.category][#grouped[record.category] + 1] = record
+    end
+  end
+  for _, category in ipairs(categories) do
+    lines[#lines + 1] = "  " .. category:gsub("^%l", string.upper)
+    for _, record in ipairs(grouped[category]) do
+      local description = record.description
+      local tab = tonumber(record.action:match("^tab_([123])$"))
+      if tab then description = tabs[surface][tab] end
+      if not contains(record.modes, "n") then
+        description = "(" .. (contains(record.modes, "i") and "insert" or "visual") .. ") " .. description
+      end
+      local prefix = string.format("  %-12s ", M.get(record.action))
+      local line = prefix
+      for word in description:gmatch("%S+") do
+        local next_line = line .. (line == prefix and "" or " ") .. word
+        if vim.fn.strdisplaywidth(next_line) > width and line ~= prefix then
+          lines[#lines + 1] = line
+          prefix = string.rep(" ", 15)
+          line = prefix .. word
+        else line = next_line end
+      end
+      lines[#lines + 1] = line
+    end
+    lines[#lines + 1] = ""
+  end
+  vim.list_extend(lines, { "  :help dadbod-grip  Full manual and commands",
+    "  :GripZoom          Zoom a normal help/report split",
+    "", "  About dadbod-grip", "",
+    "    ╭────────────────╮",
+    "    │  ◉       ─     │",
+    "    │   · ╰──╯ ·     │",
+    "    ╰───────┬────────╯",
+    "    ┌───────┴────────┐",
+    "  ╭─┤ id │ hello     ├─╮",
+    "  ╰─┼────┼───────────┼─╯",
+    "    │  1 │ chonk     │",
+    "    └────┴───────────┘",
+    "", "  Chonk holds the center", "",
+    "  q / Esc            Close this help", "" })
+  return lines
 end
 
 --- Encode the public catalog with stable record and field ordering.

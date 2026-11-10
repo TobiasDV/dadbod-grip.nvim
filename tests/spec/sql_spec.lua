@@ -132,6 +132,21 @@ test("build_delete: composite PK sorted", function()
   assert(oid_idx < pid_idx, "order_id should come before product_id in WHERE")
 end)
 
+test("projected edits and deletes use every original composite key value", function()
+  local data = require("dadbod-grip.data")
+  local st = data.new({ table_name = "order_items", primary_keys = { "order_id", "product_id" },
+    columns = { "name", "product_id", "order_id" }, rows = { { "before", "5", "10" } } })
+  eq(st.readonly, false)
+  st = data.add_change(st, 1, "order_id", "20")
+  st = data.add_change(st, 1, "name", "after")
+  local upd = data.get_updates(st)[1]
+  eq(sql.build_update(st.table_name, upd.pk_values, upd.changes),
+    [[UPDATE "order_items" SET "name" = 'after', "order_id" = '20' WHERE "order_id" = '10' AND "product_id" = '5']])
+  local del = data.get_deletes(data.toggle_delete(st, 1))[1]
+  eq(sql.build_delete(st.table_name, del.pk_values),
+    [[DELETE FROM "order_items" WHERE "order_id" = '10' AND "product_id" = '5']])
+end)
+
 -- ── preview_staged() ────────────────────────────────────────────────────────
 
 test("preview_staged: no changes returns comment", function()
@@ -160,17 +175,16 @@ end)
 
 -- ── IS NULL in WHERE clause ──────────────────────────────────────────────────
 
-test("build_update: empty-string pk value uses IS NULL (csv null)", function()
-  -- CSV NULL is represented as "": must not emit WHERE id = '' on typed PK columns
+test("build_update: empty-string pk value uses a literal predicate", function()
   local result = sql.build_update("users", { id = "" }, { name = "alice" })
-  contains(result, '"id" IS NULL')
-  assert(not result:find('"id" = \'\'', 1, true), "should not have = ''")
+  contains(result, '"id" = \'\'')
+  assert(not result:find("IS NULL", 1, true), "empty text is not NULL")
 end)
 
-test("build_delete: empty-string pk value uses IS NULL (csv null)", function()
+test("build_delete: empty-string pk value uses a literal predicate", function()
   local result = sql.build_delete("users", { id = "" })
-  contains(result, '"id" IS NULL')
-  assert(not result:find('"id" = \'\'', 1, true), "should not have = ''")
+  contains(result, '"id" = \'\'')
+  assert(not result:find("IS NULL", 1, true), "empty text is not NULL")
 end)
 
 test("build_update: non-nil pk value still uses = (regression guard)", function()
@@ -237,17 +251,6 @@ test("quote_value: sqlserver splices CRs in as NCHAR(13)", function()
   eq(sql.quote_value("a\r\nb", "postgresql"), "'a\r\nb'", "other adapters unchanged")
 end)
 
-test("build_insert_lookup: matches given values, newest key first", function()
-  local s = sql.build_insert_lookup("notes", { "id" }, { title = "a", body = "b", id = "" }, nil, "sqlserver")
-  eq(s, 'SELECT "id" FROM "notes" WHERE "body" = N\'b\' AND "title" = N\'a\' ORDER BY "id" DESC LIMIT 1')
-end)
-
-test("build_insert_lookup: leaves out skipped columns, nil when nothing is left", function()
-  local s = sql.build_insert_lookup("legacy", { "id" }, { txt = "x", name = "n" }, { txt = true }, "sqlserver")
-  eq(s, 'SELECT "id" FROM "legacy" WHERE "name" = N\'n\' ORDER BY "id" DESC LIMIT 1')
-  eq(sql.build_insert_lookup("legacy", { "id" }, { txt = "x" }, { txt = true }, "sqlserver"), nil)
-end)
-
 test("quote_value: sqlserver booleans are 1/0", function()
   eq(sql.quote_value(true, "sqlserver"), "1")
   eq(sql.quote_value(false, "sqlserver"), "0")
@@ -275,31 +278,29 @@ test("build_delete: sqlserver N-prefixes keys", function()
   eq(sql.build_delete("tags", { code = "李" }, "sqlserver"), [[DELETE FROM "tags" WHERE "code" = N'李']])
 end)
 
-test("build_reinsert: other adapters get the plain INSERT", function()
-  eq(sql.build_reinsert("t", { id = "1" }, { "id" }, "postgresql"), [[INSERT INTO "t" ("id") VALUES ('1')]])
-end)
-
-test("build_reinsert: sqlserver toggles IDENTITY_INSERT around the INSERT", function()
-  eq(sql.build_reinsert("dbo.orders", { id = "7" }, { "id" }, "sqlserver"), table.concat({
-    [[IF OBJECTPROPERTY(OBJECT_ID(N'"dbo"."orders"'), 'TableHasIdentity') = 1 SET IDENTITY_INSERT "dbo"."orders" ON;]],
-    [[INSERT INTO "dbo"."orders" ("id") VALUES (N'7');]],
-    [[IF OBJECTPROPERTY(OBJECT_ID(N'"dbo"."orders"'), 'TableHasIdentity') = 1 SET IDENTITY_INSERT "dbo"."orders" OFF]],
-  }, "\n"))
-end)
-
 test("preview_staged: shows the adapter's SQL", function()
-  local preview = sql.preview_staged("t", { { pk_values = { id = "1" }, changes = { a = "é" } } }, {}, {}, "sqlserver")
+  local preview = sql.preview_staged("t",
+    { { pk_values = { id = "1" }, changes = { a = "é", b = "0xBEEF" }, adapter_kind = "sqlserver",
+        value_types = { b = "varbinary(16)" } } }, {}, {})
   contains(preview, "N'é'")
+  contains(preview, '"b" = 0xBEEF')
 end)
 
--- ── typed values, apply and undo ──────────────────────────────────────────
+test("build_insert: sqlserver writes a binary column's hex as a binary literal", function()
+  eq(sql.build_insert("t", { id = "1", b = "0xDEAD", n = vim.NIL }, { "id", "b", "n" },
+      { adapter_kind = "sqlserver", value_types = { b = "varbinary(16)" } }),
+    [[INSERT INTO "t" ("id", "b", "n") VALUES (N'1', 0xDEAD, NULL)]])
+end)
+
+-- ── typed values ──────────────────────────────────────────
 
 local data_mod = require("dadbod-grip.data")
 
 test("value_sql: NULL, '' and SQL Server binary hex", function()
   eq(sql.value_sql(data_mod.NULL_SENTINEL, "sqlserver", "nvarchar(10)"), "NULL")
-  eq(sql.value_sql(data_mod.EMPTY, "sqlserver", "nvarchar(10)"), "N''")
-  eq(sql.value_sql(data_mod.EMPTY, "postgresql", "text"), "''")
+  eq(sql.value_sql(nil, "sqlserver", "nvarchar(10)"), "NULL")
+  eq(sql.value_sql("", "sqlserver", "nvarchar(10)"), "N''")
+  eq(sql.value_sql("", "postgresql", "text"), "''")
   eq(sql.value_sql("0xCAFE", "sqlserver", "varbinary(16)"), "0xCAFE")
   eq(sql.value_sql("0xcafe", "sqlserver", "image"), "0xcafe")
   eq(sql.value_sql("0xCAFE", "sqlserver", "nvarchar(10)"), "N'0xCAFE'", "text that looks like hex stays text")
@@ -307,57 +308,9 @@ test("value_sql: NULL, '' and SQL Server binary hex", function()
   eq(sql.value_sql("0xCAFE", "postgresql", "bytea"), "'0xCAFE'", "other adapters unchanged")
 end)
 
-local function sqlserver_grid()
-  return data_mod.new({
-    rows = { { "1", "", "0xDEAD", "" }, { "2", "x", "", "<binary 9000 bytes>" } },
-    columns = { "id", "code", "blob", "big" },
-    primary_keys = { "id" },
-    table_name = "t",
-    empty_cells = { [1] = { [2] = true } },
-    column_types = { id = "int", code = "varchar(10)", blob = "varbinary(16)", big = "varbinary(max)" },
-    generated_columns = { rv = true },
-  })
-end
-
-test("build_apply: deletes, updates and inserts with typed values", function()
-  local st = sqlserver_grid()
-  st = data_mod.add_change(st, 2, "blob", "0xBEEF")
-  st = data_mod.toggle_delete(st, 1)
-  local stmts = sql.build_apply(st, "sqlserver")
-  eq(#stmts, 2)
-  contains(stmts[1], "DELETE FROM")
-  contains(stmts[2], '"blob" = 0xBEEF')
-end)
-
-test("build_undo: a deleted row comes back with '' and hex", function()
-  local st = data_mod.toggle_delete(sqlserver_grid(), 1)
-  local reverse, irreversible = sql.build_undo(st, "sqlserver")
-  eq(#irreversible, 0)
-  contains(reverse[1], "N''")
-  contains(reverse[1], "0xDEAD")
-  assert(not reverse[1]:find("N'0xDEAD'", 1, true), "hex not quoted")
-end)
-
-test("build_undo: an edit of a '' cell restores ''", function()
-  local st = data_mod.add_change(sqlserver_grid(), 1, "code", "now set")
-  local reverse = sql.build_undo(st, "sqlserver")
-  contains(reverse[1], [["code" = N'']])
-end)
-
-test("build_undo: a row with a large binary placeholder cannot be restored", function()
-  local st = data_mod.toggle_delete(sqlserver_grid(), 2)
-  local reverse, irreversible = sql.build_undo(st, "sqlserver")
-  eq(#reverse, 0)
-  eq(irreversible[1], 2)
-end)
-
-test("build_insert: skips the columns in opts.skip", function()
-  local s = sql.build_insert("t", { id = "1", total = "4" }, { "id", "total" }, "sqlserver", { skip = { total = true } })
-  eq(s, [[INSERT INTO "t" ("id") VALUES (N'1')]])
-end)
-
 test("equals_sql: SQL Server compares by the column's type", function()
   eq(sql.equals_sql("c", nil, "sqlserver"), [["c" IS NULL]])
+  eq(sql.equals_sql("c", vim.NIL, "sqlserver"), [["c" IS NULL]])
   eq(sql.equals_sql("c", "李", "sqlserver", "nvarchar(10)"), [["c" = N'李']])
   eq(sql.equals_sql("c", "a\r\nb", "sqlserver", "nvarchar(max)"),
     [["c" = CAST(N'a' AS nvarchar(max)) + NCHAR(13) + N'
@@ -369,30 +322,6 @@ b']])
   eq(sql.equals_sql("c", "42", "sqlserver", "sql_variant"), [[CAST("c" AS nvarchar(max)) = N'42']])
   eq(sql.equals_sql("c", "POINT (1 2)", "sqlserver", "geography"), [[CAST("c" AS nvarchar(max)) = N'POINT (1 2)']])
   eq(sql.equals_sql("c", "x", "postgresql", "text"), [["c" = 'x']], "other adapters unchanged")
-end)
-
-test("build_inserted_keys: one query for every insert without a key", function()
-  local st = data_mod.new({ rows = { { "g1", "first" } }, columns = { "id", "label" }, primary_keys = { "id" },
-    table_name = "t" })
-  st = data_mod.clone_row(st, 1)
-  st = data_mod.clone_row(st, 1)
-  st = data_mod.insert_row_with_values(st, 1, { id = "explicit", label = "x" })
-  local plan = sql.build_inserted_keys(st, "postgresql")
-  contains(plan.sql, "UNION ALL")
-  eq(plan.slots[1], 1)
-  eq(plan.slots[2], 2)
-  eq(plan.slots[3], nil, "an insert with its own key needs no lookup")
-end)
-
-test("match_inserted_keys: the new keys are what was not there before", function()
-  local plan = { slots = { 1, 2 }, groups = { [1] = "w", [2] = "w" } }
-  local before = { { "1", "g1" }, { "2", "g1" } }
-  local after = { { "1", "g1" }, { "1", "g9" }, { "1", "g5" }, { "2", "g1" }, { "2", "g9" }, { "2", "g5" } }
-  local keys = sql.match_inserted_keys(plan, before, after, { "id" })
-  eq(keys[1].id, "g5")
-  eq(keys[2].id, "g9")
-  local ambiguous = sql.match_inserted_keys(plan, before, { { "1", "g1" }, { "1", "g9" }, { "2", "g1" }, { "2", "g9" } }, { "id" })
-  eq(ambiguous[1], nil, "two inserts, one new row: no guess")
 end)
 
 -- ── summary ─────────────────────────────────────────────────────────────────

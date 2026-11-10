@@ -722,210 +722,77 @@ test("resolve_query: URL does not call filereadable", function()
   eq(called, false, "filereadable should not be called for URLs")
 end)
 
--- ── open_welcome: extmark highlights ─────────────────────────────────────────
--- open_welcome() applies its syntax highlights inside vim.schedule (so they
--- survive the FileType autocmd -- see init.lua), and headless tests have no
--- UI loop driving that callback on their own. Rather than exporting a
--- renderer to call directly, these drive vim.schedule for real and vim.wait
--- on the extmarks actually showing up: that exercises the exact scheduled
--- path :Grip and :GripHome run, not a reimplementation of it.
-
+-- Rendered highlight ranges protect the retained logo and actionable hints.
 local WELCOME_NS = vim.api.nvim_create_namespace("grip_welcome")
-
---- Open the welcome screen for real and wait (bounded, on the actual
---- condition -- not a fixed sleep) for its scheduled highlight pass to run.
---- @return integer buf, table marks  (nvim_buf_get_extmarks with details)
 local function open_welcome_and_wait()
   grip.open_welcome()
   local buf = vim.api.nvim_get_current_buf()
-  local marks
-  local ok = vim.wait(1000, function()
-    marks = vim.api.nvim_buf_get_extmarks(buf, WELCOME_NS, 0, -1, { details = true })
-    return #marks > 0
-  end, 10)
-  assert(ok, "welcome highlight scheduling did not fire within 1s")
+  local marks = vim.api.nvim_buf_get_extmarks(buf, WELCOME_NS, 0, -1, { details = true })
+  assert(#marks > 0, "welcome has no highlight ranges")
   return buf, marks
 end
 
--- Every highlight group the welcome screen uses, with a predicate for what a
--- mark of that group is allowed to cover. This plus the three cases below
--- replaces the totals this test used to pin (62 marks, 42 of them Identifier) --
--- numbers that had to be recounted by hand after any edit to the logo or the
--- keymap rows, and that said nothing about *where* the highlights landed.
---
--- GripNullStaged is deliberately absent even though init.lua can apply it (to a
--- "·NULL·" token on any line): the current screen has no such token, so a
--- predicate for it would never run. Leaving the dictionary closed means that if
--- "·NULL·" is ever added to the logo, the first case below fails with
--- "unexpected highlight group ... GripNullStaged" -- pointing at this table so
--- whoever adds it has to say what that mark must cover, instead of the mark
--- going unchecked.
 local WELCOME_GROUPS = {
-  -- Section headers, bottom separator and tagline: the whole line.
-  Comment      = function(text, line) return text == line end,
-  -- Logo box rows (╔ ║ ╚): the whole line.
-  Special      = function(text, line) return text == line end,
-  -- The plugin name plus the version that follows it, to end of line.
-  Title        = function(text) return text:match("^dadbod%-grip") ~= nil end,
-  Statement    = function(text) return text:match("^:Grip%S*$") ~= nil end,
-  -- Keymap keys and --flags: always one whitespace-free token.
-  Identifier   = function(text) return text:match("^%S+$") ~= nil end,
-  GripModified = function(text) return text == "violet = modified" end,
-  GripInserted = function(text) return text == "green = inserted" end,
-  GripDeleted  = function(text) return text == "red = deleted" end,
+  Comment = function(text, line) return text == line end,
+  Special = function(text, line) return text == line end,
+  Title = function(text, line)
+    return text:match("^dadbod%-grip")
+      or (text == line and (text:match("^  [A-Z][A-Z ]+") or text == "  Welcome keys"))
+  end,
+  Statement = function(text) return text:match("^:Grip%S*$") end,
+  Identifier = function(text) return text:match("^%S+$") end,
 }
 
---- Index the Identifier marks for lookup by position.
---- @return table  row -> { [start_col] = end_col }
-local function identifier_marks(marks)
-  local idents = {}
-  for _, m in ipairs(marks) do
-    if m[4].hl_group == "Identifier" then
-      idents[m[2]] = idents[m[2]] or {}
-      idents[m[2]][m[3]] = m[4].end_col
-    end
-  end
-  return idents
-end
-
-test("open_welcome: every rendered line is highlighted, and every mark fits its group", function()
+test("open_welcome: highlight ranges fit their rendered semantic groups", function()
   local buf, marks = open_welcome_and_wait()
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-
-  local seen_groups, per_line = {}, {}
-  for _, m in ipairs(marks) do
-    local row, col, det = m[2], m[3], m[4]
-    local line = lines[row + 1]
-    assert(line, "mark sits on rendered row " .. row)
-    local pred = WELCOME_GROUPS[det.hl_group]
-    assert(pred, "unexpected highlight group on the welcome screen: " .. tostring(det.hl_group))
-    assert(det.end_col and det.end_col > col and det.end_col <= #line,
-      det.hl_group .. " mark on line " .. (row + 1) .. " covers a non-empty range inside the line")
-    local text = line:sub(col + 1, det.end_col)
-    assert(pred(text, line),
-      det.hl_group .. " on line " .. (row + 1) .. " covers '" .. text .. "', not what that group marks up")
-    seen_groups[det.hl_group] = true
-    per_line[row] = (per_line[row] or 0) + 1
+  local seen, per_line = {}, {}
+  for _, mark in ipairs(marks) do
+    local row, col, det = mark[2], mark[3], mark[4]
+    local line = assert(lines[row + 1], "mark outside welcome text")
+    assert(det.end_col and det.end_col > col and det.end_col <= #line, "invalid highlight range")
+    local pred = assert(WELCOME_GROUPS[det.hl_group], "unexpected highlight group")
+    assert(pred(line:sub(col + 1, det.end_col), line), "highlight covers the wrong semantic range: " .. det.hl_group)
+    seen[det.hl_group], per_line[row] = true, true
   end
-
-  for group in pairs(WELCOME_GROUPS) do
-    assert(seen_groups[group], "no " .. group .. " highlight was applied anywhere")
-  end
-
-  -- Blank lines are the only unhighlighted ones: a branch that stops firing
-  -- leaves its lines bare. This only catches the *first* mark on a line, so the
-  -- two positions that carry a second one (the right-hand keymap key and the
-  -- --flag in a :Grip example) get a case of their own below.
-  for i, line in ipairs(lines) do
-    if line ~= "" then
-      assert((per_line[i - 1] or 0) > 0, "line " .. i .. " is rendered but unhighlighted: " .. line)
-    end
-  end
+  for group in pairs(WELCOME_GROUPS) do assert(seen[group], "missing highlight group " .. group) end
+  for i, line in ipairs(lines) do if line ~= "" then assert(per_line[i - 1], "unhighlighted welcome row") end end
   pcall(vim.api.nvim_buf_delete, buf, { force = true })
 end)
 
-test("open_welcome: keymap rows highlight both keys of the two-column layout", function()
-  -- Keymap rows put the left key at byte 2 and, when they have one, a
-  -- right-hand key at byte 31 (0-indexed) -- see the keymap branch in
-  -- init.lua. Rows are recognised by their own left-key mark instead of by
-  -- re-deriving init.lua's line classifier, so this follows the logo text
-  -- around: adding or reflowing a keymap row needs no edit here.
+test("open_welcome: action commands and keys have their own highlight ranges", function()
   local buf, marks = open_welcome_and_wait()
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local idents = identifier_marks(marks)
-
-  local rows_checked = 0
-  for row, starts in pairs(idents) do
-    if starts[2] then  -- a key at byte 2: this row is a keymap row
-      local line = lines[row + 1]
-      local _, after = line:match("^  (%S+)()")
-      eq(starts[2], after - 1, "left key spans exactly its token on line " .. (row + 1))
-      if #line >= 34 and line:sub(32, 32) ~= " " then
-        local rs, re = line:find("%S+", 32)
-        assert(starts[rs - 1] == re, "right-column key '" .. line:sub(rs, re)
-          .. "' on line " .. (row + 1) .. " is not highlighted as its own token")
+  for _, token in ipairs({ ":GripStart", ":GripConnect", "3", "2" }) do
+    local found = false
+    for _, mark in ipairs(marks) do
+      local det = mark[4]
+      if det.hl_group == "Statement" or det.hl_group == "Identifier" then
+        local text = lines[mark[2] + 1]:sub(mark[3] + 1, det.end_col)
+        if text == token then found = true end
       end
-      rows_checked = rows_checked + 1
     end
+    assert(found, "action hint is not highlighted independently: " .. token)
   end
-  assert(rows_checked > 0, "the welcome screen still has keymap rows to check")
   pcall(vim.api.nvim_buf_delete, buf, { force = true })
 end)
 
-test("open_welcome: --flag tokens in the :Grip examples are highlighted", function()
-  -- The flag mark is a *second* mark on a line that already carries a Statement
-  -- (see the :Grip branch in init.lua), so neither "every line carries a mark"
-  -- nor the keymap case above -- which recognises rows by an Identifier at byte
-  -- 2, and :Grip rows have none -- notices when it stops being applied.
-  --
-  -- Scanned straight off the rendered text, so it follows the logo around.
-  -- init.lua marks the first --flag per :Grip example; every such token on the
-  -- current screen is the first on its line, and a second unmarked flag on one
-  -- line should surface here rather than pass silently.
+test("open_welcome: brand title excludes the unchanged box glyphs", function()
   local buf, marks = open_welcome_and_wait()
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local idents = identifier_marks(marks)
-
-  local flags_checked = 0
-  for i, line in ipairs(lines) do
-    local from = 1
-    while true do
-      local s, e = line:find("%-%-%S+", from)
-      if not s then break end
-      assert((idents[i - 1] or {})[s - 1] == e, "--flag '" .. line:sub(s, e)
-        .. "' on line " .. i .. " is not highlighted as its own token")
-      flags_checked = flags_checked + 1
-      from = e + 1
+  local found = false
+  for _, mark in ipairs(marks) do
+    local line = lines[mark[2] + 1]
+    local start = line:find("dadbod-grip", 1, true)
+    if start and mark[4].hl_group == "Title" then
+      eq(mark[3], start - 1, "brand starts at plugin name")
+      eq(mark[4].end_col, #line, "brand includes runtime version")
+      found = true
     end
   end
-  assert(flags_checked > 0, "the welcome screen still shows a --flag example to check")
+  assert(found, "brand title mark missing")
   pcall(vim.api.nvim_buf_delete, buf, { force = true })
 end)
-
-test("open_welcome: title and legend marks carry the right range and priority", function()
-  local buf, marks = open_welcome_and_wait()
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-
-  local function find(hl_group)
-    for _, m in ipairs(marks) do
-      if m[4].hl_group == hl_group then return m end
-    end
-  end
-
-  -- Title: "dadbod-grip" through end-of-line on the logo row, at the default
-  -- extmark priority (nothing overrides it -- see hl_range() in init.lua).
-  -- The line contains the version string, so its length isn't hardcoded here:
-  -- it's read back from the buffer, the same way hl_range() computed it.
-  local title = find("Title")
-  assert(title, "Title mark exists")
-  local title_line = lines[title[2] + 1]
-  local vs = title_line:find("dadbod-grip", 1, true)
-  assert(vs, "title line contains the plugin name")
-  eq(title[3], vs - 1, "title starts where the name does")
-  eq(title[4].end_col, #title_line, "title runs to end of line")
-  eq(title[4].priority, 4096, "default extmark priority")
-
-  -- Legend phrases sit at explicit priority 200 so they win over syntax
-  -- highlighting on the same line (see hl_phrase() in init.lua).
-  for _, spec in ipairs({
-    { group = "GripModified", phrase = "violet = modified" },
-    { group = "GripInserted", phrase = "green = inserted" },
-    { group = "GripDeleted",  phrase = "red = deleted" },
-  }) do
-    local m = find(spec.group)
-    assert(m, spec.group .. " mark exists")
-    local legend_line = lines[m[2] + 1]
-    local s, e = legend_line:find(spec.phrase, 1, true)
-    assert(s, spec.group .. " phrase found in its line")
-    eq(m[3], s - 1, spec.group .. " start col")
-    eq(m[4].end_col, e, spec.group .. " end col")
-    eq(m[4].priority, 200, spec.group .. " priority")
-  end
-
-  pcall(vim.api.nvim_buf_delete, buf, { force = true })
-end)
-
--- ── summary ──────────────────────────────────────────────────────────────────
 
 print(string.format("\ninit_spec: %d passed, %d failed", pass, fail))
 if fail > 0 then os.exit(1) end

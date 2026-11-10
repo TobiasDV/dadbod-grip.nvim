@@ -318,6 +318,27 @@ test("switching to a connection that was never saved restores the defaults", fun
   end)
 end)
 
+test("setup overrides survive real connection switches and a colorscheme", function()
+  local orig_scheme = vim.g.colors_name
+  with_real_file(function(local_grip)
+    write_conns(local_grip)
+    grip.setup({ highlights = {
+      GripBorder = { fg = "#112233" },
+      GripColHighlight = { link = "Visual" },
+    } })
+    for _, url in ipairs({ PROD, LOCAL, PROD }) do
+      connections.switch(url, "fixture", "postgresql")
+      eq(fg("GripBorder"), 0x112233, "connection switch preserves the border override")
+      eq(vim.api.nvim_get_hl(0, { name = "GripColHighlight", link = true }).link,
+        "Visual", "connection switch preserves the column link")
+    end
+    vim.cmd("colorscheme blue")
+    eq(fg("GripBorder"), 0x112233, "colorscheme keeps the override on the reconnected entry")
+    eq(fg("GripConnAccent"), 0xf38ba8, "unspecified groups still follow the reconnected entry")
+  end)
+  vim.cmd("colorscheme " .. (orig_scheme or "default"))
+end)
+
 -- ── summary ─────────────────────────────────────────────────────────────────
 
 print(string.format("\nconn_color_spec: %d passed, %d failed", pass, fail))

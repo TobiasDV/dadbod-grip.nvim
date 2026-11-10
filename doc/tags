@@ -10,6 +10,7 @@
 :GripExport	dadbod-grip.txt	/*:GripExport*
 :GripFill	dadbod-grip.txt	/*:GripFill*
 :GripHome	dadbod-grip.txt	/*:GripHome*
+:GripImport	dadbod-grip.txt	/*:GripImport*
 :GripLoad	dadbod-grip.txt	/*:GripLoad*
 :GripOpen	dadbod-grip.txt	/*:GripOpen*
 :GripProfile	dadbod-grip.txt	/*:GripProfile*
@@ -21,6 +22,7 @@
 :GripStart	dadbod-grip.txt	/*:GripStart*
 :GripTables	dadbod-grip.txt	/*:GripTables*
 :GripToggle	dadbod-grip.txt	/*:GripToggle*
+:GripZoom	dadbod-grip.txt	/*:GripZoom*
 dadbod-grip.txt	dadbod-grip.txt	/*dadbod-grip.txt*
 grip-accent	dadbod-grip.txt	/*grip-accent*
 grip-adapters	dadbod-grip.txt	/*grip-adapters*
@@ -38,6 +40,7 @@ grip-config	dadbod-grip.txt	/*grip-config*
 grip-connections	dadbod-grip.txt	/*grip-connections*
 grip-contents	dadbod-grip.txt	/*grip-contents*
 grip-ddl	dadbod-grip.txt	/*grip-ddl*
+grip-demo	dadbod-grip.txt	/*grip-demo*
 grip-diff	dadbod-grip.txt	/*grip-diff*
 grip-editing	dadbod-grip.txt	/*grip-editing*
 grip-editing-workflow	dadbod-grip.txt	/*grip-editing-workflow*
@@ -59,6 +62,7 @@ grip-picker	dadbod-grip.txt	/*grip-picker*
 grip-pinned-max	dadbod-grip.txt	/*grip-pinned-max*
 grip-profiling	dadbod-grip.txt	/*grip-profiling*
 grip-query-pad	dadbod-grip.txt	/*grip-query-pad*
+grip-query-timer	dadbod-grip.txt	/*grip-query-timer*
 grip-readonly	dadbod-grip.txt	/*grip-readonly*
 grip-requirements	dadbod-grip.txt	/*grip-requirements*
 grip-s3-files	dadbod-grip.txt	/*grip-s3-files*

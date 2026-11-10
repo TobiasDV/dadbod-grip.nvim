@@ -33,6 +33,8 @@ return {
       "GripDetach",
       "GripOpen",
       "GripToggle",
+      "GripZoom",
+      "GripZen",
       "GripFill",
     },
   },

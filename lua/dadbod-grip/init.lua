@@ -31,6 +31,7 @@ local OPTS = {
   limit       = 100,
   max_col_width = 40,
   timeout     = 10000,
+  engine_timing = false,
   completion  = true,
   connections_path = nil,
   picker      = "builtin",
@@ -46,6 +47,10 @@ local OPTS = {
   -- visible when a long table scrolls past it. Costs one screen line.
   sticky_header = true,
   open_sidebar = true,
+  show_hints = true,
+  show_running_time = true,
+  show_result_time = true,
+  highlights = {},
 }
 
 --- Return a copy of the current options.
@@ -111,168 +116,149 @@ local function deny_if_readonly(cmd_name, url)
   return require("dadbod-grip.connections").deny_if_readonly(cmd_name, url)
 end
 
--- Share the token stream between projection and source checks: comments and
--- quoted identifiers must never supply a different FROM to either check.
-local function tokenize_select(sql_text, adapter_kind)
-  local tokens = {}
-  local i = 1
-  local len = #sql_text
-  -- Keep UTF-8 identifier bytes together; punctuation still ends the word.
-  local word_start = "[%a_\128-\255]"
-  local word_part = "[%w_$\128-\255]"
-  local function skip_space()
-    while i <= len and sql_text:sub(i, i):match("%s") do i = i + 1 end
-  end
+local tokenize_select = require("dadbod-grip.sql_tokens").tokenize
 
-  local function read_word()
-    local start = i
-    if not sql_text:sub(i, i):match(word_start) then return nil end
-    i = i + 1
-    while i <= len and sql_text:sub(i, i):match(word_part) do i = i + 1 end
-    return sql_text:sub(start, i - 1)
-  end
+-- Ordinary statements keep the cheap keyword check. Leading SQL comments need
+-- the same lexical boundaries as previews, while the original text stays intact.
+local function statement_type(text, adapter_kind)
+  local keyword = text:match("^%s*([%a_\128-\255][%w_$\128-\255]*)")
+  if keyword then return keyword:upper() end
+  local tokens = tokenize_select(text, adapter_kind, true)
+  return tokens and tokens[1] and tokens[1].upper
+end
 
-  local function read_number()
-    local prefix = sql_text:sub(i, i + 1):lower()
-    local radix_pattern = prefix == "0x" and "^0[xX]_?[%da-fA-F][%da-fA-F_]*"
-      or prefix == "0b" and "^0[bB]_?[01][01_]*"
-      or prefix == "0o" and "^0[oO]_?[0-7][0-7_]*"
-    local _, finish
-    if radix_pattern then
-      _, finish = sql_text:find(radix_pattern, i)
-      if not finish then return false end
-    else
-      _, finish = sql_text:find("^%d[%d_]*", i)
-      finish = finish or (i - 1)
-      if sql_text:sub(finish + 1, finish + 1) == "." then
-        _, finish = sql_text:find("^%.[%d_]*", finish + 1)
-      end
-      local _, exponent_end = sql_text:find("^[eE][+-]?%d[%d_]*", finish + 1)
-      finish = exponent_end or finish
+-- Classify commands at WITH-body and outer-statement positions. PostgreSQL
+-- permits UPDATE/DELETE/etc. as ordinary column, alias and CTE names; scanning
+-- every word would mistake those reads for writes and discard their results.
+local cte_mutation_words = { UPDATE = true, DELETE = true, INSERT = true, REPLACE = true, MERGE = true }
+local function cte_mutation(tokens, adapter_kind)
+  -- Most WITH queries contain no DML words. Preserve their cheap read routing;
+  -- any candidate, including a nested or later statement, needs full context.
+  local candidate = false
+  for _, token in ipairs(tokens) do
+    if cte_mutation_words[token.upper] then candidate = true; break end
+  end
+  if not candidate then return false end
+  local matching, stack, starts = {}, {}, { 1 }
+  for idx, token in ipairs(tokens) do
+    if token.kind == "(" then
+      stack[#stack + 1] = idx
+    elseif token.kind == ")" then
+      local opener = table.remove(stack)
+      if not opener then return nil end
+      matching[opener] = idx
+    elseif token.kind == ";" and #stack == 0 then
+      starts[#starts + 1] = idx + 1
     end
-    i = finish + 1
-    -- Numeric suffixes must not become identifiers in qualification checks.
-    return not sql_text:sub(i, i):match(word_start)
+    -- T-SQL permits adjacent commands without separators. Its reserved DML
+    -- words retain the previous conservative check, excluding @variables and
+    -- qualified identifiers; PostgreSQL needs the structural checks below.
+    if adapter_kind == "sqlserver" then
+      local previous, following = tokens[idx - 1], tokens[idx + 1]
+      if following and (not previous or (previous.kind ~= "." and previous.kind ~= "@"))
+          and (((token.upper == "UPDATE" or token.upper == "DELETE" or token.upper == "INSERT")
+            and (following.kind == "ident" or following.kind == "@"))
+            or (token.upper == "MERGE" and following.upper == "INTO")) then return true end
+    end
   end
-
-  local function read_quoted(quote, escape_string)
-    local close_quote = quote == "[" and "]" or quote
-    local value = {}
-    i = i + 1
-    while i <= len do
-      local ch = sql_text:sub(i, i)
-      if ch == "\\" and quote == "'" then
-        local start = i
-        while sql_text:sub(i, i) == "\\" do i = i + 1 end
-        local odd = (i - start) % 2 == 1
-        if escape_string and odd then
-          if i > len then return nil end
-          i = i + 1
-        elseif odd and sql_text:sub(i, i) == "'"
-            and (adapter_kind == "postgresql" or adapter_kind == "mysql") then
-          -- Session escape settings can change this quote's closing boundary.
-          return nil
-        end
-        value[#value + 1] = sql_text:sub(start, i - 1)
-      elseif ch == close_quote then
-        if sql_text:sub(i + 1, i + 1) == close_quote then
-          value[#value + 1] = close_quote
-          i = i + 2
-        else
-          i = i + 1
-          return table.concat(value)
-        end
+  if #stack > 0 then return nil end
+  local function keyword(pos, value)
+    return tokens[pos] and tokens[pos].upper == value
+  end
+  local function identifier(pos)
+    return tokens[pos] and tokens[pos].kind == "ident"
+  end
+  local function after_keyword(pos, value)
+    while tokens[pos] do
+      if keyword(pos, value) then return pos + 1 end
+      pos = (matching[pos] or pos) + 1
+    end
+  end
+  local function command(pos, wrapped)
+    -- A top-level SELECT/WITH may be wrapped in parentheses. EXPLAIN ANALYZE
+    -- can execute its inner mutation, including in a later batch statement.
+    while matching[pos] do pos = pos + 1 end
+    local verb = tokens[pos] and tokens[pos].upper
+    if verb == "EXPLAIN" then
+      pos = pos + 1
+      if matching[pos] then
+        pos = matching[pos] + 1
       else
-        value[#value + 1] = ch
-        i = i + 1
+        while keyword(pos, "ANALYZE") or keyword(pos, "ANALYSE") or keyword(pos, "VERBOSE") do
+          pos = pos + 1
+        end
       end
+      return command(pos, true)
+    end
+    if verb == "UPDATE" or verb == "DELETE" or verb == "INSERT" or verb == "REPLACE" then return true end
+    if verb == "MERGE" then
+      return adapter_kind == "postgresql" or adapter_kind == "duckdb" or adapter_kind == "sqlserver"
+    end
+    if verb ~= "WITH" then
+      if wrapped and verb ~= "SELECT" and verb ~= "TABLE" and verb ~= "VALUES"
+          and not (adapter_kind == "duckdb" and verb == "FROM") then return nil end
+      return false
+    end
+    pos = pos + 1
+    if keyword(pos, "RECURSIVE") then pos = pos + 1 end
+    -- T-SQL WITH prefixes also carry XML namespaces or change tracking data.
+    if adapter_kind == "sqlserver" and (keyword(pos, "XMLNAMESPACES")
+        or keyword(pos, "CHANGE_TRACKING_CONTEXT")) then
+      if not matching[pos + 1] then return nil end
+      pos = matching[pos + 1] + 1
+      if not tokens[pos] or tokens[pos].kind ~= "," then return command(pos) end
+      pos = pos + 1
+    end
+    while identifier(pos) do
+      pos = pos + 1 -- CTE name, even when it spells a command keyword
+      if matching[pos] then pos = matching[pos] + 1 end -- optional columns
+      if adapter_kind == "duckdb" and keyword(pos, "USING") and keyword(pos + 1, "KEY") then
+        if not matching[pos + 2] then return nil end
+        pos = matching[pos + 2] + 1
+      end
+      if not keyword(pos, "AS") then return nil end
+      pos = pos + 1
+      if keyword(pos, "NOT") then pos = pos + 1 end
+      if keyword(pos, "MATERIALIZED") then pos = pos + 1 end
+      local finish = matching[pos]
+      if not finish then return nil end
+      local mutates = command(pos + 1)
+      if mutates ~= false then return mutates end
+      pos = finish + 1
+      -- Recursive SEARCH/CYCLE suffixes name output columns, not commands.
+      if keyword(pos, "SEARCH") then
+        if not (keyword(pos + 1, "DEPTH") or keyword(pos + 1, "BREADTH"))
+            or not keyword(pos + 2, "FIRST") or not keyword(pos + 3, "BY") then return nil end
+        pos = pos + 4
+        repeat
+          if not identifier(pos) then return nil end
+          pos = pos + 1
+          if not tokens[pos] or tokens[pos].kind ~= "," then break end
+          pos = pos + 1
+        until false
+        -- SET is also a legal sort-column name; only the delimiter after the
+        -- identifier list starts the output-column clause.
+        if not keyword(pos, "SET") or not identifier(pos + 1) then return nil end
+        pos = pos + 2
+      end
+      if keyword(pos, "CYCLE") then
+        pos = after_keyword(pos + 1, adapter_kind == "mysql" and "RESTRICT" or "USING")
+        if not pos then return nil end
+        if adapter_kind ~= "mysql" then
+          if not identifier(pos) then return nil end
+          pos = pos + 1
+        end
+      end
+      if not tokens[pos] or tokens[pos].kind ~= "," then return command(pos) end
+      pos = pos + 1
     end
     return nil
   end
-
-  while i <= len do
-    skip_space()
-    if i > len then break end
-
-    local ch = sql_text:sub(i, i)
-    local next_ch = sql_text:sub(i + 1, i + 1)
-
-    if ch == "-" and next_ch == "-" then
-      -- MySQL requires whitespace/control after --; otherwise it can be
-      -- arithmetic, e.g. total--1 AS status, rather than a comment.
-      local following = sql_text:sub(i + 2, i + 2)
-      if adapter_kind == "mysql" and following ~= ""
-          and not following:match("[%s%c]") then return nil end
-      local newline = sql_text:find("[\r\n]", i + 2)
-      -- PostgreSQL and DuckDB also end comments at a bare CR. Other clients
-      -- differ, so accept their shared CRLF form and reject an ambiguous CR.
-      if newline and sql_text:sub(newline, newline) == "\r"
-          and sql_text:sub(newline + 1, newline + 1) ~= "\n"
-          and adapter_kind ~= "postgresql" and adapter_kind ~= "duckdb" then return nil end
-      i = newline and (newline + 1) or (len + 1)
-    elseif ch == "/" and next_ch == "*" then
-      -- MySQL/MariaDB execute SQL inside these comment forms. Skipping them
-      -- could hide an alias or expression from the projection check.
-      if adapter_kind == "mysql"
-          and (sql_text:sub(i + 2, i + 2) == "!"
-            or sql_text:sub(i + 2, i + 3) == "M!") then return nil end
-      local depth = 1
-      i = i + 2
-      while i <= len and depth > 0 do
-        local pair = sql_text:sub(i, i + 1)
-        if pair == "/*" then
-          if adapter_kind ~= "postgresql" then return nil end
-          depth = depth + 1
-          i = i + 2
-        elseif pair == "*/" then
-          depth = depth - 1
-          i = i + 2
-        else
-          i = i + 1
-        end
-      end
-      if depth ~= 0 then return nil end
-    elseif ch == '"' or ch == "`" or ch == "'"
-        or (ch == "[" and adapter_kind ~= "postgresql" and adapter_kind ~= "duckdb") then
-      -- The MySQL/MariaDB adapter enables ANSI_QUOTES before each query,
-      -- so double quotes denote identifiers there too.
-      -- Adjacent string segments retain E-string escapes across newlines.
-      local previous = tokens[#tokens]
-      local escape_string = ch == "'" and previous and previous.escape_string
-      local ident = read_quoted(ch, escape_string)
-      if not ident then return nil end
-      tokens[#tokens + 1] = {
-        kind = ch == "'" and "literal" or "ident", text = ident, escape_string = escape_string,
-      }
-    elseif ch:match("%d") or (ch == "." and next_ch:match("%d")) then
-      if not read_number() then return nil end
-      tokens[#tokens + 1] = { kind = "literal" }
-    elseif ch:match(word_start) then
-      local word = read_word()
-      if word:upper() == "E" and sql_text:sub(i, i) == "'"
-          and (adapter_kind == "postgresql" or adapter_kind == "duckdb") then
-        local value = read_quoted("'", true)
-        if not value then return nil end
-        tokens[#tokens + 1] = { kind = "literal", text = value, escape_string = true }
-      else
-        tokens[#tokens + 1] = { kind = "ident", text = word, upper = word:upper() }
-      end
-    elseif ch == "$" and (adapter_kind == "postgresql" or adapter_kind == "duckdb") then
-      local delimiter = sql_text:match("^%$%$", i)
-        or sql_text:match("^%$[%a_\128-\255][%w_\128-\255]*%$", i)
-      if not delimiter then return nil end
-      local close = sql_text:find(delimiter, i + #delimiter, true)
-      if not close then return nil end
-      tokens[#tokens + 1] = { kind = "literal" }
-      i = close + #delimiter
-    elseif ch == "$" or (ch == "#" and adapter_kind ~= "postgresql" and adapter_kind ~= "duckdb") then
-      return nil
-    else
-      tokens[#tokens + 1] = { kind = ch }
-      i = i + 1
-    end
+  for _, pos in ipairs(starts) do
+    local mutates = command(pos)
+    if mutates ~= false then return mutates end
   end
-  return tokens
+  return false
 end
 
 -- Expose metadata only for direct columns of one known source. A dotted name
@@ -429,6 +415,10 @@ local function resolve_query(arg, page_size, adapter_kind)
   if arg == "" then
     return nil, "No table name or query provided."
   end
+  -- Reject before lexical failure can fall back to a bare-table query.
+  if arg:find("\0", 1, true) then
+    return nil, "SQL text cannot contain NUL bytes; use CHAR(0) or a hex expression for NUL data."
+  end
 
   -- File-as-table or URL-as-table: route to DuckDB
   if is_queryable_file(arg) then
@@ -468,7 +458,7 @@ local function resolve_query(arg, page_size, adapter_kind)
   end
 
   -- Detect statement type
-  local upper = arg:upper():match("^%s*(%u+)")
+  local upper = statement_type(arg, adapter_kind)
   if upper == "SELECT" or upper == "TABLE" then
     local table_name = nil
     local flat = arg:gsub("\n", " ")
@@ -483,15 +473,26 @@ local function resolve_query(arg, page_size, adapter_kind)
     end
     return query.new_raw(arg, page_size), table_name
   end
-  -- WITH can be a read-only CTE (SELECT) or a mutating CTE (UPDATE/DELETE/INSERT).
-  -- Scan for mutation keywords to decide; default to SELECT if none found.
+  -- CTE mutations retain the confirmed execution path, while identifier
+  -- spellings in read queries cannot change their routing.
   if upper == "WITH" then
-    local stripped = arg:upper():gsub("'[^']*'", ""):gsub("%-%-.-%\n", "")
-    if stripped:find("%f[%u]UPDATE%f[^%u]") or stripped:find("%f[%u]DELETE%f[^%u]")
-        or stripped:find("%f[%u]INSERT%f[^%u]") then
+    local tokens = tokenize_select(arg, adapter_kind, true)
+    local mutates = tokens and cte_mutation(tokens, adapter_kind)
+    if mutates == nil then return nil, "Could not safely classify this WITH statement" end
+    if mutates then return nil, nil, nil, arg end
+    return query.new_raw(arg, page_size), nil
+  end
+  -- MERGE has no row-preview model. Preserve the original statement behind
+  -- whole-statement confirmation, consistently with mutating WITH statements.
+  if upper == "MERGE" and (adapter_kind == "postgresql"
+      or adapter_kind == "duckdb" or adapter_kind == "sqlserver") then
+    local tokens = tokenize_select(arg, adapter_kind, true)
+    if not tokens then return nil, "Could not safely classify this MERGE statement" end
+    local target = tokens[2]
+    if target and (target.upper == "INTO" or (adapter_kind == "sqlserver"
+        and (target.kind == "ident" or target.kind == "@"))) then
       return nil, nil, nil, arg
     end
-    return query.new_raw(arg, page_size), nil
   end
   -- REPLACE INTO (MySQL/SQLite): route through mutation preview like INSERT
   if upper == "REPLACE" then
@@ -500,7 +501,7 @@ local function resolve_query(arg, page_size, adapter_kind)
   -- Destructive statements: execute directly, don't wrap in SELECT
   if upper == "UPDATE" or upper == "DELETE" or upper == "INSERT"
     or upper == "ALTER" or upper == "DROP" or upper == "CREATE"
-    or upper == "BEGIN" or upper == "COMMIT" or upper == "ROLLBACK" then
+    or upper == "BEGIN" or upper == "START" or upper == "COMMIT" or upper == "ROLLBACK" then
     return nil, nil, nil, arg  -- 4th return = mutation SQL
   end
   -- Otherwise treat as table name
@@ -513,6 +514,7 @@ M._resolve_query = resolve_query
 -- Applies staged changes to a local file by creating a temp table, mutating it,
 -- then COPY TO-ing back to the original path. file_path must be a local path.
 local function do_apply_file_writeback(bufnr, session)
+  local is_current = require("dadbod-grip.write").capture_owner(bufnr, session)
   local st = session.state
   local file_path = session.file_path
   local fmt = filetypes.write_format(file_path)
@@ -583,16 +585,15 @@ local function do_apply_file_writeback(bufnr, session)
   table.insert(stmts, "DROP TABLE _grip_w")
 
   local full_sql = table.concat(stmts, ";\n") .. ";"
-  local t0 = vim.uv.hrtime()
-  local _, err = db.execute(full_sql, "duckdb::memory:")
-  local ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
+  local written, err, ms, unknown = require("dadbod-grip.write").execute(full_sql, "duckdb::memory:", short)
 
   if err then
-    editor.show_error("Write-back failed", {
-      "✗ File not overwritten", "",
-      "  " .. (err:match("[^\n]+") or err), "",
-      "  Your staged changes are preserved.",
-    })
+    local title = unknown and "Write outcome unknown" or "Write-back failed"
+    local err_lines = { "✗ " .. title, "" }
+    for line in err:gmatch("[^\n]+") do table.insert(err_lines, "  " .. line) end
+    table.insert(err_lines, "")
+    table.insert(err_lines, "  Your staged changes are preserved.")
+    editor.show_error(title, err_lines)
     return
   end
 
@@ -608,15 +609,17 @@ local function do_apply_file_writeback(bufnr, session)
   local history = require("dadbod-grip.history")
   history.record({ sql = full_sql, url = "duckdb::memory:", table_name = file_path, type = "writeback", elapsed_ms = ms })
 
-  session.elapsed_ms = ms
-  session.last_action = "writeback"
-  session.on_refresh(bufnr)
+  if is_current() then
+    session.on_refresh(bufnr, { write_elapsed_ms = ms, write_engine_timing = written and written.engine_timing,
+      is_current = is_current })
+  end
 end
 
 -- ── apply staged changes ──────────────────────────────────────────────────
 local function do_apply(bufnr, url)
   local session = view._sessions[bufnr]
   if not session then return end
+  local is_current = require("dadbod-grip.write").capture_owner(bufnr, session)
 
   -- File write-back path: session is a local file opened in write mode
   if session.write_mode and session.file_path
@@ -626,106 +629,58 @@ local function do_apply(bufnr, url)
   end
 
   local st = session.state
-
-  local updates = data.get_updates(st)
-  local inserts = data.get_inserts(st)
-  local deletes = data.get_deletes(st)
-
-  local total = #updates + #inserts + #deletes
-  if total == 0 then
+  if session._write_unknown then
+    vim.notify("Write outcome unknown: refresh before applying more changes", vim.log.levels.ERROR)
+    return
+  end
+  if not data.has_changes(st) then
     vim.notify("No changes to apply", vim.log.levels.INFO)
     return
   end
-
-  -- Build all statements. The dialect needs the real scheme, so a templated
-  -- URL is resolved first (see ddl.drop_table).
-  local adapter_kind = adapters.kind(db.resolved_url(url))
-  local stmts = sql.build_apply(st, adapter_kind)
-  -- Computed before the apply, from the rows as loaded.
-  local reverse_stmts, irreversible = sql.build_undo(st, adapter_kind)
-  if #irreversible > 0 and vim.fn.confirm(string.format(
-      "%d deleted row(s) hold a binary value over 8000 bytes that the grid never loaded,\n"
-      .. "so u cannot put them back. Apply anyway?", #irreversible), "&Yes\n&No", 2) ~= 1 then
+  local info, metadata_err = db.get_column_info(st.table_name, url)
+  if not info then
+    vim.notify("Apply refused: " .. tostring(metadata_err or "table metadata unavailable"), vim.log.levels.ERROR)
     return
   end
-
-  -- Keys the database will give the inserts: which rows hold their values now,
-  -- so the ones that appear after the apply are known to be theirs.
-  local key_plan = sql.build_inserted_keys(st, adapter_kind)
-  local keys_before = key_plan and db.query(key_plan.sql, url)
-
-  -- Wrap in transaction for atomicity (all or nothing)
-  local txn_sql = sql.wrap_transaction(stmts, adapter_kind)
-  local t_apply = vim.uv.hrtime()
-  local _, err = db.execute(txn_sql, url)
-  local apply_ms = math.floor((vim.uv.hrtime() - t_apply) / 1e6)
-
+  local plan, plan_err = require("dadbod-grip.transaction").plan(st, info)
+  if not plan then
+    vim.notify("Apply refused: " .. plan_err, vim.log.levels.ERROR)
+    return
+  end
+  if not is_current() then
+    vim.notify("Grid changed: apply cancelled before write", vim.log.levels.WARN)
+    return
+  end
+  if not require('dadbod-grip.write').begin_write(session) then return end
+  is_current = require('dadbod-grip.write').capture_owner(bufnr, session)
+  local written, err, apply_ms, unknown, lifecycle = require("dadbod-grip.write").execute(plan, url, st.table_name)
+  session._write_pending = nil
   if err then
-    -- Transaction failed: DB auto-rolled back
-    local err_lines = { "✗ Transaction rolled back (" .. total .. " statement(s))", "" }
-    for chunk in (err .. "\n"):gmatch("([^\n]+)\n?") do
-      if chunk ~= "" then table.insert(err_lines, "  " .. chunk) end
+    if unknown and view._sessions[bufnr] == session then
+      session._write_unknown, session._write_lifecycle = true, lifecycle
     end
+    local title = unknown and "Write outcome unknown" or "Apply refused or conflicted"
+    local err_lines = { title, "" }
+    for line in (err .. "\n"):gmatch("([^\n]+)\n?") do table.insert(err_lines, line) end
     table.insert(err_lines, "")
-    table.insert(err_lines, "  Your changes are preserved. Fix the value or press u to undo.")
-    editor.show_error("Apply failed", err_lines)
+    table.insert(err_lines, "Staged changes are preserved. Refresh and inspect before retrying.")
+    editor.show_error(title, err_lines)
     return
   end
-
-  -- Success: the reverse of the deletes and updates is in reverse_stmts
-  -- (built above, from the rows as loaded).
-
-  -- Reverse of INSERT = DELETE by PK.
-  -- If the user typed an explicit PK (plain INSERT), use it directly.
-  -- If PK was auto-assigned (clone / new-row with SERIAL/UUID), its key is the
-  -- one that holds the row's values now and did not before the apply.
-  local new_keys = {}
-  if key_plan and keys_before then
-    local keys_after = db.query(key_plan.sql, url)
-    if keys_after then
-      new_keys = sql.match_inserted_keys(key_plan, keys_before.rows, keys_after.rows, st.pks)
-    end
+  vim.notify("Applied " .. #plan.ops .. " change(s) to " .. st.table_name, vim.log.levels.INFO)
+  require("dadbod-grip.history").record({ sql = written.sql, url = url,
+    table_name = st.table_name, type = "dml", elapsed_ms = apply_ms })
+  if not is_current() then
+    vim.notify("The initiating view changed; refresh to inspect the committed write", vim.log.levels.WARN)
+    return
   end
-  for i, ins in ipairs(inserts) do
-    local ins_pk_values = {}
-    for _, pk in ipairs(st.pks) do
-      ins_pk_values[pk] = ins.values[pk]
-    end
-    if not next(ins_pk_values) and new_keys[i] then ins_pk_values = new_keys[i] end
-
-    if next(ins_pk_values) then
-      table.insert(reverse_stmts, sql.build_delete(st.table_name, ins_pk_values, adapter_kind, sql.state_opts(st)))
-    end
-  end
-
-  -- Store in transaction undo stack
-  if #reverse_stmts > 0 then
-    session._txn_undo_stack = session._txn_undo_stack or {}
-    table.insert(session._txn_undo_stack, reverse_stmts)
-    if #session._txn_undo_stack > 10 then table.remove(session._txn_undo_stack, 1) end
-  end
-
-  -- Clear local staging undo stack (stale pre-apply states)
+  session._txn_undo_stack = session._txn_undo_stack or {}
+  written.undo.url = url
+  table.insert(session._txn_undo_stack, written.undo)
+  if #session._txn_undo_stack > 10 then table.remove(session._txn_undo_stack, 1) end
   session._undo_stack = {}
-
-  -- Notify, record history, and refresh
-  local parts = {}
-  if #updates > 0 then table.insert(parts, #updates .. " update(s)") end
-  if #deletes > 0 then table.insert(parts, #deletes .. " delete(s)") end
-  if #inserts > 0 then table.insert(parts, #inserts .. " insert(s)") end
-  vim.notify("Applied " .. table.concat(parts, ", "), vim.log.levels.INFO)
-
-  local history = require("dadbod-grip.history")
-  history.record({ sql = txn_sql, url = url, table_name = st.table_name, type = "dml" })
-
-  session.elapsed_ms = apply_ms
-  -- Build action label from what was applied
-  local action_parts = {}
-  if #updates > 0 then table.insert(action_parts, "updated") end
-  if #inserts > 0 then table.insert(action_parts, "inserted") end
-  if #deletes > 0 then table.insert(action_parts, "deleted") end
-  session.last_action = table.concat(action_parts, "+")
-  session.on_refresh(bufnr)
+  session.on_refresh(bufnr, { write_elapsed_ms = apply_ms, write_engine_timing = written.engine_timing,
+    is_current = is_current })
 end
 
 -- ── refresh ───────────────────────────────────────────────────────────────
@@ -737,6 +692,28 @@ local function spinner_label(table_name)
   return ((label:match("^([^\n]+)") or "query"):sub(1, 50))
 end
 
+--- Column formatting follows the rows it describes. A metadata request pumps
+--- the event loop too, so check its owner again after the adapter returns.
+local function schedule_column_info(bufnr, owner, table_name, url)
+  owner._column_info = nil
+  if not table_name then return end
+  local state, spec, generation = owner.state, owner.query_spec, owner._refresh_generation
+  local owner_url = owner.url
+  local function is_current()
+    return view._sessions[bufnr] == owner and vim.api.nvim_buf_is_valid(bufnr)
+      and owner.state == state and owner.query_spec == spec and owner.url == owner_url
+      and owner._refresh_generation == generation and state.table_name == table_name
+  end
+  vim.schedule(function()
+    if not is_current() then return end
+    local info = db.get_column_info(table_name, url)
+    if info and is_current() then
+      owner._column_info = info
+      M._render_if_visible(bufnr)
+    end
+  end)
+end
+
 --- Every db round-trip one refresh needs. Split out of do_refresh so a caller
 --- that has its own db work to do first (on_requery runs a COUNT) can put the
 --- whole batch inside one ui.blocking float instead of flashing two.
@@ -744,15 +721,29 @@ end
 --- Returns ONE table, never a bare `nil, err`: ui.blocking() forwards its fn's
 --- returns through table.unpack, which drops everything after a leading nil.
 --- @return table { result: table|nil, err: string|nil, elapsed_ms: number }
-local function fetch_refresh(url, query_sql, table_name)
+local function fetch_refresh(url, query_sql, table_name, is_raw, is_current)
   local t0 = vim.uv.hrtime()
-  local result, err = db.query(query_sql, url)
+  local result, err = db.query(query_sql, url, { engine_timing = OPTS.engine_timing })
   local elapsed_ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
   if err then return { err = err, elapsed_ms = elapsed_ms } end
 
+  -- Some clients omit headers for zero rows. Schema fallback can prove the
+  -- columns of our full-table SELECT *, but not a raw query's projection.
+  local unproven_projection = is_raw and #result.columns == 0
+
+  local column_info, columns_requested
+  local function read_columns()
+    if not columns_requested then
+      columns_requested = true
+      local ok, info = pcall(db.get_column_info, table_name, url)
+      if ok then column_info = info end
+    end
+    return column_info
+  end
+
   -- Empty result: fetch columns from schema (adapter returns none for 0 rows)
   if (#result.columns == 0) and table_name then
-    local col_info = db.get_column_info(table_name, url)
+    local col_info = read_columns()
     if col_info then
       for _, ci in ipairs(col_info) do
         table.insert(result.columns, ci.column_name)
@@ -761,7 +752,7 @@ local function fetch_refresh(url, query_sql, table_name)
   end
 
   -- Re-fetch primary keys. Keep a result the adapter already marked read-only.
-  result.readonly = result.readonly == true or db.is_readonly(url)
+  result.readonly = result.readonly == true or db.is_readonly(url) or unproven_projection == true
   if table_name and not result.readonly then
     local pks, pk_err = db.get_primary_keys(table_name, url)
     result.primary_keys = (pk_err == nil) and pks or {}
@@ -769,20 +760,47 @@ local function fetch_refresh(url, query_sql, table_name)
     result.primary_keys = {}
   end
 
+  -- Finish refresh metadata under the same owned spinner. A scheduled reader
+  -- after Apply returns can collide with the caller's next SQLite write.
+  -- Formatting metadata failure must not relabel an already committed write.
+  if is_current and table_name and is_current() then read_columns() end
+
   result.table_name = table_name
   result.url = url
   result.sql = query_sql
-  return { result = result, elapsed_ms = elapsed_ms }
+  return { result = result, elapsed_ms = elapsed_ms, column_info = column_info }
 end
 
---- Render what fetch_refresh returned. Kept outside the spinner float so the
---- grid repaints after it is torn down, the same order init.open() uses.
+--- Recount before selecting a table page, so a committed delete cannot leave
+--- the grid past its last page. A failed count is unknown, never the previous
+--- result's total. Raw refreshes avoid adding another evaluation of arbitrary
+--- SQL; explicit requery keeps its existing count contract.
+local function fetch_page(url, spec, table_name, count_raw, is_current)
+  if not is_current() then return { cancelled = true } end
+  local total_rows
+  if not spec.is_raw or count_raw then
+    local counted = db.query(query.build_count_sql(spec), url)
+    local count = counted and counted.rows[1] and tonumber(counted.rows[1][1])
+    if count and count >= 0 and count < math.huge and count == math.floor(count) then
+      total_rows = count
+      local total_pages = math.max(1, math.ceil(count / spec.page_size))
+      if spec.page > total_pages then spec = query.set_page(spec, total_pages) end
+    end
+  end
+  -- A count wait pumps input. Closing, navigating, staging, or starting a
+  -- newer write must cancel this page fetch before another DB round-trip.
+  if not is_current() then return { cancelled = true } end
+  local query_sql = query.build_sql(spec)
+  return fetch_refresh(url, query_sql, table_name, spec.is_raw, is_current),
+    { spec = spec, sql = query_sql, total_rows = total_rows }
+end
+
 --- Fetch a grid's first page. A wrapped raw query the server rejects (an
 --- unnamed column, an ORDER BY the wrapper cannot hold, ...) runs again as
 --- written, read-only; if that fails too, its error is the one to show.
 --- Returns fetched, the spec used, the table name used.
 function M._fetch_grid(url, spec, table_name)
-  local fetched = fetch_refresh(url, query.build_sql(spec), table_name)
+  local fetched = fetch_refresh(url, query.build_sql(spec), table_name, spec.is_raw)
   if fetched.result or not spec.source_sql then return fetched, spec, table_name end
   local as_written = query.new_passthrough(spec.source_sql, spec.page_size)
   local cap = require("dadbod-grip.adapters.sqlserver").row_cap_prefix(spec.source_sql)
@@ -790,26 +808,68 @@ function M._fetch_grid(url, spec, table_name)
   return fetch_refresh(url, query.build_sql(as_written), nil), as_written, nil
 end
 
-local function apply_refresh(bufnr, fetched)
+--- Render what fetch_refresh returned. Kept outside the spinner float so the
+--- grid repaints after it is torn down, the same order init.open() uses.
+local function apply_refresh(bufnr, fetched, owner, generation, query_update, write_result)
+  local session = view._sessions[bufnr]
+  if session ~= owner or not session or not vim.api.nvim_buf_is_valid(bufnr)
+      or session._refresh_generation ~= generation then return end
+  if not require('dadbod-grip.write').refresh_allowed(session) then return end
+  if write_result and write_result.is_current and not write_result.is_current() then return end
   if not fetched or not fetched.result then
     vim.notify("Grip: query failed: " .. tostring((fetched and fetched.err) or "unknown error"),
       vim.log.levels.ERROR)
     return
   end
   local new_state = data.new(fetched.result)
-  local session = view._sessions[bufnr]
-  if session then
-    session.elapsed_ms = fetched.elapsed_ms
-    session.last_action = "query"
+  session._write_unknown = nil
+  session._write_lifecycle = nil
+  -- Publish identity/count/rows/time together only after a successful SELECT.
+  if query_update then
+    session.query_spec = query_update.spec
+    session.query_sql = query_update.sql
+    session.total_rows = query_update.total_rows
   end
-  view.render(bufnr, new_state)
+  session.elapsed_ms = fetched.elapsed_ms
+  session.last_action = "query"
+  session._query_times[new_state.rows] = fetched.elapsed_ms
+  session._query_engine_times[new_state.rows] = fetched.result.engine_timing
+  if write_result then
+    session._write_times[new_state.rows] = write_result.write_elapsed_ms
+    session._write_engine_times[new_state.rows] = write_result.write_engine_timing
+  end
+  session._column_info = fetched.column_info
+  view.render_records(bufnr, new_state)
 end
 
-local function do_refresh(bufnr, url, query_sql, table_name)
-  local fetched = ui.blocking("  querying " .. spinner_label(table_name) .. "...", function()
-    return fetch_refresh(url, query_sql, table_name)
+local function begin_refresh(bufnr)
+  local session = view._sessions[bufnr]
+  if not session or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  if not require('dadbod-grip.write').refresh_allowed(session) then return end
+  session._refresh_generation = (session._refresh_generation or 0) + 1
+  return session, session._refresh_generation
+end
+
+local function do_refresh(bufnr, url, query_sql, table_name, write_result)
+  local owner, generation = begin_refresh(bufnr)
+  if not owner then return end
+  local is_current = require("dadbod-grip.write").capture_owner(bufnr, owner)
+  if write_result then
+    write_result.is_current = is_current
+  end
+  -- Clearing generations is cheap and cannot start a competing metadata read.
+  -- This also lets manual refresh recover schema changed outside Grip.
+  if type(db.invalidate_schema) == "function" then db.invalidate_schema(url) end
+  local fetched, query_update
+  ui.blocking("  querying " .. spinner_label(table_name) .. "...", function()
+    if owner.query_spec then
+      fetched, query_update = fetch_page(url, owner.query_spec, table_name, false, is_current)
+    else
+      fetched = fetch_refresh(url, query_sql, table_name, nil, is_current)
+    end
   end)
-  apply_refresh(bufnr, fetched)
+  if not is_current() then return end
+  apply_refresh(bufnr, fetched, owner, generation, query_update, write_result)
 end
 
 -- ── edit cell ─────────────────────────────────────────────────────────────
@@ -819,7 +879,11 @@ local function do_edit(bufnr, cell, url)
 
   -- Binary columns: not editable
   local val = cell.value or ""
-  if val:sub(1, #"<binary") == "<binary" then
+  if cell.storage_type == 'raw_unknown' then
+    vim.notify('Unproven raw bytes: editing is unavailable',vim.log.levels.INFO)
+    return
+  end
+  if cell.storage_type == "blob" or val:sub(1, #"<binary") == "<binary" then
     vim.notify("Binary column: not editable", vim.log.levels.INFO)
     return
   end
@@ -829,13 +893,13 @@ local function do_edit(bufnr, cell, url)
     return
   end
 
+  local is_current = require("dadbod-grip.write").capture_owner(bufnr, session)
   local prompt = (session.state.table_name or "row") .. "." .. cell.col_name
   local edited_row_idx = cell.row_idx
   local edited_col    = cell.col_name
 
-  -- JSON cells open as stored, not pretty-printed: the editor's text is what
-  -- gets saved, and a decode/re-encode would sort the keys and round numbers
-  -- through a Lua double.
+  -- Detect JSON only for editor options. The saved text must start as stored:
+  -- decoding/re-encoding can round numbers and change keys or whitespace.
   local initial_val = cell.value
   local is_json = false
   if initial_val and #initial_val > 1 then
@@ -883,19 +947,9 @@ local function do_edit(bufnr, cell, url)
       return
     end
 
-    -- An emptied editor means '' where the column or the cell says so
-    -- (data.cleared_value), else NULL.
-    if new_val == editor.NULL_VALUE then
-      local cleared = data.cleared_value(session.state, cell.row_idx, cell.col_name)
-      if cleared == data.EMPTY then
-        if cell.value == "" then
-          _restore(_pre_cursor)
-          return
-        end
-        view.apply_edit(bufnr, data.add_change(session.state, cell.row_idx, cell.col_name, data.EMPTY))
-        _restore(_pre_cursor)
-        return
-      end
+    if not is_current() then
+      vim.notify("Grid changed: nothing staged", vim.log.levels.WARN)
+      return
     end
 
     -- Skip staging if nothing actually changed
@@ -927,208 +981,154 @@ local function do_edit(bufnr, cell, url)
   end, edit_opts)
 end
 
--- ── parse INSERT VALUES ───────────────────────────────────────────────────
--- Best-effort parser for INSERT ... VALUES (...), (...).
--- Returns list of {col = val} tables. Skips INSERT...SELECT (no VALUES keyword).
-local function parse_insert_values(flat, columns)
-  if not flat:find("[Vv][Aa][Ll][Uu][Ee][Ss]") then return {} end
-
-  -- Extract column list between INSERT INTO tbl (...) VALUES
-  -- Pattern: everything in parens before the VALUES keyword
-  local col_str = flat:match("[Ii][Nn][Ss][Ee][Rr][Tt][^(]+%(([^)]+)%)%s*[Vv][Aa][Ll][Uu][Ee][Ss]")
-  local insert_cols
-  if col_str then
-    insert_cols = {}
-    for part in col_str:gmatch("[^,]+") do
-      local col = part:match("^%s*(.-)%s*$"):gsub('^"(.*)"$', "%1"):gsub("^`(.*)`$", "%1")
-      if col ~= "" then table.insert(insert_cols, col) end
+-- ── mutation preview ──────────────────────────────────────────────────────
+local function preview_columns(names, kind)
+  local columns, exact = {}, kind == "sqlserver" and {} or nil
+  for _, column in ipairs(names) do
+    local key = kind == "postgresql" and column or column:lower()
+    -- SQL Server may distinguish Value and value under its catalog collation.
+    -- Use exact metadata first; folded spelling is usable only when unique.
+    if exact then
+      exact[column] = column
+      columns[key] = columns[key] == nil and column or false
+    else
+      columns[key] = column
     end
-  else
-    insert_cols = columns  -- no column list: assume schema order
   end
-  if #insert_cols == 0 then return {} end
-
-  local values_part = flat:match("[Vv][Aa][Ll][Uu][Ee][Ss]%s*(.*)")
-  if not values_part then return {} end
-
-  local rows = {}
-  local pos = 1
-  while pos <= #values_part do
-    local pstart = values_part:find("%(", pos)
-    if not pstart then break end
-    -- Walk to matching ')' respecting single-quoted strings
-    local depth, i = 1, pstart + 1
-    while i <= #values_part and depth > 0 do
-      local ch = values_part:sub(i, i)
-      if ch == "'" then
-        i = i + 1
-        while i <= #values_part do
-          if values_part:sub(i, i) == "'" then
-            if values_part:sub(i + 1, i + 1) == "'" then i = i + 2
-            else i = i + 1; break end
-          else i = i + 1 end
-        end
-      elseif ch == "(" then depth = depth + 1; i = i + 1
-      elseif ch == ")" then depth = depth - 1; i = i + 1
-      else i = i + 1 end
-    end
-    local tuple = values_part:sub(pstart + 1, i - 2)
-    pos = i
-
-    -- Tokenize the tuple
-    local vals, ti, tn = {}, 1, #tuple
-    while ti <= tn do
-      while ti <= tn and (tuple:sub(ti, ti) == "," or tuple:sub(ti, ti):match("^%s$")) do ti = ti + 1 end
-      if ti > tn then break end
-      local token
-      if tuple:sub(ti, ti) == "'" then
-        local tj = ti + 1
-        while tj <= tn do
-          if tuple:sub(tj, tj) == "'" then
-            if tuple:sub(tj + 1, tj + 1) == "'" then tj = tj + 2
-            else break end
-          else tj = tj + 1 end
-        end
-        token = tuple:sub(ti + 1, tj - 1):gsub("''", "'")
-        ti = tj + 1
-      else
-        local tj = ti
-        while tj <= tn and tuple:sub(tj, tj) ~= "," do tj = tj + 1 end
-        token = tuple:sub(ti, tj - 1):match("^%s*(.-)%s*$")
-        if token:upper() == "NULL" then token = nil end
-        ti = tj
-      end
-      table.insert(vals, token)
-    end
-
-    local row = {}
-    for j, col in ipairs(insert_cols) do row[col] = vals[j] end
-    table.insert(rows, row)
-  end
-  return rows
+  return columns, exact
 end
 
--- ── mutation preview ──────────────────────────────────────────────────────
--- Shows affected rows in a grid before executing UPDATE/DELETE/INSERT.
-function M._mutation_preview(mutation_sql, url, stmt_type, caller_opts)
-  local sql_mod = require("dadbod-grip.sql")
-
-  -- Extract table name from the SQL (handles quoted identifiers)
-  local flat = mutation_sql:gsub("\n", " ")
-  local table_name
-  if stmt_type == "UPDATE" then
-    local after_update = flat:match("[Uu][Pp][Dd][Aa][Tt][Ee]%s+(.*)")
-    if after_update then
-      table_name = after_update:match('^"([^"]+)"') or after_update:match("^`([^`]+)`") or after_update:match("^([%w_%.]+)")
-    end
-  elseif stmt_type == "DELETE" then
-    table_name = flat:match('[Ff][Rr][Oo][Mm]%s+"([^"]+)"')
-      or flat:match("[Ff][Rr][Oo][Mm]%s+`([^`]+)`")
-      or flat:match("[Ff][Rr][Oo][Mm]%s+([%w_%.]+)")
-  elseif stmt_type == "INSERT" then
-    table_name = flat:match('[Ii][Nn][Ss][Ee][Rr][Tt]%s+[Ii][Nn][Tt][Oo]%s+"([^"]+)"')
-      or flat:match("[Ii][Nn][Ss][Ee][Rr][Tt]%s+[Ii][Nn][Tt][Oo]%s+`([^`]+)`")
-      or flat:match("[Ii][Nn][Ss][Ee][Rr][Tt]%s+[Ii][Nn][Tt][Oo]%s+([%w_%.]+)")
-  end
-
-  if not table_name then
-    vim.notify("Could not parse table from " .. stmt_type, vim.log.levels.ERROR)
+-- Shows matching or current rows before executing UPDATE/DELETE/INSERT/REPLACE.
+function M._mutation_preview(mutation_sql, url, stmt_type, caller_opts, execution_sql)
+  local kind = adapters.kind(db.resolved_url(url))
+  local parsed, parse_err = require("dadbod-grip.mutation").parse(
+    mutation_sql, tokenize_select(mutation_sql, kind, true), kind, stmt_type)
+  if not parsed then
+    vim.notify("Could not preview " .. stmt_type .. ": " .. (parse_err or "unsupported SQL syntax"), vim.log.levels.ERROR)
     return
   end
+  local inserting = stmt_type == "INSERT" or stmt_type == "REPLACE"
+  local table_name = parsed.table_name
+  local preview_sql = "SELECT * FROM " .. parsed.source_sql
+  if parsed.where and parsed.where ~= "" then
+    -- T-SQL does not require statement separators. Keep its balanced predicate
+    -- inside one expression even if an unrecognized command follows it.
+    local predicate = kind == "sqlserver" and ("(" .. parsed.where .. ")") or parsed.where
+    preview_sql = preview_sql .. " WHERE " .. predicate
+  end
 
-  -- Extract WHERE clause (not applicable for INSERT)
-  local where
-  if stmt_type ~= "INSERT" then
-    where = flat:match("[Ww][Hh][Ee][Rr][Ee]%s+(.+)$")
-    if where then
-      where = where:gsub("%s*;%s*$", "")
-      -- Strip trailing ORDER BY, LIMIT etc.
-      where = where:gsub("%s+[Oo][Rr][Dd][Ee][Rr]%s+[Bb][Yy].*$", "")
-      where = where:gsub("%s+[Ll][Ii][Mm][Ii][Tt]%s+.*$", "")
+  local preview = ui.blocking("  previewing " .. spinner_label(table_name) .. "...", function()
+    -- Run preview query
+    local result, err = db.query(preview_sql, url)
+    if not result then
+      return { err = err or "query error" }
     end
-  end
 
-  -- Build preview SELECT (INSERT shows full current table state)
-  local preview_sql = "SELECT * FROM " .. sql_mod.quote_ident(table_name)
-  if where and where ~= "" then
-    preview_sql = preview_sql .. " WHERE " .. where
-  end
-
-  -- Run preview query
-  local result, err = db.query(preview_sql, url)
-  if not result then
-    vim.notify("Preview failed: " .. (err or "query error"), vim.log.levels.ERROR)
-    return
-  end
-
-  -- Fetch columns from schema if needed (empty result)
-  if #result.columns == 0 then
-    local col_info = db.get_column_info(table_name, url)
-    if col_info then
-      for _, ci in ipairs(col_info) do table.insert(result.columns, ci.column_name) end
+    -- Fetch columns from schema if needed (empty result)
+    if #result.columns == 0 then
+      local col_info = db.get_column_info(table_name, url)
+      if col_info then
+        for _, ci in ipairs(col_info) do table.insert(result.columns, ci.column_name) end
+      end
     end
-  end
 
-  -- Fetch PKs. Keep a result the adapter already marked read-only.
-  result.readonly = result.readonly == true or db.is_readonly(url)
-  local pks = result.readonly and {} or (db.get_primary_keys(table_name, url) or {})
-  result.primary_keys = pks
-  result.table_name = table_name
-  result.url = url
-  result.sql = preview_sql
+    -- Fetch PKs. Keep a result the adapter already marked read-only.
+    result.readonly = result.readonly == true or db.is_readonly(url)
+    local pks = result.readonly and {} or (db.get_primary_keys(table_name, url) or {})
+    result.primary_keys = pks
+    result.table_name = table_name
+    result.url = url
+    result.sql = preview_sql
 
-  local state = data.new(result)
-  local row_count = #result.rows
+    local state = data.new(result)
+    local row_count = #result.rows
 
-  -- For UPDATE: parse SET clause and pre-stage changes so cells show as blue
-  if stmt_type == "UPDATE" and row_count > 0 then
-    local set_clause = flat:match("[Ss][Ee][Tt]%s+(.-)%s+[Ww][Hh][Ee][Rr][Ee]")
-      or flat:match("[Ss][Ee][Tt]%s+(.-)%s*;?%s*$")
-    if set_clause then
-      -- Parse "col = 'val', col2 = 'val2'" assignments
-      for assignment in set_clause:gmatch("([^,]+)") do
-        local col_raw, val_raw = assignment:match("^%s*(.-)%s*=%s*(.-)%s*$")
-        if col_raw and val_raw then
-          -- Strip quotes from column name
-          local col = col_raw:match('^"([^"]+)"$') or col_raw:match("^`([^`]+)`$") or col_raw:match("^%s*(%S+)%s*$")
-          -- Strip quotes from value
-          local val = val_raw:match("^'(.-)'$") or val_raw:match('^"(.-)"$') or val_raw
-          if col and val then
-            -- Apply as staged change to every row
-            for row_idx = 1, #state.rows do
-              state = data.add_change(state, row_idx, col, val)
-            end
+    -- Stage only parsed literal assignments. Expressions are executed by the
+    -- database on confirmation; their text is not a predicted cell value.
+    if stmt_type == "UPDATE" and row_count > 0 then
+      local columns, exact = preview_columns(state.columns, kind)
+      local assignments = parsed.assignments
+      if exact then
+        -- Resolve names before discarding repeated or unknown assignments:
+        -- differently-cased spellings may refer to one column or two.
+        local latest = {}
+        for _, assignment in ipairs(assignments) do
+          local column = exact[assignment.column] or columns[assignment.column:lower()]
+          if column then
+            latest[column] = assignment.known ~= false and assignment or nil
+          end
+        end
+        assignments = {}
+        for _, assignment in pairs(latest) do assignments[#assignments + 1] = assignment end
+      end
+      for _, assignment in ipairs(assignments) do
+        local key = kind == "postgresql" and assignment.column or assignment.column:lower()
+        local column = (exact and exact[assignment.column]) or columns[key]
+        if column then
+          -- This state has not been published yet: fill it once instead of
+          -- copying every previously staged row for each cell. SQL empty
+          -- strings stay distinct from NULL (interactive edits normalize them).
+          for row_idx = 1, #state.rows do
+            local changes = state.changes[row_idx]
+            if not changes then changes = {}; state.changes[row_idx] = changes end
+            changes[column] = assignment.value == nil and data.NULL_SENTINEL or assignment.value
           end
         end
       end
     end
-  end
 
-  -- For DELETE: mark all rows as deleted so they show red
-  if stmt_type == "DELETE" and row_count > 0 then
-    for row_idx = 1, #state.rows do
-      state = data.toggle_delete(state, row_idx)
+    -- For DELETE: mark all rows as deleted so they show red
+    if stmt_type == "DELETE" and row_count > 0 then
+      for row_idx = 1, #state.rows do
+        state.deleted[row_idx] = true
+      end
     end
-  end
 
-  -- For INSERT with VALUES: parse and add new rows highlighted green
-  if stmt_type == "INSERT" then
-    local insert_rows = parse_insert_values(flat, result.columns)
-    for _, row_values in ipairs(insert_rows) do
-      state = data.insert_row_with_values(state, #result.rows, row_values)
+    -- Stage complete literal tuples only. Conflict handling, defaults and
+    -- computed rows show current state; confirmation still runs original SQL.
+    if inserting then
+      local insert_rows = {}
+      local columns, exact = preview_columns(result.columns, kind)
+      local fields = parsed.insert_columns or result.columns
+      for _, tuple in ipairs(parsed.insert_values) do
+        if tuple.n ~= #fields then parsed.current_state = true; break end
+        local row, seen = {}, {}
+        for idx, field in ipairs(fields) do
+          local key = kind == "postgresql" and field or field:lower()
+          local column = (exact and exact[field]) or columns[key]
+          if not column or seen[column] then parsed.current_state = true; break end
+          seen[column] = true
+          row[column] = tuple[idx] == nil and data.NULL_SENTINEL or tuple[idx]
+        end
+        insert_rows[#insert_rows + 1] = row
+      end
+      if parsed.current_state then
+        row_count = nil
+      else
+        state = data.insert_rows_with_values(state, #result.rows, insert_rows)
+        row_count = #insert_rows
+      end
     end
-    row_count = #insert_rows  -- count = rows being inserted, not existing rows
+    return { state = state, row_count = row_count }
+  end)
+  if preview.err then
+    vim.notify("Preview failed: " .. preview.err, vim.log.levels.ERROR)
+    return
   end
+  local state, row_count = preview.state, preview.row_count
 
   -- Open grid with pending_mutation metadata
   local reuse_win = caller_opts and caller_opts.reuse_win
   local view_opts = {
     max_col_width = OPTS.max_col_width,
     pending_mutation = {
-      sql = mutation_sql,
+      sql = execution_sql or mutation_sql,
       type = stmt_type,
       table_name = table_name,
       row_count = row_count,
+      current_state = parsed.current_state or nil,
+      -- MySQL ROW_COUNT() after COMMIT counts the commit, not the mutation.
+      affected_count_unavailable = execution_sql ~= nil and kind == "mysql" or nil,
     },
   }
   if reuse_win then view_opts.reuse_win = reuse_win end
@@ -1140,13 +1140,12 @@ function M._mutation_preview(mutation_sql, url, stmt_type, caller_opts)
   if session then
     session.pending_mutation = view_opts.pending_mutation
     session.query_spec = query.new_raw(preview_sql, OPTS.limit)
-    if stmt_type == "INSERT" then
-      if row_count > 0 then
-        session._mutation_title = string.format("INSERT into %s (%d new row%s)",
-          table_name, row_count, row_count == 1 and "" or "s")
+    if inserting then
+      if row_count then
+        session._mutation_title = string.format("%s into %s (%d new row%s)",
+          stmt_type, table_name, row_count, row_count == 1 and "" or "s")
       else
-        -- INSERT ... SELECT or unparseable VALUES
-        session._mutation_title = string.format("INSERT into %s (current state)", table_name)
+        session._mutation_title = string.format("%s into %s (current state)", stmt_type, table_name)
       end
     else
       session._mutation_title = string.format("%s %s (%d row%s)",
@@ -1155,8 +1154,8 @@ function M._mutation_preview(mutation_sql, url, stmt_type, caller_opts)
 
     -- Wire refresh callback so grid updates after mutation executes
     view.set_callbacks(bufnr, {
-      on_refresh = function(bid)
-        do_refresh(bid, url, preview_sql, table_name)
+      on_refresh = function(bid, write_result)
+        do_refresh(bid, url, preview_sql, table_name, write_result)
       end,
     })
 
@@ -1190,35 +1189,56 @@ function M.open(arg, url, opts)
       vim.notify("Grip: no database connection", vim.log.levels.WARN)
       return
     end
-    local stmt_type = mutation_sql:upper():match("^%s*(%u+)") or "SQL"
+    local stmt_type = statement_type(mutation_sql, adapter_kind) or "SQL"
 
-    -- Unwrap BEGIN/COMMIT (or START TRANSACTION) blocks: extract inner DML for mutation preview.
-    -- Executing just the inner statement is correct: BEGIN/COMMIT is unnecessary for single stmts.
+    -- Preview one committed mutation, but execute the exact transaction text.
+    -- Never remove ROLLBACK or silently execute multiple hidden statements.
     if stmt_type == "BEGIN" or stmt_type == "START" then
-      local inner = mutation_sql
-        :gsub("^%s*START%s+TRANSACTION%s*;%s*\n?", "")
-        :gsub("^%s*BEGIN%s*;%s*\n?", "")
-        :gsub("\n?%s*COMMIT%s*;?%s*$", "")
-        :gsub("\n?%s*ROLLBACK%s*;?%s*$", "")
-      inner = inner:match("^%s*(.-)%s*$")
-      if inner and inner ~= "" then
-        local inner_type = inner:upper():match("^%s*(%u+)")
-        if inner_type == "UPDATE" or inner_type == "DELETE" or inner_type == "INSERT"
-            or inner_type == "REPLACE" then
-          local preview_type = inner_type == "REPLACE" and "INSERT" or inner_type
-          M._mutation_preview(inner, exec_conn, preview_type, opts)
-          return
-        end
+      local tokens = tokenize_select(mutation_sql, adapter_kind, true)
+      local last = tokens and #tokens or 0
+      if last > 0 and tokens[last].kind == ";" then last = last - 1 end
+      local first_end
+      for idx, token in ipairs(tokens or {}) do
+        if token.kind == ";" then first_end = idx; break end
       end
-      -- No DML inside: fall through to DDL confirm
+      local begin_pos = 2
+      if stmt_type == "BEGIN" and tokens and tokens[begin_pos]
+          and ({ DEFERRED = true, IMMEDIATE = true, EXCLUSIVE = true })[tokens[begin_pos].upper] then
+        begin_pos = begin_pos + 1
+      end
+      if tokens and tokens[begin_pos]
+          and (tokens[begin_pos].upper == "TRANSACTION" or tokens[begin_pos].upper == "WORK") then
+        begin_pos = begin_pos + 1
+      elseif stmt_type == "START" then
+        begin_pos = -1
+      end
+      local commit_pos = last
+      if tokens and tokens[commit_pos]
+          and (tokens[commit_pos].upper == "TRANSACTION" or tokens[commit_pos].upper == "WORK") then
+        commit_pos = commit_pos - 1
+      end
+      if not first_end or first_end ~= begin_pos or commit_pos <= first_end + 2
+          or (tokens[commit_pos].upper ~= "COMMIT" and tokens[commit_pos].upper ~= "END")
+          or tokens[commit_pos - 1].kind ~= ";" then
+        vim.notify("Could not preview transaction: use one mutation followed by COMMIT",
+          vim.log.levels.ERROR)
+        return
+      end
+      local inner_type = tokens[first_end + 1].upper
+      if inner_type ~= "UPDATE" and inner_type ~= "DELETE"
+          and inner_type ~= "INSERT" and inner_type ~= "REPLACE" then
+        vim.notify("Could not preview transaction: expected one mutation", vim.log.levels.ERROR)
+        return
+      end
+      local inner = mutation_sql:sub(tokens[first_end + 1].start, tokens[commit_pos - 1].finish)
+      M._mutation_preview(inner, exec_conn, inner_type, opts, mutation_sql)
+      return
     end
 
     -- For UPDATE/DELETE/INSERT/REPLACE: show preview grid with a:execute / U:cancel
     if stmt_type == "UPDATE" or stmt_type == "DELETE" or stmt_type == "INSERT"
         or stmt_type == "REPLACE" then
-      -- Treat REPLACE as INSERT for preview purposes
-      local preview_type = (stmt_type == "REPLACE") and "INSERT" or stmt_type
-      M._mutation_preview(mutation_sql, exec_conn, preview_type, opts)
+      M._mutation_preview(mutation_sql, exec_conn, stmt_type, opts)
       return
     end
 
@@ -1227,15 +1247,21 @@ function M.open(arg, url, opts)
     local choice = vim.fn.confirm(label .. "\n\n" .. mutation_sql:sub(1, 200), "&Execute\n&Cancel", 2)
     if choice ~= 1 then return end
 
-    local t0 = vim.uv.hrtime()
-    local _, exec_err = db.execute(mutation_sql, exec_conn)
-    local ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
+    local _, exec_err, ms = require("dadbod-grip.write").execute(mutation_sql, exec_conn, stmt_type)
     if exec_err then
       vim.notify("Grip: " .. exec_err, vim.log.levels.ERROR)
     else
       vim.notify(string.format("%s executed (%dms)", stmt_type, ms), vim.log.levels.INFO)
       local history = require("dadbod-grip.history")
       history.record({ sql = mutation_sql, url = exec_conn, type = stmt_type:lower(), elapsed_ms = ms })
+      if stmt_type == "CREATE" or stmt_type == "ALTER" or stmt_type == "DROP" then
+        local refreshed, refresh_err = pcall(function()
+          require("dadbod-grip.schema").refresh(exec_conn)
+        end)
+        if not refreshed then
+          vim.notify("DDL committed; schema refresh failed: " .. tostring(refresh_err), vim.log.levels.WARN)
+        end
+      end
       -- Refresh the grids the user can actually see. Iterating _sessions and
       -- breaking on the first hit picked an arbitrary grid (pairs order), which
       -- could leave the visible one stale while refreshing a hidden buffer.
@@ -1304,6 +1330,7 @@ function M.open(arg, url, opts)
   end)
 
   local result = fetched.result
+  if opts and opts.write_is_current and not opts.write_is_current() then return end
   if not result then
     vim.notify("Grip: " .. (fetched.err or "query failed"), vim.log.levels.ERROR)
     return
@@ -1331,9 +1358,12 @@ function M.open(arg, url, opts)
   local view_opts = vim.tbl_extend("force", {
     max_col_width = OPTS.max_col_width,
     elapsed_ms    = elapsed_ms,
+    engine_timing = result.engine_timing,
     query_spec    = spec,
     total_rows    = total_rows,
   }, opts or {})
+  -- The guard only owns this reload; do not retain the old session on the new one.
+  view_opts.write_is_current = nil
   local bufnr = view.open(state, conn, query_sql, view_opts)
 
   -- Auto-sync query pad with the current grid query (passive background update).
@@ -1355,24 +1385,12 @@ function M.open(arg, url, opts)
     -- assignments stay so a caller that reuses an existing buffer still gets them.
     session.query_spec = spec
     session.total_rows = total_rows
-    -- Auto-fetch column info for conditional formatting
-    if table_name_arg and not session._column_info then
-      vim.schedule(function()
-        local s = view._sessions[bufnr]
-        if s and not s._column_info then
-          local info = db.get_column_info(table_name_arg, conn)
-          if info then
-            s._column_info = info
-            M._render_if_visible(bufnr)
-          end
-        end
-      end)
-    end
+    schedule_column_info(bufnr, session, table_name_arg, conn)
   end
 
   -- Wire callbacks
   view.set_callbacks(bufnr, {
-    on_refresh = function(bid)
+    on_refresh = function(bid, write_result)
       local s = view._sessions[bid]
       if not s then return end
       if s.query_spec and s.query_spec.passthrough and s.query_spec.writes then
@@ -1382,45 +1400,29 @@ function M.open(arg, url, opts)
       -- Read current table name from session state (may have been updated by rename)
       local current_table = (s.state and s.state.table_name) or table_name_arg
       local sql_str = s.query_spec and query.build_sql(s.query_spec) or query_sql
-      do_refresh(bid, conn, sql_str, current_table)
+      do_refresh(bid, conn, sql_str, current_table, write_result)
     end,
     on_requery = function(bid, new_spec)
-      local s = view._sessions[bid]
-      if not s then return end
       if new_spec.passthrough then
         vim.notify("Sort, filter and pages need a single SELECT; this grid shows a batch as it ran",
           vim.log.levels.WARN)
         return
       end
+      local s, generation = begin_refresh(bid)
+      if not s then return end
+      local is_current = require("dadbod-grip.write").capture_owner(bid, s)
 
-      -- Sort / filter / page changes are two round-trips (COUNT then the page
-      -- itself). Both run inside one spinner: do_refresh's own float would
-      -- otherwise only cover the second, leaving the COUNT looking like a hang.
-      local new_sql, page_fetch
+      -- COUNT and SELECT share a spinner, but pending metadata must not
+      -- replace the displayed result's identity if SELECT fails/interruption
+      -- returns an error, or a newer refresh completes while this one waits.
+      local page_fetch, query_update
       ui.blocking("  querying " .. spinner_label(table_name_arg) .. "...", function()
-        -- Run count query for pagination
-        local count_sql = query.build_count_sql(new_spec)
-        local count_result = db.query(count_sql, conn)
-        if count_result and count_result.rows[1] then
-          s.total_rows = tonumber(count_result.rows[1][1]) or 0
-        end
-
-        -- Clamp page to valid range
-        if s.total_rows then
-          local total_pages = math.max(1, math.ceil(s.total_rows / new_spec.page_size))
-          if new_spec.page > total_pages then
-            new_spec = query.set_page(new_spec, total_pages)
-          end
-        end
-
-        new_sql = query.build_sql(new_spec)
-        page_fetch = fetch_refresh(conn, new_sql, table_name_arg)
+        page_fetch, query_update = fetch_page(conn, new_spec, table_name_arg, true, is_current)
       end)
-
-      s.query_spec = new_spec
-      s.query_sql = new_sql
-      apply_refresh(bid, page_fetch)
+      if not is_current() then return end
+      apply_refresh(bid, page_fetch, s, generation, query_update)
     end,
+
     on_apply = function(bid)
       do_apply(bid, conn)
     end,
@@ -1636,139 +1638,30 @@ function M.open_welcome()
     vim.api.nvim_buf_set_name(welcome_buf, "grip://welcome")
   end
 
-  local ver = "v" .. require("dadbod-grip.version")
-  -- Compact header matching help popup (help guy)
-  local logo = {
-    "",
-    "  ╔═╦═╦═╗",
-    "  ║d║b║g║  dadbod-grip " .. ver,
-    "  ╚═╩═╩═╝",
-    "  Editable database grids, inside Neovim.",
-    "",
-    "  ── Start ───────────────────────────────────────",
-    "  :GripStart    demo database + notebook",
-    "  :GripConnect  connect a database",
-    "  ?             full keymap reference",
-    "",
-    "  ── Navigate: 1 · 2 · 3 ─────────────────────────",
-    "  1   schema sidebar           2   query pad",
-    "  3   table / records          Q   this screen",
-    "  4   ER diagram               5-9 stats/cols/fk/idx",
-    "",
-    "  ── Query pad ───────────────────────────────────",
-    "  q       open pad             <C-CR>  run SQL block",
-    "  gn      notebook picker      gA      AI generation",
-    "  gh      query history        gq      load saved",
-    "  <C-s>   save query",
-    "",
-    "  ── Grid: edit ──────────────────────────────────",
-    "  i/<CR>  edit cell            x     set null",
-    "  o       insert row           d     delete row",
-    "  a       apply changes        u     undo",
-    "  gf      FK drill-down        s/S   sort / stack sort",
-    "  gF      filter builder       f     quick filter",
-    "  violet = modified · green = inserted · red = deleted",
-    "",
-    "  ── Analysis ────────────────────────────────────",
-    "  gR  column distributions     gS  column stats",
-    "  gD  diff tables              gE  export clipboard",
-    "  gX  export to file           A   AI SQL (grid)",
-    "",
-    "  ── Files ───────────────────────────────────────",
-    "  /path/to/file.csv   .parquet   .json   .xlsx",
-    "  https://host/data.parquet      (remote via httpfs)",
-    "  :Grip file.csv --write    edit + write back  (g!)",
-    "  :Grip file.csv --watch    auto-refresh on timer",
-    "",
-    "  ── Connect ─────────────────────────────────────",
-    "  postgresql://user:pass@host:5432/dbname",
-    "  mysql://user:pass@host:3306/dbname",
-    "  sqlite:path/to/file.db",
-    "  duckdb:path/to/file.duckdb   duckdb::memory:",
-    "",
-    "  ────────────────────────────────────────────────",
-    "",
-  }
-
-  vim.bo[welcome_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(welcome_buf, 0, -1, false, logo)
-  vim.bo[welcome_buf].modifiable = false
-  vim.bo[welcome_buf].buftype    = "nofile"
-  vim.bo[welcome_buf].modified   = false
-  vim.bo[welcome_buf].filetype   = "grip-welcome"
-
-  -- Syntax highlights for welcome screen: deferred so they survive FileType autocmds
-  local ns_w = vim.api.nvim_create_namespace("grip_welcome")
-  vim.api.nvim_buf_clear_namespace(welcome_buf, ns_w, 0, -1)
-  vim.schedule(function()
-    if not vim.api.nvim_buf_is_valid(welcome_buf) then return end
-    -- Byte-range highlight helper; matches the defaults of the (deprecated)
-    -- add_highlight it replaces: priority 4096, no hl_eol.
-    local function hl_range(row, group, col, end_col)
-      vim.api.nvim_buf_set_extmark(welcome_buf, ns_w, row, col, {
-        end_col = end_col, hl_group = group,
-      })
-    end
-    for i, line in ipairs(logo) do
-      local ln  = i - 1
-      local len = #line
-      if line:sub(3, 8) == "──" then
-        -- Section headers and bottom separator
-        hl_range(ln, "Comment", 0, len)
-      elseif line:sub(3, 5) == "╔" or line:sub(3, 5) == "║" or line:sub(3, 5) == "╚" then
-        -- Logo box lines (╔ ║ ╚)
-        hl_range(ln, "Special", 0, len)
-        local vs = line:find("dadbod-grip", 1, true)
-        if vs then hl_range(ln, "Title", vs - 1, len) end
-      elseif line:find("Editable database", 1, true) then
-        hl_range(ln, "Comment", 0, len)
-      elseif line:find("= modified", 1, true) then
-        -- Color legend: extmark with high priority so it shows above any syntax highlighting
-        local function hl_phrase(phrase, hl)
-          local s, e = line:find(phrase, 1, true)
-          if s then
-            vim.api.nvim_buf_set_extmark(welcome_buf, ns_w, ln, s - 1, {
-              end_col = e, hl_group = hl, priority = 200,
-            })
-          end
-        end
-        hl_phrase("violet = modified", "GripModified")
-        hl_phrase("green = inserted",  "GripInserted")
-        hl_phrase("red = deleted",     "GripDeleted")
-      elseif line:sub(3, 7) == ":Grip" then
-        -- :Grip command examples
-        local s, e = line:find(":Grip%S*")
-        if s then hl_range(ln, "Statement", s - 1, e) end
-        s, e = line:find("%-%-%S+")
-        if s then hl_range(ln, "Identifier", s - 1, e) end
-      elseif line:sub(1, 2) == "  " and line:sub(3, 3) ~= " " and line:sub(3, 3) ~= "" then
-        -- Keymap lines: highlight left key and right key (two-column layout)
-        local _, after = line:match("^  (%S+)()")
-        if after then
-          hl_range(ln, "Identifier", 2, after - 1)
-        end
-        -- Right-column key: consistently at byte 31 (0-indexed). Guard: line must be long
-        -- enough and that position must be non-space (single-column lines are too short).
-        if #line >= 34 and line:sub(32, 32) ~= " " then
-          local rs, re = line:find("%S+", 32)
-          if rs then
-            hl_range(ln, "Identifier", rs - 1, re)
-          end
-        end
-      end
-      -- ·NULL· token: highlight wherever it appears, regardless of which branch fired above
-      local ns, ne = line:find("·NULL·", 1, true)
-      if ns then hl_range(ln, "GripNullStaged", ns - 1, ne) end
-    end
-  end)
-
-  -- Display in current window
+  vim.bo[welcome_buf].buftype = "nofile"
+  vim.bo[welcome_buf].filetype = "grip-welcome"
+  vim.bo[welcome_buf].swapfile = false
   vim.api.nvim_win_set_buf(0, welcome_buf)
+  local km = require("dadbod-grip.keymaps")
+  local rows = require("dadbod-grip.welcome").render(welcome_buf)
+  local first
+  for row in pairs(rows) do first = math.min(first or row, row) end
+  vim.wo.wrap = false
+  vim.wo.number = false
+  vim.wo.relativenumber = false
+  vim.wo.signcolumn = "no"
+  vim.wo.foldcolumn = "0"
+  vim.wo.cursorline = true
+  vim.api.nvim_win_set_cursor(0, { first, 2 })
+  vim.fn.winrestview({ topline = 1, leftcol = 0 })
 
   -- Keymaps
-  local function wmap(key, fn, desc)
-    vim.keymap.set("n", key, fn, { buffer = welcome_buf, silent = true, nowait = true, desc = desc })
+  local function wmap(action, fn, desc)
+    km.bind("welcome", welcome_buf, action, "n", fn, { nowait = true, desc = desc })
   end
+  require("dadbod-grip.keymaps").bind("welcome", welcome_buf, "zoom", "n", function()
+    require("dadbod-grip.zoom").toggle()
+  end)
   local function do_connect()
     require("dadbod-grip.connections").pick()
   end
@@ -1777,21 +1670,21 @@ function M.open_welcome()
     if type(c) ~= "string" or c == "" then c = os.getenv("DATABASE_URL") end
     return (c and c ~= "") and c or nil
   end
-  wmap("q",     function() pcall(vim.api.nvim_buf_delete, welcome_buf, { force = true }) end, "Close welcome")
-  wmap("<Esc>", function() pcall(vim.api.nvim_buf_delete, welcome_buf, { force = true }) end, "Close welcome")
-  wmap("gc",    do_connect, "Connect to database")
-  wmap("gC",    do_connect, "Connect to database")
-  wmap("<C-g>", do_connect, "Connect to database")
-  wmap("<CR>",  do_connect, "Connect to database")
-  wmap("go",    function()
+  wmap("welcome_close",     function() pcall(vim.api.nvim_buf_delete, welcome_buf, { force = true }) end, "Close welcome")
+  wmap("welcome_close_esc", function() pcall(vim.api.nvim_buf_delete, welcome_buf, { force = true }) end, "Close welcome")
+  wmap("welcome_connect",    do_connect, "Connect to database")
+  wmap("connections",    do_connect, "Connect to database")
+  wmap("connections_alt", do_connect, "Connect to database")
+  local function do_tables()
     local conn = cur_conn()
     if not conn then do_connect(); return end
     require("dadbod-grip.picker").pick_table(conn, function(t) M.open(t, conn) end)
-  end, "Open table picker")
-  wmap("gb",    function()
+  end
+  wmap("table_picker_go", do_tables, "Open table picker")
+  wmap("schema_browser",    function()
     require("dadbod-grip.schema").toggle(cur_conn())
   end, "Schema browser")
-  wmap("gG", function()
+  wmap("er_diagram", function()
     local conn = cur_conn()
     if not conn then
       vim.notify("ER Diagram: no database connection", vim.log.levels.WARN)
@@ -1799,8 +1692,8 @@ function M.open_welcome()
     end
     require("dadbod-grip.er_diagram").toggle(conn)
   end, "ER diagram")
-  wmap("?",     function() view.show_help() end, "Full keymap help")
-  wmap("A",     function()
+  wmap("help",     function() view.show_help() end, "Full keymap help")
+  wmap("ai",     function()
     local ai = require("dadbod-grip.ai")
     if not ai.is_enabled() then
       vim.notify("AI is disabled. Enable it in setup({ ai = { ... } })", vim.log.levels.INFO)
@@ -1810,25 +1703,26 @@ function M.open_welcome()
   end, "AI SQL assistant")
 
   -- 1-9: surface navigation from welcome screen
-  wmap("1", function()
+  wmap("tab_1", function()
     local conn = cur_conn()
     if not conn then do_connect(); return end
     require("dadbod-grip.schema").toggle(conn)
   end, "Schema sidebar")
-  wmap("2", function()
+  local function do_query()
     local conn = cur_conn()
     if conn then
       require("dadbod-grip.query_pad").open(conn)
     else
       do_connect()
     end
-  end, "Query pad")
-  wmap("3", function()
+  end
+  wmap("tab_2", do_query, "Query pad")
+  wmap("tab_3", function()
     local conn = cur_conn()
     if not conn then do_connect(); return end
     require("dadbod-grip.picker").pick_table(conn, function(t) M.open(t, conn) end)
   end, "Table picker")
-  wmap("4", function()
+  wmap("tab_4", function()
     local conn = cur_conn()
     if not conn then do_connect(); return end
     require("dadbod-grip.er_diagram").toggle(conn)
@@ -1837,15 +1731,40 @@ function M.open_welcome()
   -- is a float, not a grid view, so it is wired separately above.
   for n = 5, 9 do
     local vname = require("dadbod-grip.keymaps").TAB_VIEWS[n]
-    wmap(tostring(n), function()
+    wmap("tab_" .. n, function()
       local conn = cur_conn()
       if not conn then do_connect(); return end
       require("dadbod-grip.picker").pick_table(conn, function(t) M.open(t, conn, { view = vname }) end)
     end, vname .. " view")
   end
 
+  local actions = {
+    demo = function() vim.cmd("GripStart") end,
+    connect = do_connect,
+    tables = do_tables,
+    query = do_query,
+  }
+  wmap("welcome_activate", function()
+    local action = actions[rows[vim.api.nvim_win_get_cursor(0)[1]]]
+    if action then action() end
+  end, "Run welcome action")
+  local function move_action(direction)
+    local ordered = {}
+    for row in pairs(rows) do ordered[#ordered + 1] = row end
+    table.sort(ordered)
+    local current = vim.api.nvim_win_get_cursor(0)[1]
+    local target = direction > 0 and ordered[1] or ordered[#ordered]
+    for _, row in ipairs(ordered) do
+      if direction > 0 and row > current then target = row; break end
+      if direction < 0 and row < current then target = row end
+    end
+    vim.api.nvim_win_set_cursor(0, { target, 2 })
+  end
+  wmap("welcome_next", function() move_action(1) end, "Next welcome action")
+  wmap("welcome_prev", function() move_action(-1) end, "Previous welcome action")
+
   -- Dev secret: Chonk at the center of the grip vortex
-  wmap(";", function()
+  wmap("welcome_secret", function()
     local secret = {
       "",
       "∿ ∿  dadbod-grip vortex  ∿ ∿",
@@ -1926,6 +1845,7 @@ end
 ---@field ollama_url? string Ollama base URL (default: http://localhost:11434)
 
 ---@class DadbodGripOpts
+---@field engine_timing? boolean  Collect opt-in DuckDB profiler latency (default: false)
 ---@field limit? integer         Rows per page (default: 100)
 ---@field max_col_width? integer Max display width per column (default: 40)
 ---@field timeout? integer       Query timeout in ms (default: 10000)
@@ -1935,6 +1855,10 @@ end
 ---@field border? string|table   Float window border style (default: "rounded")
 ---@field cell_split? string     Cell buffer (gB) split style: "horizontal"|"vertical"
 ---@field open_sidebar? boolean  Open the schema sidebar on connection (default: true)
+---@field show_running_time? boolean Show elapsed time in the loading float (default: true)
+---@field show_result_time? boolean Show retained query/action durations (default: true)
+---@field show_hints? boolean Show automatic shortcut help (default: true)
+---@field highlights? table<string, table> Grip group replacements using nvim_set_hl style attributes
 
 ---Setup dadbod-grip with user options.
 ---@param opts? DadbodGripOpts
@@ -1946,6 +1870,7 @@ function M.setup(opts)
     limit         = { opts.limit,         "number",  true },
     max_col_width = { opts.max_col_width,  "number",  true },
     timeout       = { opts.timeout,        "number",  true },
+    engine_timing = { opts.engine_timing, "boolean", true },
     completion       = { opts.completion,      "boolean", true },
     connections_path = { opts.connections_path, "string",  true },
     picker           = { opts.picker, function(v)
@@ -1961,10 +1886,18 @@ function M.setup(opts)
     discovery     = { opts.discovery, "boolean", true },
     sticky_header = { opts.sticky_header, "boolean", true },
     open_sidebar  = { opts.open_sidebar,  "boolean", true },
+    show_running_time = { opts.show_running_time, "boolean", true },
+    show_result_time  = { opts.show_result_time,  "boolean", true },
+    show_hints        = { opts.show_hints,        "boolean", true },
+    highlights        = { opts.highlights,       "table",   true },
   })
+  -- Nested definitions are validated before any live config is changed.
+  view.set_highlights(opts.highlights or {})
+  OPTS.highlights = vim.deepcopy(opts.highlights or {})
   OPTS.limit        = opts.limit        or 100
   OPTS.max_col_width = opts.max_col_width or 40
   OPTS.timeout      = opts.timeout      or 10000
+  if opts.engine_timing ~= nil then OPTS.engine_timing = opts.engine_timing end
   if opts.completion ~= nil then OPTS.completion = opts.completion end
   OPTS.connections_path = opts.connections_path or nil
   OPTS.picker = opts.picker or "builtin"
@@ -1974,6 +1907,9 @@ function M.setup(opts)
   if opts.discovery ~= nil then OPTS.discovery = opts.discovery end
   if opts.sticky_header ~= nil then OPTS.sticky_header = opts.sticky_header end
   OPTS.open_sidebar = opts.open_sidebar ~= false
+  if opts.show_running_time ~= nil then OPTS.show_running_time = opts.show_running_time end
+  if opts.show_result_time ~= nil then OPTS.show_result_time = opts.show_result_time end
+  if opts.show_hints ~= nil then OPTS.show_hints = opts.show_hints end
 
   -- Keymap overrides: stored at module level for keymaps.get() to read.
   if opts.keymaps then
@@ -2317,12 +2253,13 @@ function M.setup(opts)
       local sql_mod = require("dadbod-grip.sql")
       local ddl_sql = string.format('ALTER TABLE %s RENAME COLUMN %s TO %s',
         sql_mod.quote_ident(table_name), sql_mod.quote_ident(old_name), sql_mod.quote_ident(new_name))
-      local _, err = db.execute(ddl_sql, url)
+      local is_current = require("dadbod-grip.write").capture_owner(bufnr, session)
+      local _, err, _, unknown = require("dadbod-grip.write").execute(ddl_sql, url, "rename column")
       if err then
-        vim.notify("Rename failed: " .. err, vim.log.levels.ERROR)
+        vim.notify((unknown and "" or "Rename failed: ") .. err, vim.log.levels.ERROR)
       else
         vim.notify("Renamed " .. old_name .. " to " .. new_name, vim.log.levels.INFO)
-        if session.on_refresh then session.on_refresh(bufnr) end
+        if is_current() and session.on_refresh then session.on_refresh(bufnr) end
       end
     elseif #args == 1 then
       ddl_mod.rename_column(table_name, args[1], url, function()
@@ -2495,36 +2432,67 @@ function M.setup(opts)
       return
     end
     local connections = require("dadbod-grip.connections")
-    connections.switch(demo.url, demo_module.label)
+    connections.switch(demo.url, demo_module.label, nil, { on_ready = function()
+      local md_files = vim.api.nvim_get_runtime_file("demo/softrear-internal.md", false)
+      if #md_files == 0 then return end
+      local qpad = require("dadbod-grip.query_pad")
+      qpad.open(demo.url)
+      local pad = qpad.get_pad_bufnr()
+      if not pad or not vim.api.nvim_buf_is_valid(pad) then return end
+      local lines = vim.fn.readfile(md_files[1])
+      vim.bo[pad].modifiable = true
+      vim.api.nvim_buf_set_lines(pad, 0, -1, false, lines)
+      vim.bo[pad].modified = false
+      for i, line in ipairs(lines) do
+        if line == "```sql" then
+          vim.api.nvim_win_set_cursor(0, { i + 1, 0 })
+          vim.cmd("normal! zt")
+          break
+        end
+      end
+      local run_key = require("dadbod-grip.keymaps").get("qpad_execute")
+      vim.notify(run_key and ("Demo ready: " .. run_key .. " runs this SQL block.")
+        or "Demo ready. Use :GripQuery to edit SQL.", vim.log.levels.INFO)
+    end })
     local attached
     attached, err = demo_module.attach_supplier(demo)
     if not attached then vim.notify("Grip: " .. err, vim.log.levels.WARN) end
     if demo.supplier_error then vim.notify("Grip: " .. demo.supplier_error, vim.log.levels.WARN) end
 
-    -- Load the demo notebook into the query pad.
-    -- Double-schedule: connections.switch opens the pad in its own vim.schedule;
-    -- we need to run after that has completed.
-    vim.schedule(function()
-      vim.schedule(function()
-        local md_files = vim.api.nvim_get_runtime_file("demo/softrear-internal.md", false)
-        if #md_files == 0 then return end
-        local qpad = require("dadbod-grip.query_pad")
-        qpad.open(demo.url)  -- idempotent: ensures _pad_bufnr exists regardless of timing
-        local pad = qpad.get_pad_bufnr()
-        if not pad or not vim.api.nvim_buf_is_valid(pad) then return end
-        local lines = vim.fn.readfile(md_files[1])
-        vim.bo[pad].modifiable = true
-        vim.api.nvim_buf_set_lines(pad, 0, -1, false, lines)
-        vim.bo[pad].modified = false
-        vim.notify("Softrear Inc. Analyst Portal\xe2\x84\xa2  \xc2\xb7  C-CR runs any SQL block", vim.log.levels.INFO)
-      end)
-    end)
   end, { desc = "Open the Softrear Inc. Analyst Portal" })
 
   -- :GripHome: return to the welcome screen from anywhere
   vim.api.nvim_create_user_command("GripHome", function()
     M.open_welcome()
   end, { desc = "Open dadbod-grip welcome screen" })
+
+  vim.api.nvim_create_user_command("GripZoom", function()
+    require("dadbod-grip.zoom").toggle()
+  end, { desc = "Zoom current pane or restore its split layout" })
+
+  vim.api.nvim_create_user_command("GripZen", function()
+    local windows = {}
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      windows[win] = vim.api.nvim_win_call(win, vim.fn.winsaveview)
+    end
+    OPTS.show_hints = not OPTS.show_hints
+    for buf, session in pairs(view._sessions) do
+      if vim.api.nvim_buf_is_valid(buf) then view.render(buf, session.state) end
+    end
+    require("dadbod-grip.query_pad").refresh_hints()
+    require("dadbod-grip.schema").redraw()
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_loaded(buf) and vim.api.nvim_buf_get_name(buf) == "grip://welcome" then
+        require("dadbod-grip.welcome").render(buf)
+      end
+    end
+    for win, saved in pairs(windows) do
+      if vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_call(win, function() vim.fn.winrestview(saved) end)
+      end
+    end
+    vim.cmd("redraw")
+  end, { desc = "Toggle automatic Grip shortcut hints for this session" })
 
   -- :GripToggle: close all grip windows if visible, reopen if hidden
   vim.api.nvim_create_user_command("GripToggle", function()

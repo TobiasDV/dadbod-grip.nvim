@@ -88,10 +88,18 @@ local function mysql_env(parsed)
 end
 
 --- Run a statement, blocking.
-local function mysql_query(parsed, sql_str, timeout_ms)
+local function mysql_query(parsed, sql_str, timeout_ms, xml, guarded, hooks)
   local opts = adapters.session_opts()
-  return adapters.run_cmd(mysql_args(parsed), timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
-    { stdin = mysql_stdin(sql_str, opts), env = mysql_env(parsed) })
+  local args = mysql_args(parsed)
+  if xml then args[#args + 1] = "--xml" end
+  if guarded then
+    args[#args + 1] = "--skip-force"; args[#args + 1] = "--skip-reconnect"
+    args[#args + 1] = "--default-character-set=utf8mb4"
+  end
+  return adapters.run_cmd(args, timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
+    { stdin = mysql_stdin(sql_str, opts), env = mysql_env(parsed), raw_output = xml,
+      on_start = hooks and hooks.on_start, on_complete = hooks and hooks.on_complete,
+      on_spawn_error = hooks and hooks.on_spawn_error, terminate_on_interrupt = hooks ~= nil })
 end
 
 --- Run a statement without blocking; same argv, stdin and env as mysql_query.
@@ -109,20 +117,15 @@ function M.query(sql_str, url)
   local parsed = parse_url(url)
   if not parsed then return nil, "Invalid MySQL URL: " .. sql_util.redact_url(url) end
 
-  local stdout, stderr, code = mysql_query(parsed, sql_str)
-  if code ~= 0 then
-    local msg = stderr ~= "" and stderr or ("mysql exited with code " .. code)
-    return nil, msg
-  end
-
-  local result, parse_err = parse_output(stdout)
-  if not result then return nil, parse_err end
-
-  return {
-    rows = result.rows,
-    columns = result.columns,
-    primary_keys = {},
-  }, nil
+  return require("dadbod-grip.mysql_read").query(sql_str, {
+    args = mysql_args(parsed), env = mysql_env(parsed),
+    setup = mysql_stdin("", adapters.session_opts()),
+    timeout = adapters.configured_timeout(DEFAULT_TIMEOUT),
+    readonly = adapters.session_opts().readonly == true,
+    identity = { schema = parsed.dbname, instance = (parsed.host or "localhost") .. ":"
+      .. tostring(parsed.port or "3306") .. "/" .. (parsed.user or "") },
+    source_provider = require("dadbod-grip.mysql_source"),
+  })
 end
 
 function M.get_primary_keys(table_name, url)
@@ -174,14 +177,17 @@ function M.get_column_info(table_name, url)
       c.COLUMN_TYPE AS data_type,
       c.IS_NULLABLE AS is_nullable,
       COALESCE(c.COLUMN_DEFAULT, '') AS column_default,
-      COALESCE(c.COLUMN_KEY, '') AS constraints
+      COALESCE(c.COLUMN_KEY, '') AS constraints, c.EXTRA AS extra,
+      COALESCE(c.CHARACTER_SET_NAME, '') AS character_set, COALESCE(c.COLLATION_NAME, '') AS collation,
+      c.ORDINAL_POSITION AS ordinal_position, COALESCE(c.GENERATION_EXPRESSION, '') AS generation_expression,
+      c.TABLE_SCHEMA AS source_schema, c.TABLE_NAME AS source_table
     FROM information_schema.COLUMNS c
     WHERE c.TABLE_SCHEMA = '%s'
       AND c.TABLE_NAME = '%s'
     ORDER BY c.ORDINAL_POSITION
   ]], esc(schema), esc(tbl))
 
-  local stdout, stderr, code = mysql_query(parsed, info_sql)
+  local stdout, stderr, code = mysql_query(parsed, info_sql, nil, false, true)
   if code ~= 0 then
     return nil, stderr ~= "" and stderr or "Failed to query column info"
   end
@@ -203,6 +209,19 @@ function M.get_column_info(table_name, url)
       is_nullable    = row[3] or "",
       column_default = row[4] or "",
       constraints    = constraint_str,
+      generated      = (row[6] or ""):find("VIRTUAL GENERATED", 1, true) ~= nil
+        or (row[6] or ""):find("STORED GENERATED", 1, true) ~= nil,
+      character_set  = row[7] or "",
+      collation      = row[8] or "",
+      column_type    = row[2], -- exact server spelling; data_type remains UI-normalized
+      extra          = row[6],
+      ordinal        = tonumber(row[9]),
+      ordinal_position = tonumber(row[9]),
+      visible        = row[6] and (row[6]:upper():find('INVISIBLE',1,true) == nil),
+      generation_expression = row[10],
+      source_schema  = row[11],
+      source_table   = row[12],
+      metadata_source = row[9] and row[11] and row[12] and 'source_schema' or nil,
     })
   end
   return cols, nil
@@ -527,6 +546,134 @@ function M.get_table_stats(table_name, url)
   }, nil
 end
 
+--- Translate INSERT [priority] [IGNORE] [INTO] table [PARTITION (...)] DEFAULT
+--- VALUES, optionally followed by ON DUPLICATE KEY UPDATE or RETURNING.
+--- Keep token offsets so comments, quoting, and all text
+--- outside the two keyword edits survive byte-for-byte. This is deliberately
+--- not a general SQL parser: ambiguous/session-dependent input passes through
+--- unchanged so the server remains responsible for SQL errors.
+local function rewrite_default_values(sql_str)
+  local tokens, edits = {}, {}
+  local i, n = 1, #sql_str
+  local word_part = "[%w_$\128-\255]"
+
+  local function keyword(index, word)
+    local token = tokens[index]
+    return token and token.kind == "word" and token.text == word
+  end
+
+  local function identifier(index)
+    local token = tokens[index]
+    return token and (token.kind == "quoted"
+      or (token.kind == "word" and token.text:match("^[%a_$\128-\255]")))
+  end
+
+  local function statement()
+    -- Later statements can change quote interpretation after a mode change;
+    -- mysql's DELIMITER command also changes the meaning of semicolons.
+    if keyword(1, "DELIMITER") then return false end
+    if keyword(1, "SET") then
+      for _, token in ipairs(tokens) do
+        if token.text == "SQL_MODE" then return false end
+      end
+    end
+    if keyword(1, "INSERT") then
+      local at = 2
+      if keyword(at, "LOW_PRIORITY") or keyword(at, "HIGH_PRIORITY")
+          or keyword(at, "DELAYED") then at = at + 1 end
+      if keyword(at, "IGNORE") then at = at + 1 end
+      if keyword(at, "INTO") then at = at + 1 end
+      if identifier(at) then
+        at = at + 1
+        if tokens[at] and tokens[at].text == "." and identifier(at + 1) then at = at + 2 end
+        if keyword(at, "PARTITION") and tokens[at + 1] and tokens[at + 1].text == "(" then
+          local part = at + 2
+          while identifier(part) do
+            part = part + 1
+            if tokens[part] and tokens[part].text == ")" then at = part + 1; break end
+            if not tokens[part] or tokens[part].text ~= "," then break end
+            part = part + 1
+          end
+        end
+        local tail = at + 2
+        local complete = #tokens == at + 1
+          or (keyword(tail, "RETURNING") and tokens[tail + 1])
+          or (keyword(tail, "ON") and keyword(tail + 1, "DUPLICATE")
+            and keyword(tail + 2, "KEY") and keyword(tail + 3, "UPDATE") and tokens[tail + 4])
+        if keyword(at, "DEFAULT") and keyword(at + 1, "VALUES") and complete then
+          edits[#edits + 1] = { first = tokens[at].first, last = tokens[at].last, text = "()" }
+          edits[#edits + 1] = { first = tokens[at + 1].first, last = tokens[at + 1].last, text = "VALUES ()" }
+        end
+      end
+    end
+    tokens = {}
+    return true
+  end
+
+  while i <= n do
+    local ch, pair = sql_str:sub(i, i), sql_str:sub(i, i + 1)
+    if ch:match("%s") then
+      i = i + 1
+    elseif ch == "#" or (pair == "--" and sql_str:sub(i + 2, i + 2):match("[%s%c]")) then
+      local newline = sql_str:find("[\r\n]", i + 1)
+      -- Client/server handling of a bare CR differs; do not infer boundaries.
+      if newline and sql_str:sub(newline, newline) == "\r"
+          and sql_str:sub(newline + 1, newline + 1) ~= "\n" then return sql_str end
+      i = newline and (newline + 1) or (n + 1)
+    elseif pair == "/*" then
+      -- These comments contain executable SQL, not lexical whitespace.
+      local marker = sql_str:sub(i + 2, i + 3):upper()
+      if marker:sub(1, 1) == "!" or marker == "M!" then return sql_str end
+      local finish = sql_str:find("*/", i + 2, true)
+      local nested = sql_str:find("/*", i + 2, true)
+      if not finish or (nested and nested < finish) then return sql_str end
+      -- mysql also honors short client commands inside optimizer hints. A
+      -- delimiter/charset command invalidates this scan's boundary assumptions.
+      local command = marker:sub(1, 1) == "+" and sql_str:find("\\", i + 3, true)
+      if command and command < finish then return sql_str end
+      i = finish + 2
+    elseif ch == "'" or ch == '"' or ch == "`" then
+      local first, quote, closed = i, ch, false
+      i = i + 1
+      while i <= n do
+        ch = sql_str:sub(i, i)
+        if ch == "\\" then
+          local start = i
+          while sql_str:sub(i, i) == "\\" do i = i + 1 end
+          if (i - start) % 2 == 1 and sql_str:sub(i, i) == quote then return sql_str end
+        elseif ch == quote then
+          if sql_str:sub(i + 1, i + 1) == quote then i = i + 2
+          else i = i + 1; closed = true; break end
+        else i = i + 1 end
+      end
+      if not closed then return sql_str end
+      tokens[#tokens + 1] = { kind = quote == "'" and "string" or "quoted",
+        text = sql_str:sub(first + 1, i - 2):upper(), first = first, last = i - 1 }
+    elseif ch == ";" then
+      if not statement() then return sql_str end
+      i = i + 1
+    elseif ch:match(word_part) then
+      local first = i
+      repeat i = i + 1 until i > n or not sql_str:sub(i, i):match(word_part)
+      tokens[#tokens + 1] = { kind = "word", text = sql_str:sub(first, i - 1):upper(), first = first, last = i - 1 }
+    else
+      -- mysql client commands can change delimiters/session interpretation.
+      if ch == "\\" then return sql_str end
+      tokens[#tokens + 1] = { kind = "other", text = ch, first = i, last = i }
+      i = i + 1
+    end
+  end
+  if not statement() or #edits == 0 then return sql_str end
+  local pieces, first = {}, 1
+  for _, edit in ipairs(edits) do
+    pieces[#pieces + 1] = sql_str:sub(first, edit.first - 1)
+    pieces[#pieces + 1] = edit.text
+    first = edit.last + 1
+  end
+  pieces[#pieces + 1] = sql_str:sub(first)
+  return table.concat(pieces)
+end
+
 function M.execute(sql_str, url)
   if vim.fn.executable("mysql") == 0 then
     return nil, "mysql not found. Install mysql-client."
@@ -535,8 +682,8 @@ function M.execute(sql_str, url)
   local parsed = parse_url(url)
   if not parsed then return nil, "Invalid MySQL URL: " .. sql_util.redact_url(url) end
 
-  -- MySQL doesn't support DEFAULT VALUES; rewrite for compatibility
-  sql_str = sql_str:gsub("DEFAULT VALUES", "() VALUES ()")
+  -- MySQL uses an empty column/value list for a default-row INSERT.
+  sql_str = rewrite_default_values(sql_str)
 
   -- mysql --batch prints no "N rows affected" line anywhere (that needs -vv), so
   -- ask the server for the count instead, the way sqlite appends changes().
@@ -566,6 +713,37 @@ function M.execute(sql_str, url)
   return { affected = n, message = n .. " row(s) affected" }, nil
 end
 
+function M.grid_write(plan, url, opts)
+  local transaction = require("dadbod-grip.transaction")
+  local parsed = parse_url(url)
+  if not parsed then return nil, "Invalid MySQL URL" end
+  local schema, tbl = split_table_name(plan.table_name, parsed.dbname)
+  local output, metadata_error, metadata_code = mysql_query(parsed,
+    "SELECT VERSION(), ENGINE, (SELECT COLUMN_NAME FROM information_schema.COLUMNS"
+    .. " WHERE TABLE_SCHEMA=" .. sql_util.quote_value(schema) .. " AND TABLE_NAME=" .. sql_util.quote_value(tbl)
+    .. " AND EXTRA LIKE '%auto_increment%' LIMIT 1) FROM information_schema.TABLES WHERE TABLE_SCHEMA="
+    .. sql_util.quote_value(schema) .. " AND TABLE_NAME=" .. sql_util.quote_value(tbl), nil, true, true)
+  if metadata_code ~= 0 then return nil, metadata_error end
+  local metadata = require("dadbod-grip.transport").mysql_xml(output)
+  local row = metadata and metadata.rows[1]
+  if not row or (row[2] or ""):lower() ~= "innodb" then return nil, "Verified grid writes require InnoDB" end
+  local kind = (row[1] or ""):find("MariaDB", 1, true) and "mariadb" or "mysql"
+  local major, minor, patch = (row[1] or ""):match("(%d+)%.(%d+)%.(%d+)")
+  local version = major and (tonumber(major) * 10000 + tonumber(minor) * 100 + tonumber(patch)) or 0
+  if version < (kind == "mariadb" and 100201 or 80016) then
+    return nil, "Verified grid writes require enforced CHECK constraints (MySQL8.0.16 or MariaDB10.2.1 and newer)"
+  end
+  local script, err = transaction.compile(plan, kind, { auto_increment = row[3], schema = schema, table_name = tbl })
+  if not script then return nil, err end
+  local stdout, stderr, code = transaction.submit(kind, opts, function(hooks)
+    return mysql_query(parsed, script, nil, false, true, hooks)
+  end)
+  if code ~= 0 then return nil, stderr ~= "" and stderr or ("mysql exited with code " .. code) end
+  local result, decode_err = transaction.decode(plan, stdout, kind)
+  if result then result.sql = script end
+  return result, decode_err
+end
+
 --- Ping the server by running SELECT 1. Returns true on success, false on any error.
 function M.ping(url)
   if vim.fn.executable("mysql") == 0 then return false end
@@ -581,5 +759,6 @@ M._mysql_args = mysql_args
 M._mysql_env = mysql_env
 M._mysql_stdin = mysql_stdin
 M._normalize_column_type = normalize_column_type
+M._rewrite_default_values = rewrite_default_values
 
 return M

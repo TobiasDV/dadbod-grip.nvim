@@ -171,6 +171,44 @@ test("all-row export is complete and atomically written", function()
 end)
 
 if URL:match("^sqlserver://") or URL:match("^mssql://") then
+  -- A grid over `probe` as the editor builds it, and the apply/undo the a and u
+  -- keys run: one verified transaction each (transaction.plan, db.execute).
+  local function grid(probe)
+    local page = assert(db.query(query.build_sql(query.new_table(probe, 50)), URL))
+    page.primary_keys = db.get_primary_keys(probe, URL)
+    page.table_name = probe
+    page.url = URL
+    return data.new(page)
+  end
+  --- Apply a grid's staged changes; returns the plan that undoes them.
+  local function apply_grid(st)
+    local info = assert(db.get_column_info(st.table_name, URL))
+    local plan = assert(require("dadbod-grip.transaction").plan(st, info))
+    local written, write_err = db.execute(plan, URL)
+    assert(written, write_err)
+    return written.undo
+  end
+  --- Run an undo plan, or a list of statements as one transaction.
+  local function run(what)
+    if what.ops then
+      local undone, undo_err = db.execute(what, URL)
+      assert(undone, undo_err)
+      return
+    end
+    if #what == 0 then return end
+    local _, run_err = db.execute(sql.wrap_transaction(what, "sqlserver"), URL)
+    assert(not run_err, run_err)
+  end
+  local function dump(q)
+    local out = {}
+    for _, row in ipairs(assert(db.query(q, URL)).rows) do
+      local cells = {}
+      for i, cell in ipairs(row) do cells[i] = cell == vim.NIL and "<NULL>" or cell end
+      out[#out + 1] = table.concat(cells, "|")
+    end
+    return table.concat(out, "\n")
+  end
+
   test("SQL Server temporary tables share one submission but not the next", function()
     local name = "##grip_live_temp_scope"
     local result, err = db.query(table.concat({
@@ -209,11 +247,11 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       eq(rows()[1][3], "Zoë", "update matched the Unicode key")
 
       local before = rows()[1]
-      assert(apply({ sql.build_delete(probe, { id = before[1] }, "sqlserver") }))
+      local undo = apply_grid(data.toggle_delete(grid(probe), 1))
       eq(#rows(), 0, "row deleted")
-      local values = { id = before[1], code = before[2], label = before[3] }
-      assert(apply({ sql.build_reinsert(probe, values, columns, "sqlserver") }))
+      run(undo)
       eq(rows()[1][1], before[1], "undo restored the original IDENTITY key")
+      eq(rows()[1][2], "李", "and its Unicode value")
     end)
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
     if not ok then error(err) end
@@ -301,21 +339,20 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
-  test("SQL Server finds an inserted row past text and ntext columns", function()
+  test("SQL Server undoes an insert past text and ntext columns", function()
     local probe = "grip_live_legacy"
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
     local ok, err = pcall(function()
       assert(db.execute("CREATE TABLE " .. probe
         .. " (id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(40), txt TEXT, ntxt NTEXT)", URL))
       assert(db.execute("INSERT INTO " .. probe .. " (name, txt, ntxt) VALUES (N'one', 'a', N'b')", URL))
-      local page = assert(db.query(query.build_sql(query.new_table(probe, 50)), URL))
-      eq(page.incomparable_columns.txt, true, "text reported")
-      local values = { name = "one", txt = "a", ntxt = "b" }
-      local find_sql = sql.build_insert_lookup(probe, { "id" }, values, page.incomparable_columns, "sqlserver")
-      local found = assert(db.query(find_sql, URL))
-      eq(found.rows[1][1], "1", "row found")
-      local _, unskipped_err = db.query(sql.build_insert_lookup(probe, { "id" }, values, nil, "sqlserver"), URL)
-      assert(unskipped_err, "comparing text with = must fail, or this test proves nothing")
+      local st = grid(probe)
+      eq(st.incomparable_columns.txt, true, "text reported")
+      -- Same values as the row already there: only the key tells them apart.
+      local undo = apply_grid(data.insert_row_with_values(st, 1, { name = "one", txt = "a", ntxt = "b" }))
+      eq(dump("SELECT COUNT(*) FROM " .. probe), "2", "inserted")
+      run(undo)
+      eq(dump("SELECT id FROM " .. probe), "1", "undo removed the inserted row, not the original")
     end)
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
     if not ok then error(err) end
@@ -360,30 +397,6 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     if not ok then error(err) end
   end)
 
-  -- A grid over `probe` as the editor builds it, and the apply/undo the a and u
-  -- keys run, so these tests go through the same statements.
-  local function grid(probe)
-    local page = assert(db.query(query.build_sql(query.new_table(probe, 50)), URL))
-    page.primary_keys = db.get_primary_keys(probe, URL)
-    page.table_name = probe
-    return data.new(page)
-  end
-  local function run(stmts)
-    if #stmts == 0 then return end
-    local _, run_err = db.execute(sql.wrap_transaction(stmts, "sqlserver"), URL)
-    assert(not run_err, run_err)
-  end
-  local function apply_grid(st)
-    local undo, irreversible = sql.build_undo(st, "sqlserver")
-    run(sql.build_apply(st, "sqlserver"))
-    return undo, irreversible
-  end
-  local function dump(q)
-    local out = {}
-    for _, row in ipairs(assert(db.query(q, URL)).rows) do out[#out + 1] = table.concat(row, "|") end
-    return table.concat(out, "\n")
-  end
-
   test("SQL Server keeps empty strings apart from NULL through edit, delete and undo", function()
     local probe = "grip_live_empties"
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
@@ -422,8 +435,7 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       run((apply_grid(data.add_change(grid(probe), 2, "opt", "y"))))
       eq(snap(), before, "undo of an edit to a '' cell")
 
-      local st = grid(probe)
-      apply_grid(data.add_change(st, 2, "req", data.cleared_value(st, 2, "req")))
+      apply_grid(data.add_change(grid(probe), 2, "req", ""))
       eq(dump("SELECT COUNT(*) FROM " .. probe .. " WHERE id = 2 AND req = ''"), "1", "req is ''")
 
       st = data.clone_row(grid(probe), 1)
@@ -494,8 +506,17 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       eq(dump("SELECT CONVERT(varchar(50), b, 1), CONVERT(varchar(50), CAST(img AS varbinary(max)), 1) FROM "
         .. probe .. " WHERE id = 1"), "0xCAFE|0xABCD", "undo of the delete")
 
-      local _, irreversible = sql.build_undo(data.toggle_delete(grid(probe), 2), "sqlserver")
-      eq(irreversible[1], 2, "a row with a binary over 8000 bytes is reported, not half-restored")
+      -- The grid only holds "<binary 9000 bytes>" for row 2: the delete's own
+      -- receipt is what carries the bytes back.
+      local function big() return dump("SELECT DATALENGTH(big), CONVERT(varchar(40), HASHBYTES('SHA1', big), 2) FROM "
+        .. probe .. " WHERE id = 2") end
+      local big_before = big()
+      local st2 = grid(probe)
+      eq(data.effective_value(st2, 2, "big"), "<binary 9000 bytes>", "placeholder in the grid")
+      local undo_big = apply_grid(data.toggle_delete(st2, 2))
+      eq(dump("SELECT COUNT(*) FROM " .. probe .. " WHERE id = 2"), "0", "row 2 deleted")
+      run(undo_big)
+      eq(big(), big_before, "a binary over 8000 bytes comes back whole")
     end)
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
     if not ok then error(err) end
@@ -598,13 +619,10 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
     local ok, err = pcall(function()
       assert(db.execute("CREATE TABLE " .. probe .. " (id INT IDENTITY(1,1) PRIMARY KEY, txt TEXT, ntxt NTEXT)", URL))
       assert(db.execute("INSERT INTO " .. probe .. " (txt, ntxt) VALUES ('old', N'old')", URL))
-      local st = grid(probe)
-      local values = { txt = "new", ntxt = "nieuw ✓" }
-      assert(db.execute(sql.build_insert(probe, values, st.columns, "sqlserver"), URL))
-      local find_sql = sql.build_insert_lookup(probe, st.pks, values, st.incomparable_columns, "sqlserver",
-        sql.state_opts(st))
-      assert(find_sql, "a lookup, not none")
-      eq(assert(db.query(find_sql, URL)).rows[1][1], "2", "the inserted row")
+      local undo = apply_grid(data.insert_row_with_values(grid(probe), 1, { txt = "new", ntxt = "nieuw ✓" }))
+      eq(dump("SELECT id, CAST(ntxt AS nvarchar(max)) FROM " .. probe .. " ORDER BY id"), "1|old\n2|nieuw ✓", "inserted")
+      run(undo)
+      eq(dump("SELECT id FROM " .. probe), "1", "the inserted row is gone")
     end)
     db.execute("DROP TABLE IF EXISTS " .. probe, URL)
     if not ok then error(err) end
@@ -625,8 +643,7 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
       assert(db.execute("SELECT * INTO " .. copy .. " FROM " .. probe .. " WHERE 1 = 0", URL))
       local result = assert(db.query(query.build_sql(query.new_table(probe, 50), { paginate = false }), URL))
       local path = vim.fn.tempname() .. ".sql"
-      assert(view._write_export_file(view._export_rows_from_result(result), result.columns, "sql", copy, path,
-        { kind = "sqlserver", types = result.column_types }))
+      assert(view._write_export_file(result.rows, result.columns, "sql", copy, path, result))
       assert(db.execute(table.concat(vim.fn.readfile(path), "\n"), URL))
       vim.fn.delete(path)
       local function snap(t)
@@ -649,14 +666,9 @@ if URL:match("^sqlserver://") or URL:match("^mssql://") then
         db.execute("DELETE FROM " .. probe, URL)
         assert(db.execute("INSERT INTO " .. probe .. " (label) VALUES (N'first')", URL))
         local original = dump("SELECT id FROM " .. probe)
-        local st = data.clone_row(data.clone_row(grid(probe), 1), 1)
-        local plan = assert(sql.build_inserted_keys(st, "sqlserver"))
-        local before = assert(db.query(plan.sql, URL)).rows
-        run(sql.build_apply(st, "sqlserver"))
-        local after = assert(db.query(plan.sql, URL)).rows
-        local keys = sql.match_inserted_keys(plan, before, after, st.pks)
-        assert(keys[1] and keys[2], "both clones found")
-        run({ sql.build_delete(probe, keys[1], "sqlserver"), sql.build_delete(probe, keys[2], "sqlserver") })
+        local undo = apply_grid(data.clone_row(data.clone_row(grid(probe), 1), 1))
+        eq(dump("SELECT COUNT(*) FROM " .. probe), "3", "both clones inserted")
+        run(undo)
         eq(dump("SELECT id FROM " .. probe), original, "only the original is left")
       end
     end)

@@ -15,6 +15,22 @@ This notebook answers all three. Place your cursor inside any SQL block and pres
 `<C-CR>` to run it. Results appear in the grid below. Move through the notebook
 with `j`/`k`.
 
+Examples use the default keys. Press `?` in the current pane if you changed them.
+
+```text
++-- Schema --------+-- SQL -------------------+
+| / find an object | <C-CR> run this block    |
+| h/l fold         +-- Results ---------------+
+| 2 open SQL       | K inspect   gs review    |
+|                  | u undo      a apply      |
++------------------+--------------------------+
+                 gz zoom / restore
+```
+
+The digits depend on the pane: `2` from schema or results opens SQL; `2` inside
+SQL opens history. Search this notebook for `Daily practice` for a short task
+loop after the investigation.
+
 DuckDB loads the full 505-roll investigation. The SQLite fallback keeps the same
 named evidence in a compact 35-roll fixture, so exact background-row counts differ.
 
@@ -22,7 +38,7 @@ named evidence in a compact 35-roll fixture, so exact background-row counts diff
 
 ## 1. Product catalog overview
 
-The catalog has 500+ SKUs. Before any filtering, pull a broad view sorted by
+The full DuckDB catalog has 505 SKUs; SQLite keeps 35 named examples. Before any filtering, pull a broad view sorted by
 softness score to see if anything surfaces at the edges.
 
 ```sql
@@ -66,7 +82,7 @@ With the two outlier products identified, the next question is: how bad are the
 incidents, and is there a pattern in the worst ones?
 
 ```sql
-SELECT incident_type, severity, roll_sku, notes
+SELECT id, incident_type, severity, roll_sku, incident_date, notes
 FROM consumer_incidents
 ORDER BY severity DESC
 LIMIT 30
@@ -83,10 +99,10 @@ Airplane bathrooms are a structural failure mode for this product category.
 > **Grid:** `gS` shows severity statistics (mean, min, max, nulls). Press `f` on a
 > cell to instantly filter the grid to that incident type.
 >
-> **Cell editor:** open any row with `i`, navigate to `incident_date`, press `<Esc>`
-> to enter NORMAL mode. A line appears below the field value: "→ 2 years ago (Monday,
-> Aug 14 2023)". Seat 34B. Meal service had just ended. Two years ago. The file is
-> still open.
+> **Cell editor:** move to an `incident_date` cell, open its value with `i`, and
+> press `<Esc>` to leave INSERT mode. The date preview shows a calendar date and
+> relative time, calculated when you open the editor. Seat 34B. Meal service had
+> just ended.
 
 ---
 
@@ -164,7 +180,7 @@ under embargo.
 
 > **Grid:** this result is wide. Press `K` on any row for a vertical key-value view.
 > Visual-select two rows with `V`, then press `K` to stack both in one float.
-> Press `gQ` to inspect the query plan and confirm the join indexes are used.
+> Press `gQ` to inspect the query plan and see how the database executes the joins.
 > Press `gf` on any FK column to follow it interactively to its referenced table,
 > or `gm` on a referenced row to open the rows that point back to it. Press `gE`
 > to export the current page or every matching row.
@@ -369,6 +385,7 @@ compact SQLite fallback.
 Every shipment from Bamboo Don arrived with declared contents on file. Pull the
 comparison against what the facility received.
 
+<!-- Requires: duckdb+sqlite3 -->
 ```sql
 SELECT
   s.ship_date,
@@ -396,6 +413,7 @@ Every recalled batch traces back to knowingly mislabeled incoming material.
 The relabeling created a paper trail on the supplier side. The ingredient test
 records show what was found.
 
+<!-- Requires: duckdb+sqlite3 -->
 ```sql
 SELECT batch_ref, bamboo_grade, contaminant_level, passed, tester_notes
 FROM supplier.ingredient_tests
@@ -415,6 +433,7 @@ relabeling occurred before customs inspection.
 
 The economic incentive that created the relabeling is in the pricing table.
 
+<!-- Requires: duckdb+sqlite3 -->
 ```sql
 SELECT supplier_alias, territory, price_per_ton, discount_pct, loyalty_tier
 FROM supplier.pricing
@@ -449,6 +468,97 @@ restores the disposable database on the next run.
 
 ---
 
+## Daily practice
+
+### Find a report without opening every schema
+
+Press `gb` to focus the sidebar, then `H` to collapse it. Press `/`, type
+`incident_summary`, and press Enter. Search reveals matching objects inside closed
+groups. Enter on the view opens it. Press `gb` to return to the sidebar, then
+`F` to clear its search and restore the previous folds. Press `gw` to return
+to the grid. The summary is a real aggregate view, so browse and export it
+rather than editing it.
+
+You can also run the report from SQL:
+
+```sql
+SELECT incident_type, incident_count, max_severity, open_count
+FROM incident_summary
+ORDER BY max_severity DESC, incident_count DESC
+```
+
+In the grid, move to `max_severity` and press `s` to sort. Press `K` to inspect a
+row vertically, then `q` to close the inspection. Press `gX` to export to a file;
+choose whether to export the current page or all matching rows. Narrow panes
+show two rows of shortcut hints, with `?` available for the remaining actions.
+
+### Make one reversible edit
+
+Open the base table with `:Grip consumer_incidents`. Press `<C-f>`, enter
+`id = 1`, and confirm. Move to `severity`, press `i`, replace `10` with `9`, and
+press Enter to stage the cell. The database still contains `10`.
+
+```text
+edit cell -> staged change -> gs: inspect UPDATE
+                              | q: close preview
+                              +-> u: undo the edit
+                              `-> a: confirm the write
+```
+
+Try `gs`, close the preview with `q`, and press `u` first. For the commit path,
+repeat the edit, inspect the SQL with `gs`, close it with `q`, and then press `a`
+and confirm. Press `r` to refresh. Running `:GripStart` again restores the demo's original data.
+The same staging boundary applies to the imported batch in section 17.
+
+### Keep SQL and results within reach
+
+From the grid, press `2` to return to this SQL pad. Press `gz` to zoom it and
+`gz` again to restore the splits. In SQL, `2` opens history so you can choose a
+previous query. `gh` also opens history from the main panes. Press `gw` to return
+to the grid, pin a useful result with `gL`, and use `gJ` to switch between retained results.
+
+To save a reusable query, open SQL with `:GripQuery` and replace the pad contents
+with just that SQL, then press `<C-s>` and name it. The save action saves the entire pad, so do not
+save the whole investigation when you intend to keep one query. `gq` loads saved
+queries. Named queries and history persist; an unsaved pad and active result
+layout do not automatically restore after Neovim exits.
+
+### Explore DuckDB's reporting schema
+
+This part requires DuckDB. SQLite keeps the shared summary above in its flat
+object list. In DuckDB's sidebar, expand `reporting` with `l`, then open
+`reporting.monthly_incidents` under Views. To fold the schema again, press `gb`,
+move onto `reporting`, and press `h`. Depending on the
+supplier attachment, the original tables appear in a `main` or `softrear` group.
+
+```text
+reporting
+  Views (1)
+    monthly_incidents
+```
+
+<!-- Requires: duckdb -->
+```sql
+SELECT month, incident_count, highest_priority
+FROM reporting.monthly_incidents
+ORDER BY month
+```
+
+The report uses a stored scalar macro. Call it in SQL:
+
+<!-- Requires: duckdb -->
+```sql
+SELECT reporting.severity_label(4) AS low_priority,
+       reporting.severity_label(8) AS high_priority
+```
+
+DuckDB macros are callable SQL expressions. Dadbod Grip does not list them as
+PostgreSQL-style Functions in the sidebar. To practice actual partition trees,
+function source, and parent-versus-child queries, use the optional
+[PostgreSQL lab](README.md#postgresql-schema-lab) in a disposable local database.
+
+---
+
 ## What this found
 
 The three questions from the opening now have answers.
@@ -473,8 +583,8 @@ The data was here the whole time.
 
 ## Going further
 
-Every result set is a live grid. Press `?` from any surface for the full
-keymap reference. Press `gn` from the query pad to open another SQL or Markdown
+Every result set is a live grid. Press `?` from any surface for that pane's configured
+keys. Press `gn` from the query pad to open another SQL or Markdown
 notebook.
 
 Full feature reference: https://jorypestorious.com/dadbod-grip-web/

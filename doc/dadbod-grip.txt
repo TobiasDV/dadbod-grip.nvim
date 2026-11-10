@@ -119,6 +119,7 @@ Override if needed: >lua
     limit            = 100,
     max_col_width    = 40,
     timeout          = 10000,
+    engine_timing    = false,
     completion       = true,
     connections_path = nil,
     picker           = "builtin",
@@ -126,6 +127,10 @@ Override if needed: >lua
     cell_split       = "horizontal",
     sticky_header    = true,
     open_sidebar     = true,
+    show_running_time = true,
+    show_result_time  = true,
+    show_hints        = true,
+    highlights        = {},
   })
 <
 When `completion` is false, grip's built-in TextChangedI popup is disabled.
@@ -140,8 +145,166 @@ connections file shared across projects.
 extension or read a remote URL gets a 60-second minimum for that network step.
 Health pings use 5 seconds.
 
+DuckDB queries, writes, and background metadata requests sharing the same local
+database file wait in order. Grip also coordinates local DuckDB files registered
+with GripAttach. Unrelated files can progress independently. Queued calls retain
+their original read-only options; queue waiting and CLI execution use separate
+bounded waits. A cancelled queued request never executes. A running request
+keeps its file reservation until the actual child exits, even if its result has
+already timed out. Grip never retries the original SQL after a lock error.
+External clients and filenames introduced only by custom ATTACH SQL are outside
+this coordination and can still produce native DuckDB lock errors.
+
+                                                        *grip-highlights*
+Highlight overrides ~
+
+`highlights` maps Grip group names to |nvim_set_hl()| style definitions.
+For selection colors that follow a light or dark colorscheme: >lua
+  require("dadbod-grip").setup({
+    highlights = {
+      GripColHighlight = { link = "Visual" },
+      GripHeaderActive = { link = "Visual" },
+      GripNull = { link = "Comment" },
+    },
+  })
+<
+Grip applies built-in definitions first, then the current connection accent,
+then your overrides. An override REPLACES the entire group; unspecified
+attributes do not inherit Grip's colors or styles. An empty definition (`{}`)
+clears a group. Links follow the target group when the colorscheme changes.
+Use `fg`/`bg` for explicit GUI colors and `ctermfg`/`ctermbg` for terminal colors.
+The `default` and `force` control flags are not supported: configured overrides
+always take precedence.
+
+Overrides are reapplied when grids open, after `:colorscheme`, and on connection
+switches, including reconnecting or leaving a colored connection. A later
+`setup()` replaces the map; omitting `highlights` or passing `{}` restores
+built-in definitions and the current connection accent. With no overrides,
+Grip's existing appearance is unchanged.
+
+Supported groups:
+  GripHeader         GripHeaderActive   GripColHighlight   GripColType
+  GripNull           GripNullStaged     GripReadonly       GripModified
+  GripDeleted        GripInserted       GripStatusOk       GripStatusChg
+  GripNegative       GripBoolTrue       GripBoolFalse      GripDatePast
+  GripUrl            GripWatch          GripConnAccent     GripConnAccentBold
+  GripBorder
+
+Invalid maps, unknown group names, and invalid highlight definitions raise a
+setup error before changing live options or visible groups. Define linked
+target groups in your colorscheme, as you would for other Neovim highlights.
+
+                                                        *grip-query-timer*
+Operations wrapped in grip's loading float, such as opening a table or
+generating SQL, show a centered indicator. Once the work passes half a
+second the float starts counting up next to its label, so the wait is
+visible before the grid appears: >
+    querying users... 3.4s
+    generating SQL... 1m12s
+<
+The reading is wall time for the whole operation, including nested steps.
+Set `show_running_time = false` to hide its elapsed number while keeping the
+animated loading indicator and operation label. It resets for the next
+operation. Long labels shorten to keep the elapsed time visible. The counter
+measures waiting; it does not report database progress or identify a hung query.
+CLI timeouts apply separately to each call, so a multi-step operation may take
+longer.
+After a successful query, the results footer keeps its client-observed
+round-trip, such as "Query: 3.4s client" or "Query: 17ms client". This duration
+measures db.query, including the client process and result parsing. It excludes
+column/primary-key lookups, pagination counts, and rendering, so it can be
+shorter than the running whole-operation clock. History keeps the same query
+duration in milliseconds. The footer stays visible during horizontal data
+scrolling; narrow windows shorten its label. If the SELECT fails or is
+interrupted, the previous result and its original duration stay in place.
+
+                                                        *grip-engine-timing*
+Set `engine_timing = true` to opt in to DuckDB profiler latency collection.
+The result footer adds a separate "Engine: 12.3ms DuckDB profiler latency"
+line. This is DuckDB's JSON-profile LATENCY for the statement that produced
+the result, converted from seconds to milliseconds. It includes the adapter's
+nested-value SELECT conversion. Attachment setup, CLI startup, and Lua result
+parsing are outside this metric. It is elapsed query latency, not cumulative
+operator CPU, network latency, or the execution time of a remote attached DB.
+The existing client clock keeps its own meaning. Collection is independent
+of timing display preferences and adds profiling overhead.
+Actual database writes also opt in. After a successful reload, "Write engine"
+retains the write's profiler latency separately from that SELECT's "Engine".
+Metadata and later unrelated refreshes inherit neither write duration.
+`show_result_time = false` hides Engine and Write engine with client timings;
+collection continues. `show_hints` controls Zen shortcuts independently.
+The first eligible call probes JSON/ALL support once using a synthetic SELECT
+in a fresh in-memory client without an init file or attachments. Results are
+cached per executable identity; its time belongs to that first client clock.
+An unsupported client keeps the normal query path with absent engine timing.
+Cancelling or timing out the probe aborts the request before user SQL starts.
+
+Only eligible single statements are profiled. Batches, transaction wrappers,
+session/profiling commands, and conservatively unsupported syntax keep the
+normal conversion/compatibility path and report unsupported timing. A profile must
+match the submitted adapter statement exactly (apart from outer whitespace).
+Missing, malformed, or mismatched profiles report unavailable timing. Neither
+absence becomes a numeric zero. An enabled profile never runs EXPLAIN ANALYZE
+or retries its statement; its wrapper errors are returned without compatibility
+fallback. When profiling is disabled, legacy conversion/fallback is preserved.
+DuckDB JSON profiling with ALL coverage is required; this
+collector is exercised against DuckDB 1.5.5.
+
+Each profile is written inside a new private temporary directory (0700) and
+removed after success, failure, timeout, interruption, or parsing failure.
+No database privileges or settings are changed persistently. Timing does not
+change transaction semantics or promise rollback after a failed batch.
+
+The additive Lua facade also accepts per-call options: >lua
+  local db = require("dadbod-grip.db")
+  local result, err = db.query("SELECT 42", url, { engine_timing = true })
+  local written, write_err = db.execute(sql, url, { engine_timing = true })
+<
+Successful results gain `engine_timing`: status is "available", "unsupported",
+or "unavailable". Only "available" has `elapsed_ms`; DuckDB also identifies
+`source = "duckdb_profile"` and `scope = "statement"`. Absent data has a
+machine-readable `reason`. Calls without the option keep their existing
+result shape. PostgreSQL, MySQL/MariaDB, SQL Server, and SQLite currently
+return "unsupported"; their client durations remain available as before.
+See doc/engine-timing.md for the support matrix and upstream metric contracts.
+Mutation previews and confirmed database writes use the same loading clock.
+This includes staged apply (also imported rows), local file write-back,
+committed-transaction undo, and DDL. A write finishes its clock before its
+separate SELECT reload begins. After that reload succeeds, the status line
+keeps "Write: 1.4s client" alongside the SELECT's own Query duration. Write
+measures the db.execute call, including client startup and lock waits; it is
+not server execution time. That Write duration belongs to those refreshed
+rows: metadata and later unrelated SELECT results do not inherit it.
+Successful apply history also keeps the write duration in milliseconds.
+
+Import parsing/staging and AI generation are not database writes. The loading
+clock updates while client waits pump Neovim's event loop; CPU-only local
+preview staging can pause animation. An interrupted client wait closes the
+indicator but does not prove the server stopped or rolled back the write.
+Grip reports the database outcome as unknown for interrupted/timed-out client
+waits. Refresh and check the database before retrying. If you navigate or edit
+while a write waits, its completion keeps your newer view and staging intact.
+
+Set `show_result_time = false` to hide retained Query, Write, and action
+durations in the result grid. Completed action status, errors, row counts, and pagination
+remain visible. This option and `show_running_time` are independent and both
+default to true. They control display only: queries and actions are still
+timed, and history keeps its durations. Neither setting changes key hints,
+the sticky header, or whether the sidebar opens.
+
 Set `open_sidebar = false` to connect directly into the main workspace. The
 sidebar remains available through :GripSchema, `gb`, or `1`.
+
+Set `show_hints = false` for Zen display: hide automatic shortcut/decorative
+help in the grid, SQL pad, sidebar, and welcome screen. Essential result status,
+column labels, data/NULLs, staged colors/counts, read-only and hidden-column
+markers, filters, pagination/totals, loading, and errors remain available.
+Narrow grids may use extra status rows so fields remain readable. Explicit `?`
+help (or its configured binding) still works. New SQL-pad help uses decorations;
+changing modes never rewrites existing SQL or comments. `:GripZen` toggles this
+setting for the current session without changing either timing option, keymaps,
+pane geometry, or zoom. No default key is added. A cursor on a removed help row
+may naturally clamp to the last remaining line.
 
                                                              *grip-picker*
 When `picker` is set to "telescope" or "snacks", simple pickers (table picker,
@@ -181,6 +344,11 @@ the whole grid by one row every time scrolling crosses that threshold.
 A winbar costs one screen line per grid window; set `sticky_header = false`
 to reclaim it for good (the badges then render as before).
 
+The shortcut hints below the result fit into two rows for each window's text
+width. They use configured keys and stay in place during horizontal table
+scrolling. Narrow windows prioritize core actions and help; `…` marks omitted
+hints when it fits. These rows scroll vertically with the end of the result.
+
 AI SQL generation (optional): >lua
   require("dadbod-grip").setup({
     ai = {
@@ -214,7 +382,7 @@ a binding entirely: >lua
 <
 Action names (stable API) with their defaults:
 
-  Shared across all surfaces ~
+  Persistent actions (surface availability is listed in keymaps.json) ~
   palette          = "<C-p>"   command palette
   help             = "?"       help popup
   er_diagram       = "gG"      ER diagram float
@@ -226,6 +394,16 @@ Action names (stable API) with their defaults:
   load_saved       = "gq"      load saved query
   welcome          = "Q"       welcome / home screen
   schema_browser   = "gb"      schema sidebar (open/focus/close)
+  zoom             = "gz"      zoom current pane / restore split sizes
+
+  Welcome screen ~
+  welcome_activate = "<CR>"    run the selected welcome action
+  welcome_next     = "<Tab>"   next action row
+  welcome_prev     = "<S-Tab>" previous action row
+  welcome_close    = "q"       close welcome
+  welcome_close_esc= "<Esc>"   close welcome with Escape
+  welcome_connect  = "gc"      connection picker
+  welcome_secret   = ";"       existing Chonk cameo
 
   Shared: grid + sidebar ~
   query_pad        = "q"       open query pad
@@ -353,6 +531,48 @@ All commands are global and available after the plugin loads.
   Open a table in an editable grid, run a SQL query, open a local file,
   or query a remote file via DuckDB httpfs.
 
+  UPDATE, DELETE, INSERT, and REPLACE open a preview before execution.
+  Target aliases, comments, quoted identifiers, and nested predicates are
+  recognized. Literal SET values are staged; computed expressions stay at
+  their current values until the database executes the original statement.
+  RETURNING and SQL Server OUTPUT clauses are excluded from the preview
+  SELECT but retained for execution. SQL Server INSERT may omit INTO, and
+  DELETE may omit FROM.
+  Press a to confirm the original SQL or u/U to cancel.
+  Recognized WITH-prefixed mutations confirm the entire SQL directly; this
+  also covers SQL Server's optional INTO/FROM and table-variable targets,
+  and MySQL/MariaDB DELETE modifiers. MERGE in PostgreSQL, DuckDB, and SQL
+  Server uses this whole-statement confirmation instead of a row preview.
+  PostgreSQL composite fields and SQL Server UDT properties are not predicted
+  as scalar column changes. SQL Server column mapping preserves exact case;
+  case-insensitive fallback is used only for an unambiguous metadata match.
+
+  Ordinary INSERT VALUES shows literal incoming rows, preserving the column
+  list, NULLs, and empty strings. MySQL INSERT SET and row/column aliases,
+  SQLite/DuckDB INSERT OR forms, and REPLACE are recognized. DuckDB BY NAME/
+  POSITION, parenthesized/FROM-first source queries, VALUES queries with set
+  operations or limits, and MySQL () VALUES () use current-data previews.
+  UPSERT, REPLACE, ignored conflicts, explicit DEFAULT values, computed
+  values, and INSERT SELECT show only current data: their final values and
+  affected counts are determined when the original SQL executes. The title
+  and confirmation identify this mode.
+
+  SQL text containing embedded NUL bytes is rejected before any preview
+  request. Use CHAR(0) or a hex expression to generate NUL data values.
+
+  Multi-source JOIN/USING/UPDATE FROM previews and multiple statements are
+  rejected rather than showing an incomplete affected-row set. A transaction
+  containing one mutation and ending in COMMIT can be previewed; execution
+  retains the entire transaction. ROLLBACK blocks are not previewed or run.
+  SQL Server's unseparated extra commands and client command escapes are
+  rejected before querying preview data.
+
+  The existing preview still omits top-level ORDER BY/LIMIT, so its count is
+  the matching row set before those restrictions. Nested ORDER BY/LIMIT remain
+  intact. The completed-write message uses the adapter's affected count when
+  available. For MySQL/MariaDB transactions, COMMIT does not preserve the
+  mutation count, so the completed-write message omits that count.
+
   Examples: >
     :Grip users
     :Grip SELECT * FROM orders LIMIT 50
@@ -394,6 +614,11 @@ All commands are global and available after the plugin loads.
                                                               *:GripConnect*
 :GripConnect [url]
   Switch database connection. Shows a picker if no argument is provided.
+  Pending result changes require explicit discard confirmation. Canceling or
+  failing to read the target database preserves the current result changes,
+  connection URL, and saved profiles. Resolve any pending or uncertain write
+  before switching. Apply or discard pending changes manually before opening
+  a file profile; file-profile switching remains unchanged when none exist.
   Reads from .grip/connections.json, g:dbs (DBUI compatible), and
   $DATABASE_URL.
 
@@ -453,8 +678,45 @@ All commands are global and available after the plugin loads.
 
                                                               *:GripToggle*
 :GripToggle
-  Close all grip windows if any are open, or reopen the last workspace
-  (schema sidebar + query pad) if closed.
+  Delete visible Grip buffers across all tabs, or reconnect to the last
+  connection when no Grip windows are visible. Deleting buffers discards
+  unsaved query text and staged result state without a save prompt. This
+  command is not reversible workspace hiding. Use :GripZoom to make room
+  temporarily, or <Esc> inside the sidebar to close just its window.
+
+                                                                *:GripZoom*
+:GripZoom
+  Maximize the current split window, or restore the saved split sizes in
+  this tab. The default normal-mode key is gz in grids, the query pad, the
+  schema sidebar, and welcome. The command also works in ordinary file/help
+  splits and the full cell-value split; those use :GripZoom without a gz map.
+
+  No windows are closed and no buffers are copied, replaced, or deleted.
+  Unsaved SQL, staged results, sidebar folds, and native window keys stay
+  available. Other panes remain at Neovim's minimum window size.
+
+  A second toggle restores the original sizes and fixed-size settings.
+  Navigation and edits made while zoomed are retained. After a terminal
+  resize or a split change, surviving panes are equalized around their saved
+  fixed-size settings. Added or rearranged windows stay in place; closed
+  windows are not rebuilt. Closing the zoomed pane also ends its zoom and
+  recovers usable sizes for the remaining panes. Floating panes are not maximized;
+  close their popup first, then zoom the underlying split.
+
+  Opening the query pad while another split is zoomed restores the layout
+  first, so the SQL window is usable. Reopening SQL keeps its zoom when it
+  returns to the same zoomed window. Native window navigation does not change zoom.
+
+  Remap or disable only this shortcut with setup({ keymaps = { zoom = ... } }).
+  Native <C-w>h/j/k/l and <C-w>w still navigate windows. <C-w>= equalizes
+  sizes rather than restoring a saved layout. Avoid :only for temporary
+  zoom: closing a Grip grid wipes its result buffer and staged state.
+
+                                                                 *:GripZen*
+:GripZen
+  Toggle automatic shortcut hints for this session. Equivalent to switching
+  `show_hints` between true (normal) and false (Zen); timing and layout remain
+  independent. Existing grids, SQL pad, sidebar, and welcome screens update.
 
                                                                 *:GripDrop*
 :GripDrop [table]
@@ -548,12 +810,41 @@ All commands are global and available after the plugin loads.
   the disposable supplier database is attached automatically as `supplier`.
   Demo files live under stdpath("data") and never overwrite the current
   project's .grip directory.
+  The pad focuses the first bundled SQL block without executing it. Press
+  <C-CR> to run it, or gb, select rolls, and press Enter to browse a table
+  first. From that table, 2 returns to the walkthrough's SQL pad.
+
+                                                               *grip-demo*
+  Search the notebook for "Daily practice" for a short find -> inspect ->
+  edit -> review -> undo/apply loop. Both engines include incident_summary,
+  a read-only aggregate view. DuckDB also includes reporting.monthly_incidents
+  and the SQL-callable reporting.severity_label macro. The reporting schema
+  folds in the sidebar; macros are not listed as PostgreSQL functions.
+  The bundled demo/README.md describes the separate optional PostgreSQL lab
+  in demo/softrear_postgres.sql. Use a new disposable local database for that
+  lab. It creates nested partitions, a view, and a function without changing
+  roles, grants, extensions, or server settings. GripStart does not seed or
+  connect to PostgreSQL automatically.
 
                                                                 *:GripHome*
 :GripHome
-  Return to the dadbod-grip welcome screen from anywhere. Shows the keymap
-  reference, connection string examples, and navigation shortcuts. Also
-  reachable with Q from any grip buffer.
+  Return to the dadbod-grip welcome screen from anywhere. The DBG logo is
+  followed by actionable rows for the demo, connection picker, table picker,
+  and SQL pad. Tab / Shift-Tab or native j/k selects a row; Enter runs it.
+  Enter on other lines does nothing. Opening welcome does not connect or run
+  SQL. Q also returns here from the grid, query pad, or sidebar.
+
+  Welcome's current defaults remain q/Esc to close, gc/gC/C-g to connect,
+  gb or 1 for schema, go or 3 for tables, 2 for SQL, and ? for local help.
+  The workspace diagram labels these welcome keys. In the SQL pad, 2 opens
+  history; in schema, 1 opens connections. ? shows that pane's actual actions.
+  Existing 4-9 views and the ; Chonk Easter egg remain available. Only the
+  selected row changes Enter's previous connect-anywhere behavior.
+  Welcome and help show effective configured keys and omit disabled keys.
+  With a disabled action, type its global command: GripStart, GripConnect,
+  GripTables, or GripQuery. No alternate keymap preset is implemented.
+  In-app help ends with an About section featuring Chonk's Table Hug drawing.
+  Press G in help to see it, then q or Escape to return to the same pane.
 
 ==============================================================================
 6. KEYBINDINGS                                           *grip-keybindings*
@@ -583,8 +874,9 @@ EDITING ~
                   NORMAL mode for full Vim motions (ciw, dw, s, etc.),
                   then <CR> to save or q/<Esc> to cancel.
                   <C-c> in INSERT cancels immediately.
-                  JSON cell values open with JSON syntax highlighting and
-                  a taller float. Long values wrap at word boundaries.
+                  JSON cell values open as stored, with JSON syntax
+                  highlighting and a taller float. Long values wrap at word
+                  boundaries.
                   Footer updates live: INSERT hint vs NORMAL hint.
   gB              Open cell value in a full split buffer
                   JSON opens as stored with ft=json; :w stages the
@@ -631,6 +923,13 @@ SORT / FILTER / PAGINATION ~
   H / L           Previous / next page
   ]p / [p         Previous / next page (alternate)
   ]P / [P         Last / first page
+
+Table-grid refreshes recount the active filters after Apply, committed Undo,
+or `r`. If the current page no longer exists, Grip loads the last valid page;
+an empty table remains on page one. Sorting, filters, and page size stay intact.
+If a count fails, the total is unknown and Grip does not guess a page boundary.
+Raw-query refreshes do not add another COUNT evaluation; their total becomes
+unknown until an explicit pagination, sort, or filter requery counts it again.
 
 FK NAVIGATION ~
                                                             *grip-fk-nav*
@@ -771,16 +1070,133 @@ Workflow:
   4. Apply all changes with `a` (wraps in BEGIN/COMMIT transaction)
   5. Undo individual edits with `u` or reset all with `U`
 
-All DML is wrapped in a transaction. If any statement fails, the entire
-transaction is rolled back and your staged changes are preserved so you
-can fix the value and retry.
+Structured grid writes run in one transaction. A guard or statement failure
+rolls back that batch and preserves staged changes. A timed-out or interrupted
+client can leave the outcome unknown; inspect and refresh before retrying.
 
 Multi-level undo: every edit operation pushes the previous state onto a
 50-deep undo stack. Press `u` repeatedly to step back through your edit
 history. Press `U` to reset to the original state in one step.
 
-Read-only mode is auto-detected when no primary key exists on the table
-(grip needs PKs for WHERE clauses in UPDATE/DELETE statements). SELECT
+Committed Undo ~
+
+After applying staged edits, `u` performs a guarded compensating row operation.
+It uses identities captured in that write's session, including post-edit keys,
+and requires the stored current values to match. A conflict or missing row
+rolls back the reversal and retains the Undo entry. This is not a universal
+transaction rollback: triggers may run again, and arbitrary trigger effects on
+other rows or tables are not reversed. If exact target-row restoration cannot
+be proved, Undo fails without consuming its entry.
+
+Generated identities are supported through SQLite rowid, PostgreSQL RETURNING,
+DuckDB RETURNING, MariaDB INSERT RETURNING, SQL Server OUTPUT, and MySQL's
+single auto-increment primary key. MySQL/MariaDB grid writes require InnoDB and enforced CHECK
+constraints. ENUM/SET definitions must have unique nonempty ASCII labels made
+of letters, digits, underscores or hyphens. Empty, case-equivalent, escaped or
+otherwise unproven labels refuse the entire batch before writing. Spatial row
+restoration is also unsupported. Custom SQL remains available.
+SQLite generated keys in WITHOUT ROWID tables, tables shadowing
+all rowid aliases, and MySQL incomplete non-auto-increment or composite keys
+require explicit complete keys. A batch containing an unsupported generated
+identity is refused before any row changes; no partial Undo is offered. NULL,
+missing, or unproven row keys also fail closed. SQL Server grids built from
+sqlcmd's plain text remain read-only.
+Failed writes after submission remain uncertain unless rollback is proved.
+They are never retried automatically. If original client completion is still
+unknown, refresh refuses to discard staging or clear the write guard. After
+confirmed client exit, inspect and refresh before taking a new action. An
+uncertain Undo entry cannot be replayed.
+
+Lossless SQLite reads require UTF-8 database encoding and SQLite 3.35 or newer
+for MATERIALIZED result snapshots. UTF-16 databases are refused before the
+original read; their encoding is never changed. Custom SQL execution remains
+available, but unsupported result reads do not become editable grids.
+Before a reversible SQLite grid batch, Grip verifies that this SQLite runtime
+can restore the original REAL values from their exact receipts. Some older
+versions cannot round-trip tiny subnormal values. Such batches remain staged
+without changing rows; clones with an unrestorable REAL receipt also refuse.
+
+MySQL/MariaDB typed reads evaluate the original SELECT once inside a derived
+table. A LIMIT fence preserves materialization and original ORDER/LIMIT and
+DISTINCT behavior. Known direct fields and explicit AS labels retain their
+spelling, including quoted names. Source metadata before the read plans headers
+only. The original read runs first in its transaction; source types, visibility
+and the complete schema are checked afterward on that same client. Source
+restoration is admitted only after matching receipts, COMMIT and client exit.
+No TEMP table privilege is required, and read-only profiles keep server-side
+transaction enforcement.
+
+Column metadata can hide columns the account cannot see. Grip also compares
+the complete quoted column names/order from SHOW CREATE TABLE with the type
+metadata while the original read's metadata lock remains held. Invisible and
+generated SQL columns are included. The bounded layout check requires
+sql_quote_show_create enabled and the adapter's fixed SQL mode. On MySQL with
+generated invisible-key support, show_gipk_in_create_table_and_information_schema
+must be ON. An absent setting is accepted only on identified MariaDB or the
+documented pre-GIPK MySQL 8.0.0--8.0.29 profile. Grip reads these settings and
+does not change them or grant access. Native verification covers MySQL 8.4 and
+MariaDB 11.8; this does not claim native testing on older server versions.
+
+A successful pre-read check that establishes an unsupported visibility/layout
+profile can select native read-only results before any original query runs.
+Denied metadata, unknown visibility or ambiguous layout parsing is an error;
+it cannot trigger a second route. A post-read layout mismatch withholds the
+result after the one query ran. SHOW CREATE supplies only a SQL-column span
+witness; type/charset metadata supplies physical types. Engine-internal hidden
+storage is outside this layout contract.
+
+Other safe single SELECTs, CTEs and set operations keep the original native
+query and headers through a route chosen before execution. Session-context
+reads also remain unwrapped. These results have unproven physical types and
+remain read-only; this route makes no universal byte or NULL fidelity claim.
+Explicit duplicate labels, batches on the SELECT route, INTO/locking clauses
+and ambiguous client commands are refused before execution. Intentional custom
+DDL/DML/routine batches remain a separate invocation path and are denied on
+read-only profiles. Safe SHOW/DESCRIBE/EXPLAIN reads remain available.
+
+Schema changes, unsupported types or unsafe warnings can withhold a result
+after the query ran. A successful original is committed when a completed
+metadata comparison or codec check withholds only its result. Actual metadata/client errors
+close the session; commit or completion failures report uncertainty. No error,
+denial or cancellation causes a fallback or automatic SQL replay.
+
+Result provenance ~
+
+A byte-encoding receipt is separate from proof of a column's physical SQL type
+and editable source. Results with unproven source restoration remain read-only;
+staging an apparent text value cannot upgrade that proof. Empty results and
+all-NULL columns also require column-level proof. Metadata-only source records
+and binding flags alone never establish an editable source.
+
+Unproven bytes display as hexadecimal in the grid and the gB split inspector.
+Text/JSON inspectors, clipboard yanks and exports refuse values whose encoding
+is unproven. Encoding-proven text may be exported for presentation, but SQL
+export, cloning and grid writes additionally require source restoration proof.
+Page, all-row and batched file exports retain the original provenance. A
+refused file export preserves any existing destination.
+
+Empty text and SQL NULL ~
+
+Empty text displays as `""`; SQL NULL displays as the NULL marker. Clearing an
+ordinary value and saving stages empty text. Saving an untouched NULL buffer
+stages nothing. The existing grid `x` action stages SQL NULL.
+
+Inside either editable cell buffer, `:GripCellEmpty` stages empty text even
+when the original value is NULL, and `:GripCellNull` stages SQL NULL. These
+commands close the float editor; the split editor stays open. They only stage
+a value. The grid's normal Apply confirmation still controls the database write.
+An editor whose grid was refreshed, replaced, or navigated elsewhere refuses
+stale saves and commands. Raw JSON text remains unchanged by no-op saves.
+
+CSV and TSV exports encode NULL as an unquoted empty field and empty text as
+`""`. JSON exports keep non-NULL cell text as strings, including numeric and
+boolean spellings, instead of guessing a value's type from its characters.
+
+Read-only mode is auto-detected when no primary key exists on the table or
+the result omits any primary-key column, including part of a composite key
+(grip needs the complete PK for WHERE clauses in UPDATE/DELETE statements).
+Empty raw queries also stay read-only when the client returns no column metadata;
+schema fallback still allows insertion into an empty full-table view. SELECT
 projections with column aliases, including unchanged names such as `id AS id`,
 or expressions such as `total * 2` and bare `CURRENT_TIMESTAMP` open read-only.
 Supported direct column references and wildcards remain eligible for editing
@@ -799,11 +1215,9 @@ Press `gB` on a cell to open its value in a real split buffer (named
 grip://cell/<table>/<row>/<column>) instead of the small float editor.
 Built for large values: big JSON documents, long text.
 
-  - JSON values open exactly as stored, with ft=json (syntax highlighting
-    and folding work as usual). They are not pretty-printed, because :w
-    writes the buffer back and a reformat would sort the keys and round
-    large numbers. To reformat on purpose, run a formatter such as
-    `:%!jq .` before saving.
+  - JSON values open exactly as stored with ft=json (syntax highlighting
+    and folding work as usual). Editing preserves large numbers, decimal
+    spelling, key order, and whitespace outside your changes.
   - Prose columns (body, description, notes, content, text, bio) open
     with ft=markdown; everything else stays plain.
   - Multiline values round-trip exactly: the grid displays newlines as a
@@ -908,18 +1322,31 @@ to scanning each table's foreign keys once.
 10. SCHEMA BROWSER                                          *grip-schema*
 
 Toggle with `:GripSchema` or `gb` from a grid or query-pad buffer. Opens a
-left sidebar showing all tables and views for the current connection.
+left sidebar showing tables, views, functions, and procedures for the current
+connection. When the adapter supplies schema metadata, schemas start collapsed.
+Objects without schema metadata keep their flat sections, even when other
+objects have known schemas. Missing metadata does not assign an object to
+public or main. PostgreSQL objects always belong to a schema; an unqualified
+display name does not mean the object has no schema.
+
+PostgreSQL declarative partitions appear once beneath their actual parent in a
+separate Partitions group. Nested partitions retain their hierarchy, and
+cross-schema children show their schema. Children whose parent is not visible
+remain at the top level. Traditional inheritance stays flat. Group counts show
+visible direct children; browsing and expanding columns do not count data rows.
+Opening a parent table uses the normal parent query, including its partitions.
+Metadata visibility does not guarantee permission to query every column.
 
 Schema browser keymaps:
-  <CR>            Open table in grid (or open parent table from column)
+  <CR>            Open table/routine, or toggle schema/partition group
   <S-CR>          Open table in new split
-  l / zo          Expand table to show columns
-  h / zc          Collapse table
-  L               Expand all tables
-  H               Collapse all tables
-  /               Filter tables by name
-  n / N           Jump to next / previous table match
-  F               Clear filter
+  l / zo          Expand group or table columns
+  h / zc          Collapse item, or move to its parent
+  L               Expand every schema/partition level; keep existing columns
+  H               Collapse all groups and table columns
+  /               Search hidden names and routine identity signatures
+  n / N           Jump to next / previous visible table or routine
+  F               Clear filter and restore the original folds and view
   r               Refresh schema (re-fetch table list)
   y               Yank table or column name to clipboard
   go              Open table under cursor, ORDER BY latest (created_at / PK DESC)
@@ -935,7 +1362,20 @@ Schema browser keymaps:
   <Esc>           Close sidebar
   ?               Toggle help popup
 
-Columns show type abbreviations (int, text, bool, vc(255), etc.) and
+L and H apply to the whole sidebar. During filtering they change only the
+temporary matching tree. Press F, then L or H, to apply them to the complete
+catalog. Flat root objects remain visible because they have no schema group
+to collapse. Use l/zo on an individual table to load its columns.
+
+Search temporarily reveals matching paths without changing the saved folds.
+Editing a filter keeps the original pre-search view; cancelling leaves the
+active filter and selection unchanged. Functions and procedures retain their
+full identity signatures, and opening a PostgreSQL routine uses its exact OID.
+
+Labels remain complete in the buffer. Use `zh`/`zl` to scroll horizontally,
+`zH`/`zL` for half-window scrolling, or `0`/`$` to reach either end of a label.
+The window edge indicates clipped text. Columns load on explicit table
+expansion and show type abbreviations (int, text, bool, vc(255), etc.) with
 markers for primary keys and foreign keys.
 
 ==============================================================================
@@ -944,8 +1384,9 @@ markers for primary keys and foreign keys.
 Open with `:GripQuery` or `q` from the grid or schema sidebar. Creates a
 persistent scratch SQL buffer with filetype=sql and built-in completion.
 
-Content protection: pressing `q` or `2` focuses the pad without replacing
-anything. Clicking a table in the sidebar or picker appends the new query
+Content protection: `q` or `2` from the grid/sidebar focuses the pad without
+replacing its SQL. Inside the pad, `q` goes to welcome and `2` opens query
+history. Clicking a table in the sidebar or picker appends the new query
 below existing SQL with a blank separator. The pad is only pre-filled when
 it is empty (or contains only the hint comment). Your work is never lost.
 
@@ -959,7 +1400,44 @@ columns from all attached databases appear with schema-qualified names
 (e.g. `pg.users.email`). The nvim-cmp source name is `dadbod_grip`.
 Works with nvim-cmp, blink.cmp, or standalone via `<C-Space>`.
 
+The standalone automatic menu waits for two identifier characters, or a
+qualifier dot such as `users.`. A sole exact match stays quiet. Suggestions
+do not insert text or select an item automatically: use Tab or the arrow keys
+to select, then Enter to accept. Enter with nothing selected inserts a newline.
+Manual `<C-Space>` / `<C-x><C-o>` completion also works with shorter prefixes.
+These menu options apply only to Grip's standalone query pad. On Neovim 0.10,
+Grip temporarily owns the global option while the pad is focused and restores
+it on leave or deletion; newer Neovim uses a buffer-local option. External
+engines retain their settings when `completion = false`.
+
+DuckDB also suggests scalar, aggregate and macro functions in expressions,
+and table functions/macros after FROM or JOIN. Choosing one inserts its name
+and opening parenthesis. Catalog warming is asynchronous and shares Grip's
+DuckDB query queue. While it warms, keep typing or trigger completion again;
+it never opens a delayed menu or inserts a function on its own. Successful
+catalogs are cached for five minutes. Failed warms have a short cooldown;
+manual schema refresh or a schema-changing SQL attempt clears them immediately.
+Suggestions include ordinary unquoted function names in the main schema of
+the actual CLI session. Catalog lookup loads no additional extensions; existing
+configured attachment setup still applies. Functions loaded only in a different
+client session, or macros in another attached catalog, are not promised.
+
+After a custom SQL write attempt, Grip discards cached table and column
+metadata, including when a later statement fails after earlier DDL committed.
+It preserves the original SQL result or error and does not retry the SQL.
+The sidebar and SQL completion reload metadata when next needed. Use
+`r` or `R` in the sidebar to refresh completion after schema changes made
+outside Grip.
+Grid `r` also reloads column metadata. Delayed metadata from an older result
+cannot replace the current grid's column information.
+
 Query pad keymaps:
+  q / Q           Go to welcome (q elsewhere opens/focuses this pad)
+  1               Open/focus sidebar (1 inside sidebar opens connections)
+  2               Query history (2 from grid/sidebar opens/focuses this pad)
+  3               Focus grid, or pick a table when none is open
+                  In a grid: return from a detail view to records, or pick
+                  a table when already viewing records.
   <C-CR>          Execute the SQL block under the cursor (normal/insert)
   <C-CR>          Execute visual selection into a grip grid (visual mode)
   <S-CR>      Execute and always open result in a new split (never reuses
@@ -967,7 +1445,7 @@ Query pad keymaps:
   <C-Space>       Trigger SQL completion manually
   <Tab>/<S-Tab>   Trigger or move through completion choices
   <Down>/<Up>     Move through completion choices, or move normally
-  <CR>            Accept completion, or insert a newline
+  <CR>            Accept selected completion, or insert a newline
   <C-s>           Save query with :GripSave
   gq              Load saved query (picker with SQL preview)
   gA              AI SQL generation (natural language)
@@ -1037,6 +1515,25 @@ Both files are merged when the picker opens. When at least one global
 connection exists, connections are grouped under "global" and "project"
 section headers so the scope is immediately visible without any extra
 knowledge of the file layout.
+
+Selecting a saved global connection updates its recency in the global file
+without creating a project-local copy. Its settings and attachments continue
+to come from that profile. If the same URL has a project-local profile, that
+override keeps precedence and only its recency is updated.
+Attachment changes also save to the profile's owning registry.
+
+Press `D` in the connection picker to remove the selected saved profile from
+its original registry after confirmation. Other profiles with the same name
+are preserved. Deleting a local override reveals the global profile for that
+URL on the next refresh. If the selected profile changed or is ambiguous,
+reopen the picker before deleting. Unsaved and discovered-only rows have no
+saved profile to remove; deleting a discovered row with saved settings removes
+only those settings, and the live container can still appear. Built-in and
+demo rows retain their separate dismissal behavior.
+Removing a profile preserves every other stored record, including custom
+fields. Malformed registry JSON is refused without changing the file.
+Deletion requires a nonempty string `id`, or no `id` for a legacy profile;
+numeric and other unsupported IDs are refused without changing the file.
 
 `g:dbs` entries auto-persist to the global file so they appear in every
 project without any extra steps.
@@ -1123,10 +1620,19 @@ If a literal password contains `${WORD}`, write `$${WORD}`: a doubled dollar
 produces the literal text and resolves nothing. The escape is only special
 immediately before `{NAME}`, so `pa$$word` is left alone.
 
-The .env file is parsed for `KEY=value` and `export KEY=value` lines; one
-pair of surrounding quotes is stripped; whole-line `#` comments and blank
-lines are ignored. A `#` inside a value is part of the value, not the start
-of a comment -- a password may legitimately contain one.
+The .env file supports `KEY=value` and `export KEY=value` lines. Whitespace
+outside values and one surrounding quote pair are stripped. Whole-line `#`
+comments and blank lines are ignored. An inline comment starts with whitespace
+followed by `#` outside the quotes, so `KEY="value" # comment` and
+`KEY=value # comment` both produce `value`. A quoted hash or an unspaced hash
+stays literal: `KEY="value # suffix"` and `KEY=value#suffix` retain their hashes.
+
+Values remain literal: backslash escapes and nested ${VAR} text are not decoded
+or expanded, and multiline values and shell expressions are not supported.
+Backslashes only help identify escaped quotes when finding the closing quote.
+An unmatched quote or extra noncomment text after a closing quote is preserved
+verbatim rather than silently truncating a credential. Inline comments require
+separating whitespace, including after a closing quote.
 
 It is read at connect time and memoized on the file's mtime, so a
 rotated password is picked up on the next query. A git-crypt-locked file is
@@ -1141,13 +1647,19 @@ expanded url. Passwords also reach psql, mysql, and sqlcmd through the process
 environment rather than argv, so they are not visible in another user's `ps`.
 Processes running as your user may still read those environment variables.
 
-Grip sends all database SQL and AI request content through stdin. Statements,
+Grip sends original SQL and AI request content through stdin. Statements,
 prompts, schema context, existing SQL, and JSON request bodies are absent from
 argv. AI URLs and headers also travel through `curl --config -`, and API-key
 lookup commands run through shell stdin. DuckDB attachment declarations use
 the same stdin boundary. Credentialed PostgreSQL and MySQL attachments use
 invocation-scoped temporary DuckDB secrets and attach by secret name. Grip
 never creates persistent DuckDB secrets.
+
+SQLite's lossless read path also uses a generated SQL script containing selected
+column identifiers. It creates the script as 0600 inside a fresh 0700 temporary
+directory and removes it after the client exits, including cancellation cleanup.
+Identifiers can be sensitive. The original query and mutation values remain on
+stdin, and the temporary path carries no connection credentials.
 
 Limit: a templated url is grip-only. vim-dadbod's `:DB` and any statusline
 reading `g:db` see the literal `${NAME}`. Keep such connections un-templated
@@ -1222,10 +1734,9 @@ Three highlight groups carry it:
                        instead of leaving the last connection's tint behind
 
 All three are redefined on every connection switch and re-applied whenever
-highlights are rebuilt, so they survive a `:colorscheme` change. Because
-they are redefined rather than merged, defining any of them yourself in your
-config will not stick -- this is unchanged from how grip's other groups have
-always behaved.
+highlights are rebuilt, so they survive a `:colorscheme` change. To customize
+them persistently, use the `highlights` setup option (|grip-highlights|); those
+overrides take precedence over the connection's accent.
 
 ==============================================================================
 14. EXPORT                                                   *grip-export*
@@ -1241,6 +1752,14 @@ then choose one of six clipboard formats:
   Grip Table ....... Box-drawing table matching the grid style
 
 All-row export preserves filters and sorting while removing pagination.
+Metadata views export their displayed snapshot as CSV or JSON in either scope;
+they do not rerun the records query. SQL export is unavailable for metadata
+because it has no physical insertion target. JSON export refuses BLOB cells;
+use SQL to preserve binary bytes. Invalid UTF-8 text is also refused by JSON
+export. Unsupported formats preserve existing files. Metadata clipboard
+shortcuts copy the displayed metadata, not the hidden Records state.
+Changing the visible result or closing its session while choosing scope
+cancels that export request.
 Clipboard exports are capped at 100,000 rows; use a file above that.
 
 Export to file ~                                              *:GripExport*
@@ -1319,13 +1838,17 @@ plain text instead. Those results are read-only: plain text has no quoting,
 drops trailing spaces, cuts values at 8000 characters and cannot tell NULL
 from the text 'NULL'.
 
-In SQL Server grids an empty cell is either NULL (shown as ·NULL·) or a
-real empty string (shown blank). Saving an empty editor writes '' to a NOT
-NULL text column or a cell that held '', and NULL otherwise; x always
-writes NULL. Computed, rowversion and temporal period columns cannot be
-edited and are left out of clones and of the INSERT that undoes a delete.
-A deleted row with a binary over 8000 bytes (shown as <binary N bytes>)
-cannot be undone, and apply asks first.
+SQL Server grid writes run as one transaction per Apply or Undo. Each
+UPDATE and DELETE first locks the row and checks that it still holds the
+values the grid loaded (a rowversion column makes that check exact); a row
+changed elsewhere refuses the whole batch. Undo uses the rows as the
+transaction itself read and wrote them, including the key an IDENTITY,
+NEWID() or sequence default gave an inserted row, and restores a deleted
+row under its original IDENTITY value. Computed, rowversion and temporal
+period columns cannot be edited and are left out of clones and of the
+INSERT that undoes a delete. A binary over 8000 bytes is shown as
+<binary N bytes> and cannot be edited, but a deleted row holding one is
+restored whole by Undo.
 
 The query pad pages a single SELECT by wrapping it, which SQL Server only
 allows for plain queries. A trailing ORDER BY of plain columns becomes the
@@ -1336,6 +1859,14 @@ SET ROWCOUNT 1000; a batch that writes asks before it runs.
 
 Each adapter implements: query, execute, get_primary_keys, get_column_info,
 get_foreign_keys, get_indexes, get_table_stats, list_tables, and explain.
+
+MySQL/MariaDB translate `INSERT ... DEFAULT VALUES` into the native
+`INSERT ... () VALUES ()` form. Translation recognizes mixed-case keywords
+and ordinary comments while preserving quoted data, identifiers, and the
+surrounding SQL. Inputs with executable comments, optimizer hints containing
+client commands, SQL-mode or delimiter changes, or ambiguous/unfinished
+quoting or comments are sent unchanged.
+Use native `() VALUES ()` syntax for those inputs.
 
 File-as-table: `:Grip /path/to/data.parquet` routes through DuckDB to
 query supported files directly. No database connection is needed.
@@ -1379,9 +1910,17 @@ grip.setup({opts})
     limit         (number)  Default row limit. Default: 100
     max_col_width (number)  Max display width per column. Default: 40
     timeout       (number)  Query timeout in ms. Default: 10000
+    engine_timing (boolean) Collect DuckDB profiler latency. Default: false
+                            See |grip-engine-timing|
     sticky_header (boolean) Column names in the winbar. Default: true
                             See |grip-sticky-header|
     open_sidebar  (boolean) Open schema sidebar on connect. Default: true
+    show_running_time (boolean) Elapsed number in the loading float. Default: true
+    show_result_time  (boolean) Retained query/action durations. Default: true
+    show_hints        (boolean) Automatic shortcut help. Default: true
+                                See |grip-query-timer|
+    highlights        (table) Grip group replacements. Default: {}
+                              See |grip-highlights|
 
                                                            *grip.open()*
 grip.open({arg}, {url}, {opts})

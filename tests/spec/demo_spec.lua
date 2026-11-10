@@ -22,16 +22,18 @@ local function with_spec(spec, fn)
 end
 
 local function sql_blocks()
-  local blocks, current = {}, nil
+  local blocks, current, previous, requirement = {}, nil, "", nil
   for _, line in ipairs(vim.fn.readfile(root .. "/demo/softrear-internal.md")) do
     if line == "```sql" then
       current = {}
+      requirement = previous:match("^<!%-%- Requires: (.-) %-%->$")
     elseif line == "```" and current then
-      blocks[#blocks + 1] = table.concat(current, "\n")
+      blocks[#blocks + 1] = { sql = table.concat(current, "\n"), requires = requirement }
       current = nil
     elseif current then
       current[#current + 1] = line
     end
+    previous = line
   end
   return blocks
 end
@@ -55,10 +57,22 @@ test("SQLite fallback seeds cleanly and runs every non-federated notebook query"
         .. "WHERE conspiracy_adjacent IS NULL) AS unreviewed FROM rolls", spec.url))
     eq(tonumber(counts.rows[1][1]), 35, "compact roll count")
     eq(tonumber(counts.rows[1][2]), 2, "compact unreviewed count")
-    for index = 1, 12 do
-      local result, query_err = db.query(blocks[index], spec.url)
-      assert(result and #result.rows > 0,
-        string.format("SQLite notebook block %d failed: %s", index, query_err or "empty"))
+    local summary, summary_err = db.query(
+      "SELECT incident_count, max_severity FROM incident_summary WHERE incident_type = 'airplane'", spec.url)
+    assert(summary, summary_err)
+    eq(tonumber(summary.rows[1][1]), 7, "view groups the seven named airplane incidents")
+    eq(tonumber(summary.rows[1][2]), 10, "view retains their maximum severity")
+    local summary_item
+    for _, item in ipairs(assert(db.list_tables(spec.url))) do
+      if item.name == "incident_summary" then summary_item = item end
+    end
+    eq(summary_item and summary_item.type, "view", "sidebar receives a real view")
+    for index, block in ipairs(blocks) do
+      if not block.requires then
+        local result, query_err = db.query(block.sql, spec.url)
+        assert(result and #result.rows > 0,
+          string.format("SQLite notebook block %d failed: %s", index, query_err or "empty"))
+      end
     end
   end)
   vim.fn.delete(dir, "rf")

@@ -40,7 +40,6 @@ local help = read("doc/dadbod-grip.txt")
 local todo = read("TODO.md")
 local changelog = read("CHANGELOG.md")
 local walkthrough = read("demo/softrear-internal.md")
-local grid_help = read("lua/dadbod-grip/view.lua")
 local contributing = read("CONTRIBUTING.md")
 local security = read("SECURITY.md")
 local justfile = read("justfile")
@@ -104,9 +103,9 @@ test("keymap documentation points to the catalog and runtime help stays complete
   assert(readme:find("AI keys remain registered", 1, true))
   assert(help:find("Pressing A or gA while AI is disabled shows an informational message", 1, true))
   assert(help:find("Press `gm` on any row", 1, true))
-  assert(grid_help:find('"  gU        Set current column across all visible rows"', 1, true))
-  assert(grid_help:find('"  gm        Open rows that reference the current row"', 1, true))
-  assert(grid_help:find("Markdown, Grip Table", 1, true))
+  local effective = table.concat(keymaps.help_lines("grid", 70), " "):gsub("%s+", " ")
+  assert(effective:find("gU", 1, true) and effective:find("visible rows", 1, true))
+  assert(effective:find("gm", 1, true) and effective:find("referenc", 1, true))
 end)
 
 local function documented_extensions(text)
@@ -141,8 +140,12 @@ test("onboarding and process-privacy claims match current behavior", function()
   assert(not readme:find("`A` in the query pad generates SQL", 1, true))
 
   for name, text in pairs({ README = readme, help = help }) do
-    assert(text:find("all database SQL and AI request content through stdin", 1, true),
-      name .. " must document the stdin boundary")
+    assert(text:find("original SQL", 1, true) and text:find("stdin", 1, true),
+      name .. " must document the original-query stdin boundary")
+    local prose = text:gsub("%s+", " ")
+    for _, claim in ipairs({ "0600", "0700", "selected column identifiers", "after the client exits" }) do
+      assert(prose:find(claim, 1, true), name .. " must document private SQLite script handling: " .. claim)
+    end
     assert(text:find("running as your user may still read those environment variables", 1, true),
       name .. " must document the same-user environment limit")
     assert(not text:find("--init-command", 1, true), name .. " still documents removed mysql argv setup")
@@ -190,7 +193,7 @@ test("demo walkthrough uses cataloged keys and current data-source behavior", fu
     grid_sort_stack = "`%s` to stack",
     grid_col_stats = "`%s` shows severity statistics",
     grid_filter_cell = "Press `%s` on a",
-    grid_edit = "with `%s`, navigate",
+    grid_edit = "with `%s`, and",
     grid_row_view = "Press `%s` on any row",
     grid_explain = "Press `%s` to inspect the query plan",
     grid_fk_follow = "Press `%s` on any FK column",
@@ -272,8 +275,8 @@ end)
 
 test("release version has matching changelog notes", function()
   local version = require("dadbod-grip.version")
-  assert(version == "3.11.0", "unexpected release version: " .. tostring(version))
-  assert(changelog:find("## [" .. version .. "] - 2026-08-31", 1, true),
+  assert(version == "3.20.2", "unexpected release version: " .. tostring(version))
+  assert(changelog:find("## [" .. version .. "] - 2026-11-03", 1, true),
     "changelog section missing for " .. version)
 end)
 

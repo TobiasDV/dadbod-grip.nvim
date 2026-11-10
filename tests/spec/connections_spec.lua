@@ -1,8 +1,8 @@
 -- connections_spec.lua -- characterization tests for M.switch()'s single-pass
--- read/mutate/write behavior (see history.lua's task-8 companion refactor).
+-- read/mutate/write behavior and persistence scope.
 -- M.switch() used to read the local connections file up to 4 times and write
--- it up to twice per call; it now reads once (plus the global file, but only
--- when actually needed for type resolution) and writes at most once. These
+-- it up to twice per call; it now reads each registry at most once for the
+-- mutation and writes only the owning registry. These
 -- tests pin the observable behavior of that rewrite against real files in an
 -- isolated temp directory, since nothing in the suite previously exercised it.
 local paths = require("dadbod-grip.paths")
@@ -13,6 +13,7 @@ local grip = require("dadbod-grip")
 -- hook: without the reload, a switch() in one test leaves its URL marked "ok"
 -- for every later case.
 local connections = require("dadbod-grip.connections")
+local picker_opts
 
 local pass = 0
 local fail = 0
@@ -60,6 +61,7 @@ local function with_real_file(fn)
   local orig_expand = vim.fn.expand
   local orig_notify = vim.notify
   local orig_g_db = vim.g.db
+  local orig_g_dbs = vim.g.dbs
   local orig_opts = grip.get_opts()
   local orig_open = grip.open
   local orig_open_welcome = grip.open_welcome
@@ -68,6 +70,8 @@ local function with_real_file(fn)
   local orig_completion = package.loaded["dadbod-grip.completion"]
   local orig_duckdb = package.loaded["dadbod-grip.adapters.duckdb"]
   local orig_connections = package.loaded["dadbod-grip.connections"]
+  local orig_picker = package.loaded["dadbod-grip.grip_picker"]
+  local orig_docker = package.loaded["dadbod-grip.sources.docker_localdb"]
 
   paths.project_root = function() return project_dir end
   vim.fn.expand = function(a, ...)
@@ -75,7 +79,13 @@ local function with_real_file(fn)
     return orig_expand(a, ...)
   end
   vim.notify = function() end
-  grip.setup({}) -- deterministic OPTS baseline (connections_path = nil, etc.)
+  grip.setup({})
+  package.loaded["dadbod-grip.sources.docker_localdb"] = {
+    fetch = function() return { connections = {} } end,
+  }
+  vim.g.db, vim.g.dbs = nil, nil
+  picker_opts = nil
+  package.loaded["dadbod-grip.grip_picker"] = { open = function(opts) picker_opts = opts end }
   grip.open = function() end
   grip.open_welcome = function() end
   package.loaded["dadbod-grip.schema"] = {
@@ -102,6 +112,7 @@ local function with_real_file(fn)
   vim.fn.expand = orig_expand
   vim.notify = orig_notify
   vim.g.db = orig_g_db
+  vim.g.dbs = orig_g_dbs
   grip.setup(orig_opts)
   grip.open = orig_open
   grip.open_welcome = orig_open_welcome
@@ -110,6 +121,8 @@ local function with_real_file(fn)
   package.loaded["dadbod-grip.completion"] = orig_completion
   package.loaded["dadbod-grip.adapters.duckdb"] = orig_duckdb
   package.loaded["dadbod-grip.connections"] = orig_connections
+  package.loaded["dadbod-grip.grip_picker"] = orig_picker
+  package.loaded["dadbod-grip.sources.docker_localdb"] = orig_docker
   connections = orig_connections
 
   vim.fn.delete(project_dir, "rf")
@@ -126,6 +139,20 @@ end
 
 local function read_connections_json(dir)
   return vim.fn.json_decode(table.concat(vim.fn.readfile(dir .. "/connections.json"), "\n"))
+end
+
+local function write_connections_json(dir, entries)
+  paths.ensure_dir(dir)
+  vim.fn.writefile({ vim.fn.json_encode(entries) }, dir .. "/connections.json")
+end
+
+local function picker_entry(url)
+  connections.pick()
+  assert(picker_opts, "picker opened")
+  for _, c in ipairs(picker_opts.items) do
+    if c.url == url then return c end
+  end
+  error("connection missing from picker")
 end
 
 -- ── switching to an existing connection (by name, and without one) ────────
@@ -201,7 +228,7 @@ test("switch: health state starts clean in every test, then switch records it", 
   end)
 end)
 
--- ── global file consulted only when the gate allows it ─────────────────────
+-- ── type precedence across registries ──────────────────────────────────────
 -- Signal: the only externally-observable trace of resolved_type is the
 -- notify message ("opening" for type == "file" vs "connected to" otherwise).
 -- customscheme:// is not detected as a file url by the is_file_url()
@@ -246,7 +273,7 @@ test("switch: global file is not consulted when connections_path is configured",
   end)
 end)
 
-test("switch: global file is not consulted when conn_type is already given", function()
+test("switch: an explicit conn_type wins over the globally stored type", function()
   with_real_file(function(local_grip, global_grip)
     paths.ensure_dir(global_grip)
     vim.fn.writefile({ vim.fn.json_encode({
@@ -264,7 +291,7 @@ test("switch: global file is not consulted when conn_type is already given", fun
   end)
 end)
 
-test("switch: global file is not consulted when the type is already known locally", function()
+test("switch: the locally stored type wins over the global type", function()
   with_real_file(function(local_grip, global_grip)
     paths.ensure_dir(local_grip)
     paths.ensure_dir(global_grip)
@@ -283,6 +310,285 @@ test("switch: global file is not consulted when the type is already known locall
     flush_schedules()
     assert(#notified > 0 and notified[1]:find("connected to", 1, true),
       "locally-known type must win over global lookup: " .. vim.inspect(notified))
+  end)
+end)
+
+-- A global-only profile must stay global: a metadata-free local shadow used
+-- to win entry_for() immediately after the first selection and prevent the
+-- second selection (or any later query) from resolving its env_file.
+test("switch: selecting a global-only templated profile twice keeps its settings and scope", function()
+  with_real_file(function(local_grip, global_grip)
+    paths.ensure_dir(global_grip)
+    local env_file = global_grip .. "/fixture.env"
+    local url = "${GRIP_TEST_GLOBAL_PROFILE_URL}"
+    local expanded = "postgresql://fixture:fixture@invalid.example/global"
+    vim.fn.writefile({ "GRIP_TEST_GLOBAL_PROFILE_URL=" .. expanded }, env_file)
+    local entry = {
+      id = "conn_global_fixture", name = "global fixture", url = url, type = "postgresql",
+      env_file = env_file, mode = "ro", color = "orange", last_used = 100,
+      attachments = { { alias = "fixture", dsn = "sqlite:/fixture/attachment.db" } },
+    }
+    write_connections_json(global_grip, { entry })
+
+    local first = picker_entry(url)
+    picker_opts.on_select(first)
+    local second = picker_entry(url)
+    picker_opts.on_select(second)
+
+    eq(connections.get_health(url), "ok", "both selections resolved the profile")
+    eq(connections.expand_url(url), expanded, "later queries still resolve via env_file")
+    eq(vim.g.db, url, "active URL stays templated")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "no project copy created")
+    eq(connections.current_mode(url), "ro", "read-only mode survives selection")
+    local stored = read_connections_json(global_grip)[1]
+    assert(stored.last_used > 100, "global MRU persisted")
+    stored.last_used = entry.last_used
+    assert(vim.deep_equal(stored, entry), "every persisted profile field survives")
+    eq(connections.entry_for(url).source, "global", "lookups still use the global profile")
+  end)
+end)
+
+test("switch: unnamed global selection with an explicit type updates only global MRU", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "postgresql://fixture:fixture@invalid.example/global"
+    write_connections_json(local_grip, { { name = "local", url = "sqlite:/fixture/local.db", last_used = 7 } })
+    write_connections_json(global_grip, {
+      { name = "global", url = url, type = "postgresql", last_used = 1 },
+      { name = "other", url = "sqlite:/fixture/other.db", last_used = 100 },
+    })
+    local before = table.concat(vim.fn.readfile(local_grip .. "/connections.json"), "\n")
+
+    assert(connections.switch(url, nil, "postgresql"), "switch committed")
+
+    local stored = read_connections_json(global_grip)
+    assert(stored[1].last_used > 100, "MRU written despite explicit type and no name")
+    eq(stored[2].last_used, 100, "unselected global profile unchanged")
+    eq(table.concat(vim.fn.readfile(local_grip .. "/connections.json"), "\n"), before,
+      "unrelated local file remains byte-identical")
+    picker_entry(url)
+    local first_global
+    for _, c in ipairs(picker_opts.items) do
+      if c.source == "global" then first_global = c; break end
+    end
+    eq(first_global.url, url, "reopened picker orders the used global profile first")
+  end)
+end)
+
+test("switch: intentional local override keeps its metadata and touches only local MRU", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "postgresql://fixture:fixture@invalid.example/shared"
+    write_connections_json(local_grip, {
+      { id = "conn_local", name = "local", url = url, mode = "ro", color = "orange", last_used = 1 },
+    })
+    write_connections_json(global_grip, {
+      { id = "conn_global", name = "global", url = url, mode = "rw", color = "red", last_used = 2 },
+    })
+    local before = table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n")
+
+    local selected = picker_entry(url)
+    picker_opts.on_select(selected)
+
+    local stored = read_connections_json(local_grip)[1]
+    eq(stored.id, "conn_local", "local identity wins even with the global picker badge")
+    eq(stored.color, "orange", "local settings win")
+    eq(connections.current_mode(url), "ro", "local mode wins")
+    assert(stored.last_used > 1, "local MRU updated")
+    eq(table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n"), before,
+      "shadowed global profile remains byte-identical")
+  end)
+end)
+
+test("switch: configured path owns persistence even when the URL also exists globally", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "postgresql://fixture:fixture@invalid.example/shared"
+    local custom_dir = local_grip .. "/custom"
+    write_connections_json(global_grip, { { name = "global", url = url, mode = "ro", last_used = 2 } })
+    grip.setup({ connections_path = custom_dir .. "/connections.json" })
+    local before = table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n")
+
+    connections.switch(url, "custom", "postgresql")
+    local custom = read_connections_json(custom_dir)[1]
+    custom.mode, custom.color = "rw", "green"
+    custom.env_file = custom_dir .. "/fixture.env"
+    custom.attachments = { { alias = "custom", dsn = "sqlite:/fixture/custom.db" } }
+    write_connections_json(custom_dir, { custom })
+    connections.switch(url, "custom", "postgresql")
+
+    local stored = read_connections_json(custom_dir)
+    eq(#stored, 1, "one custom profile after repeated selection")
+    eq(stored[1].name, "custom", "new profile saved to configured file")
+    eq(stored[1].id, custom.id, "custom identity preserved")
+    eq(stored[1].color, "green", "custom color preserved")
+    eq(stored[1].env_file, custom.env_file, "custom env_file preserved")
+    assert(vim.deep_equal(stored[1].attachments, custom.attachments), "custom attachments preserved")
+    assert(stored[1].last_used > 2, "custom MRU persisted")
+    eq(connections.current_mode(url), "rw", "global mode ignored")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "default project file untouched")
+    eq(table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n"), before,
+      "global file untouched")
+  end)
+end)
+
+test("switch: a failed global template does not touch either registry", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "${GRIP_TEST_MISSING_GLOBAL_URL}"
+    write_connections_json(global_grip, {
+      { name = "global", url = url, env_file = global_grip .. "/missing.env", last_used = 1 },
+    })
+    local before = table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n")
+
+    eq(connections.switch(url, "global", "postgresql"), false, "unresolved template aborts")
+
+    eq(table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n"), before,
+      "failed selection does not write global MRU")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "failed selection does not create a shadow")
+  end)
+end)
+
+test("switch: global DuckDB attachments restore from their original profile", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "duckdb:/fixture/global.duckdb"
+    local attachments = { { alias = "fixture", dsn = "sqlite:/fixture/attachment.db" } }
+    write_connections_json(global_grip, {
+      { name = "global duck", url = url, type = "duckdb", attachments = attachments, last_used = 1 },
+    })
+    local captured_url, captured_atts
+    package.loaded["dadbod-grip.adapters.duckdb"] = {
+      load_attachments = function(u, atts) captured_url, captured_atts = u, atts end,
+    }
+
+    connections.switch(url, "global duck", "duckdb")
+
+    eq(captured_url, url, "attachments loaded for the selected connection")
+    assert(vim.deep_equal(captured_atts, attachments), "global attachments restored")
+    assert(vim.deep_equal(read_connections_json(global_grip)[1].attachments, attachments),
+      "attachments still persisted in global scope")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "attachments do not create a local shadow")
+  end)
+end)
+
+test("global GripAttach and GripDetach changes survive reconnect without a local copy", function()
+  if vim.fn.executable("duckdb") ~= 1 then
+    assert(vim.env.GRIP_REQUIRE_DUCKDB ~= "1", "DuckDB required for attachment command regression")
+    print("SKIP: global attachment commands (duckdb CLI not installed)")
+    return
+  end
+  with_real_file(function(local_grip, global_grip)
+    paths.ensure_dir(global_grip)
+    local env_file = global_grip .. "/attachments.env"
+    local main_path = global_grip .. "/main.duckdb"
+    local old_path = global_grip .. "/old.duckdb"
+    local fresh_path = global_grip .. "/fresh.duckdb"
+    for _, path in ipairs({ main_path, old_path, fresh_path }) do
+      local result = vim.system({ "duckdb", path, "-c", "CREATE TABLE fixture(value INTEGER); INSERT INTO fixture VALUES (42);" },
+        { text = true }):wait()
+      eq(result.code, 0, "isolated DuckDB fixture seeded: " .. (result.stderr or ""))
+    end
+    local url, live_url = "${GRIP_TEST_GLOBAL_DUCK_URL}", "duckdb:" .. main_path
+    local old_dsn, fresh_dsn = "${GRIP_TEST_GLOBAL_OLD_DSN}", "${GRIP_TEST_GLOBAL_FRESH_DSN}"
+    vim.fn.writefile({
+      "GRIP_TEST_GLOBAL_DUCK_URL=" .. live_url,
+      "GRIP_TEST_GLOBAL_OLD_DSN=" .. old_path,
+      "GRIP_TEST_GLOBAL_FRESH_DSN=" .. fresh_path,
+    }, env_file)
+    local profile = {
+      id = "conn_global_attachments", name = "global duck", url = url, type = "duckdb",
+      env_file = env_file, mode = "rw", color = "orange", last_used = 100,
+      attachments = { { alias = "old", dsn = old_dsn } },
+    }
+    write_connections_json(global_grip, { profile })
+    package.loaded["dadbod-grip.adapters.duckdb"] = nil
+    local duckdb = require("dadbod-grip.adapters.duckdb")
+    assert(connections.switch(url, profile.name, "duckdb"), "initial global selection succeeds")
+    eq(duckdb.get_attachments(live_url)[1].alias, "old", "initial attachment restored")
+
+    vim.cmd("GripAttach " .. fresh_dsn .. " fresh")
+    eq(#duckdb.get_attachments(live_url), 2, "actual attach command updates live registry")
+    local stored = read_connections_json(global_grip)[1]
+    eq(#stored.attachments, 2, "actual attach command persists to global registry")
+    eq(stored.attachments[2].dsn, fresh_dsn, "global persistence keeps DSN template")
+
+    vim.cmd("GripDetach old")
+    eq(#duckdb.get_attachments(live_url), 1, "actual detach command updates live registry")
+    stored = read_connections_json(global_grip)[1]
+    eq(#stored.attachments, 1, "actual detach command persists removal")
+    eq(stored.attachments[1].alias, "fresh", "only the new attachment stays persisted")
+    assert(connections.switch(url, profile.name, "duckdb"), "reconnect succeeds")
+    eq(#duckdb.get_attachments(live_url), 1, "reconnect keeps the current attachment set")
+    eq(duckdb.get_attachments(live_url)[1].alias, "fresh", "removed attachment is not resurrected")
+    local result, err = duckdb.query("SELECT value FROM fresh.fixture", live_url)
+    assert(result, err)
+    eq(result.rows[1][1], "42", "reconnected attachment can query its isolated fixture")
+
+    vim.cmd("GripDetach fresh")
+    eq(read_connections_json(global_grip)[1].attachments, nil, "detaching the last attachment persists an empty set")
+    assert(connections.switch(url, profile.name, "duckdb"), "reconnect without attachments succeeds")
+    eq(#duckdb.get_attachments(live_url), 0, "reconnect does not resurrect the final detached attachment")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "commands never create a project shadow")
+    eq(vim.g.db, url, "active connection remains templated")
+    stored = read_connections_json(global_grip)[1]
+    stored.attachments, stored.last_used = nil, nil
+    local expected = vim.deepcopy(profile)
+    expected.attachments, expected.last_used = nil, nil
+    assert(vim.deep_equal(stored, expected), "attachment changes preserve all other profile fields")
+  end)
+end)
+
+test("save_attachments: a local override owns changes without rewriting its global counterpart", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "duckdb:/fixture/shared.duckdb"
+    local local_profile = {
+      id = "conn_local_attachment", name = "local", url = url, type = "duckdb",
+      env_file = "/fixture/local.env", mode = "ro", color = "orange", last_used = 17,
+    }
+    write_connections_json(local_grip, { local_profile })
+    write_connections_json(global_grip, {
+      { id = "conn_global_attachment", name = "global", url = url, color = "red",
+        attachments = { { alias = "global", dsn = "/fixture/global.duckdb" } } },
+    })
+    local before = table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n")
+    local attachments = { { alias = "local", dsn = "/fixture/local.duckdb" } }
+
+    connections.save_attachments(url, attachments)
+
+    local_profile.attachments = attachments
+    assert(vim.deep_equal(read_connections_json(local_grip)[1], local_profile), "local settings and attachments retained")
+    eq(table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n"), before,
+      "global counterpart remains byte-identical")
+  end)
+end)
+
+test("save_attachments: a configured path owns changes and never falls back to global", function()
+  with_real_file(function(local_grip, global_grip)
+    local url = "duckdb:/fixture/shared.duckdb"
+    local custom_dir = local_grip .. "/custom"
+    local custom = {
+      id = "conn_custom_attachment", name = "custom", url = url, type = "duckdb",
+      env_file = "/fixture/custom.env", mode = "ro", color = "green", last_used = 31,
+    }
+    write_connections_json(custom_dir, { custom })
+    write_connections_json(global_grip, { { name = "global", url = url, color = "red" } })
+    grip.setup({ connections_path = custom_dir .. "/connections.json" })
+    local before = table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n")
+    local attachments = { { alias = "custom", dsn = "/fixture/custom.duckdb" } }
+
+    connections.save_attachments(url, attachments)
+
+    custom.attachments = attachments
+    assert(vim.deep_equal(read_connections_json(custom_dir)[1], custom), "configured profile preserves every field")
+    write_connections_json(custom_dir, {})
+    connections.save_attachments(url, attachments)
+    eq(#read_connections_json(custom_dir), 0, "missing configured profile is not copied from global")
+    eq(table.concat(vim.fn.readfile(global_grip .. "/connections.json"), "\n"), before, "global remains byte-identical")
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "default local registry untouched")
+  end)
+end)
+
+test("save_attachments: an unsaved connection does not create a profile", function()
+  with_real_file(function(local_grip, global_grip)
+    connections.save_attachments("duckdb:/fixture/unsaved.duckdb", { { alias = "side", dsn = "/fixture/side.duckdb" } })
+    eq(vim.fn.filereadable(local_grip .. "/connections.json"), 0, "unsaved connection stays unsaved locally")
+    eq(vim.fn.filereadable(global_grip .. "/connections.json"), 0, "unsaved connection stays unsaved globally")
   end)
 end)
 

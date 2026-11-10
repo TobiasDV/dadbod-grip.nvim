@@ -21,19 +21,30 @@ function M.clear_cache()
   cache = {}
 end
 
---- Strip one matching pair of surrounding quotes from a raw assignment
---- value. Unquoted values are returned unchanged.
+--- Strip a whitespace-separated comment and one surrounding quote pair.
+--- Backslashes affect quote boundaries but remain literal value bytes.
 --- @param raw string
 --- @return string
-local function unquote(raw)
-  local double = raw:match('^"(.*)"$')
-  if double then
-    return double
+local function parse_value(raw)
+  raw = raw:gsub("^%s+#.*$", "")
+  raw = raw:match("^%s*(.-)%s*$")
+  local quote = raw:sub(1, 1)
+  if quote ~= '"' and quote ~= "'" then
+    return (raw:gsub("%s+#.*$", ""))
   end
-  local single = raw:match("^'(.*)'$")
-  if single then
-    return single
+  local escaped = false
+  for i = 2, #raw do
+    local char = raw:sub(i, i)
+    if char == quote and not escaped then
+      local tail = raw:sub(i + 1)
+      if tail:match("^%s*$") or tail:match("^%s+#") then
+        return raw:sub(2, i - 1)
+      end
+      break
+    end
+    escaped = char == "\\" and not escaped
   end
+  -- Preserve malformed input rather than silently truncating a credential.
   return raw
 end
 
@@ -52,7 +63,7 @@ local function parse_line(line)
   if not key then
     return nil
   end
-  return key, unquote(raw)
+  return key, parse_value(raw)
 end
 
 --- Detect a git-crypt-locked file from its leading bytes.

@@ -68,7 +68,7 @@ end
 --- Handles multiline quoted fields (RFC 4180).
 --- Shared by all adapters that use CSV CLI output; imports also pass a tab
 --- delimiter and strict=true for user-supplied TSV.
-function M.parse_csv(raw, delimiter, strict)
+function M.parse_csv(raw, delimiter, strict, typed)
   if not raw or raw == "" then
     return { columns = {}, rows = {} }
   end
@@ -118,7 +118,7 @@ function M.parse_csv(raw, delimiter, strict)
         if b == DELIM then
           i = i + 1
           if i > len or raw:byte(i) == LF or raw:byte(i) == CR then
-            table.insert(fields, "")
+            table.insert(fields, typed and vim.NIL or "")
           end
         elseif b == LF or b == CR then
           if b == CR and raw:byte(i + 1) == LF then i = i + 1 end
@@ -130,10 +130,10 @@ function M.parse_csv(raw, delimiter, strict)
         end
       end
     elseif b == DELIM then
-      table.insert(fields, "")
+      table.insert(fields, typed and vim.NIL or "")
       i = i + 1
       if i > len or raw:byte(i) == LF or raw:byte(i) == CR then
-        table.insert(fields, "")
+        table.insert(fields, typed and vim.NIL or "")
       end
     elseif b == LF or b == CR then
       if b == CR and raw:byte(i + 1) == LF then i = i + 1 end
@@ -154,7 +154,7 @@ function M.parse_csv(raw, delimiter, strict)
         if b == DELIM then
           i = i + 1
           if i > len or raw:byte(i) == LF or raw:byte(i) == CR then
-            table.insert(fields, "")
+            table.insert(fields, typed and vim.NIL or "")
           end
         elseif b == LF or b == CR then
           if b == CR and raw:byte(i + 1) == LF then i = i + 1 end
@@ -173,8 +173,8 @@ function M.parse_csv(raw, delimiter, strict)
   -- Filter out empty rows and psql "(N rows)" footer
   local filtered = {}
   for _, row in ipairs(all_rows) do
-    if not (#row == 1 and row[1]:match("^%(%d+ rows?%)$")) then
-      if not (#row == 1 and row[1] == "") then
+    if typed or not (#row == 1 and type(row[1]) == "string" and row[1]:match("^%(%d+ rows?%)$")) then
+      if typed or not (#row == 1 and row[1] == "") then
         table.insert(filtered, row)
       end
     end
@@ -183,13 +183,14 @@ function M.parse_csv(raw, delimiter, strict)
   if #filtered == 0 then return { columns = {}, rows = {} } end
 
   local columns = filtered[1]
+  for ci, name in ipairs(columns) do if name == vim.NIL then columns[ci] = "" end end
   local rows = {}
   for ri = 2, #filtered do
     local row = filtered[ri]
     if strict and #row ~= #columns then
       return nil, string.format("row %d has %d fields; expected %d", ri - 1, #row, #columns)
     end
-    while #row < #columns do table.insert(row, "") end
+    while #row < #columns do table.insert(row, typed and vim.NIL or "") end
     table.insert(rows, row)
   end
 
@@ -323,12 +324,77 @@ local function via_adapter(url, fn, ...)
   return result, err
 end
 
--- ── public interface (unchanged signatures) ───────────────────────────────
+-- ── public interface (optional per-call engine timing for query/execute) ──
 
-function M.query(sql, url)
+local function with_engine_timing(result, conn, opts)
+  if result and opts and opts.engine_timing == true and not result.engine_timing then
+    result.engine_timing = { status = "unsupported", adapter = adapters.kind(conn), reason = "adapter_unsupported" }
+  end
+  return result
+end
+
+-- Invalidation is deliberately clear-only: do not do another database read in
+-- the completion path of a committed write. Capture the requested and resolved
+-- URLs before entering the adapter; vim.wait may change the ambient connection.
+local function invalidate_schema(url, adapter, conn)
+  local ok = true
+  local function clear(fn, ...)
+    if type(fn) == "function" then ok = pcall(fn, ...) and ok end
+  end
+  local completion = package.loaded["dadbod-grip.completion"]
+  local schema = package.loaded["dadbod-grip.schema"]
+  clear(completion and completion.invalidate, url)
+  clear(schema and schema.invalidate, url)
+  if conn ~= url then
+    clear(completion and completion.invalidate, conn)
+    clear(schema and schema.invalidate, conn)
+  end
+  clear(adapter and adapter.invalidate_schema, conn)
+  return ok
+end
+
+function M.invalidate_schema(url)
+  local requested = M.get_url(url)
+  if not requested then return false end
+  local adapter, conn = resolve(requested)
+  return invalidate_schema(requested, adapter, conn)
+end
+
+local function after_schema_change(url, adapter, conn)
+  if invalidate_schema(url, adapter, conn) then return end
+  -- A cache failure cannot turn a committed statement into an SQL refusal.
+  vim.schedule(function()
+    vim.notify("Grip: schema cache invalidation failed. Refresh schema manually.", vim.log.levels.WARN)
+  end)
+end
+
+local READ_HEAD = { SELECT = true, WITH = true, FROM = true, VALUES = true, TABLE = true,
+  SHOW = true, DESC = true, DESCRIBE = true }
+local function query_may_change_schema(sql, kind)
+  local tokens = require("dadbod-grip.sql_tokens").tokenize(sql, kind)
+  if not tokens then return true end
+  local start = true
+  for _, token in ipairs(tokens) do
+    if token.kind == ";" then
+      start = true
+    elseif start then
+      if not READ_HEAD[token.upper] then return true end
+      start = false
+    end
+  end
+  return false
+end
+
+function M.query(sql, url, opts)
+  if type(opts) ~= "table" then opts = nil end
+  local requested = M.get_url(url)
   local adapter, conn, err = resolve(url)
   if not adapter then return nil, err end
-  return via_adapter(url, adapter.query, sql, conn)
+  local result, query_err = via_adapter(url, adapter.query, sql, conn, opts)
+  if query_may_change_schema(sql, adapters.kind(conn)) then
+    after_schema_change(requested, adapter, conn)
+  end
+  return with_engine_timing(result, conn, opts), query_err
 end
 
 function M.get_primary_keys(table_name, url)
@@ -343,10 +409,30 @@ function M.get_column_info(table_name, url)
   return via_adapter(url, adapter.get_column_info, table_name, conn)
 end
 
-function M.execute(sql, url)
+function M.execute(sql, url, opts)
+  if type(sql) == "table" then return M.grid_write(sql, url, opts) end
+  if type(opts) ~= "table" then opts = nil end
+  local requested = M.get_url(url)
   local adapter, conn, err = resolve(url)
   if not adapter then return nil, err end
-  return via_adapter(url, adapter.execute, sql, conn)
+  local result, exec_err = via_adapter(url, adapter.execute, sql, conn, opts)
+  -- A later statement can fail after an earlier DDL statement committed. An
+  -- error must preserve its exact SQL outcome, not stale schema knowledge.
+  after_schema_change(requested, adapter, conn)
+  return with_engine_timing(result, conn, opts), exec_err
+end
+
+-- Execute a structured, guarded grid transaction in one adapter session.
+function M.grid_write(plan, url, opts)
+  if type(opts) ~= 'table' then opts = nil end
+  if opts and opts.write_lifecycle then
+    opts.write_lifecycle.state, opts.write_lifecycle.settled = 'not_started', true
+  end
+  local adapter, conn, err = resolve(url)
+  if not adapter then return nil, err end
+  if not adapter.grid_write then return nil, "Verified grid writes unsupported for this adapter" end
+  if M.is_readonly(url) then return nil, "Connection is read-only" end
+  return via_adapter(url, adapter.grid_write, plan, conn, opts)
 end
 
 --- Ping a connection. Returns true on success, false on any error.
@@ -427,6 +513,13 @@ function M.get_schema_batch_async(url, callback)
   local adapter, conn = resolve(url)
   if not adapter or not adapter.get_schema_batch_async then callback(nil); return end
   via_adapter(url, adapter.get_schema_batch_async, conn, callback)
+end
+
+--- Optional adapter catalog for SQL function completion. Never a query fallback.
+function M.get_completion_functions_async(url, callback)
+  local adapter, conn = resolve(url)
+  if not adapter or not adapter.get_completion_functions_async then callback(nil); return end
+  return via_adapter(url, adapter.get_completion_functions_async, conn, callback)
 end
 
 function M.get_indexes(table_name, url)

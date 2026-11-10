@@ -10,38 +10,6 @@
       "modes": ["n"]
     },
     {
-      "action": "help",
-      "default": "?",
-      "description": "Opens the keymap help.",
-      "category": "navigation",
-      "surfaces": ["grid", "query_pad", "sidebar"],
-      "modes": ["n"]
-    },
-    {
-      "action": "er_diagram",
-      "default": "gG",
-      "description": "Opens the entity-relationship diagram.",
-      "category": "navigation",
-      "surfaces": ["grid", "query_pad", "sidebar"],
-      "modes": ["n"]
-    },
-    {
-      "action": "connections",
-      "default": "gC",
-      "description": "Opens the connection picker.",
-      "category": "navigation",
-      "surfaces": ["grid", "query_pad", "sidebar"],
-      "modes": ["n"]
-    },
-    {
-      "action": "connections_alt",
-      "default": "<C-g>",
-      "description": "Opens the connection picker with its alternate key.",
-      "category": "navigation",
-      "surfaces": ["grid", "query_pad", "sidebar"],
-      "modes": ["n"]
-    },
-    {
       "action": "table_picker",
       "default": "gT",
       "description": "Opens the table picker.",
@@ -82,6 +50,94 @@
       "modes": ["n"]
     },
     {
+      "action": "help",
+      "default": "?",
+      "description": "Opens the keymap help.",
+      "category": "navigation",
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "er_diagram",
+      "default": "gG",
+      "description": "Opens the entity-relationship diagram.",
+      "category": "navigation",
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "connections",
+      "default": "gC",
+      "description": "Opens the connection picker.",
+      "category": "navigation",
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "connections_alt",
+      "default": "<C-g>",
+      "description": "Opens the connection picker with its alternate key.",
+      "category": "navigation",
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_activate",
+      "default": "<CR>",
+      "description": "Runs the selected welcome action.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_next",
+      "default": "<Tab>",
+      "description": "Selects the next welcome action.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_prev",
+      "default": "<S-Tab>",
+      "description": "Selects the previous welcome action.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_close",
+      "default": "q",
+      "description": "Closes the welcome screen.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_close_esc",
+      "default": "<Esc>",
+      "description": "Closes the welcome screen with Escape.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_connect",
+      "default": "gc",
+      "description": "Opens the connection picker from welcome.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "welcome_secret",
+      "default": ";",
+      "description": "Shows Chonk's hidden welcome cameo.",
+      "category": "welcome",
+      "surfaces": ["welcome"],
+      "modes": ["n"]
+    },
+    {
       "action": "query_pad",
       "default": "q",
       "description": "Opens or focuses the query pad.",
@@ -92,9 +148,9 @@
     {
       "action": "ai",
       "default": "A",
-      "description": "Generates SQL from the grid with the configured AI provider.",
+      "description": "Generates SQL with the configured AI provider.",
       "category": "ai",
-      "surfaces": ["grid"],
+      "surfaces": ["grid", "welcome"],
       "modes": ["n"]
     },
     {
@@ -102,7 +158,15 @@
       "default": "gb",
       "description": "Opens, focuses, or closes the schema browser.",
       "category": "navigation",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
+      "modes": ["n"]
+    },
+    {
+      "action": "zoom",
+      "default": "gz",
+      "description": "Zooms the current pane or restores its split layout.",
+      "category": "navigation",
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -126,7 +190,7 @@
       "default": "go",
       "description": "Opens the table picker with the short key.",
       "category": "navigation",
-      "surfaces": ["grid", "query_pad"],
+      "surfaces": ["grid", "query_pad", "welcome"],
       "modes": ["n"]
     },
     {
@@ -134,7 +198,7 @@
       "default": "1",
       "description": "Opens the first surface-specific view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -142,7 +206,7 @@
       "default": "2",
       "description": "Opens the second surface-specific view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -150,7 +214,7 @@
       "default": "3",
       "description": "Opens the third surface-specific view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -158,7 +222,7 @@
       "default": "4",
       "description": "Opens the entity-relationship view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -166,7 +230,7 @@
       "default": "5",
       "description": "Opens the column statistics view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -174,7 +238,7 @@
       "default": "6",
       "description": "Opens the columns view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -182,7 +246,7 @@
       "default": "7",
       "description": "Opens the foreign-keys view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -190,7 +254,7 @@
       "default": "8",
       "description": "Opens the indexes view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -198,7 +262,7 @@
       "default": "9",
       "description": "Opens the constraints view.",
       "category": "views",
-      "surfaces": ["grid", "query_pad", "sidebar"],
+      "surfaces": ["grid", "query_pad", "sidebar", "welcome"],
       "modes": ["n"]
     },
     {
@@ -364,7 +428,7 @@
     {
       "action": "grid_column_set",
       "default": "gU",
-      "description": "Stages one value across the visible column.",
+      "description": "Stages one value in this column across all visible rows.",
       "category": "grid editing",
       "surfaces": ["grid"],
       "modes": ["n"]
@@ -716,7 +780,7 @@
     {
       "action": "grid_rename_col",
       "default": "gN",
-      "description": "Renames the displayed column header.",
+      "description": "Renames the database column after confirmation.",
       "category": "grid inspection",
       "surfaces": ["grid"],
       "modes": ["n"]
@@ -948,7 +1012,7 @@
     {
       "action": "qpad_close",
       "default": "q",
-      "description": "Closes the query pad and returns to the welcome screen.",
+      "description": "Returns to the welcome screen from the query pad.",
       "category": "query pad",
       "surfaces": ["query_pad"],
       "modes": ["n"]
@@ -1010,7 +1074,7 @@
     {
       "action": "sidebar_open",
       "default": "<CR>",
-      "description": "Opens the table under the cursor.",
+      "description": "Opens the object or toggles the group under the cursor.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1026,7 +1090,7 @@
     {
       "action": "sidebar_expand",
       "default": "l",
-      "description": "Expands the table under the cursor.",
+      "description": "Expands the group or table columns under the cursor.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1034,7 +1098,7 @@
     {
       "action": "sidebar_collapse",
       "default": "h",
-      "description": "Collapses the table under the cursor.",
+      "description": "Collapses the item or moves to its parent.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1042,7 +1106,7 @@
     {
       "action": "sidebar_expand_z",
       "default": "zo",
-      "description": "Expands the table with the fold-style key.",
+      "description": "Expands the group or table columns with the fold-style key.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1050,7 +1114,7 @@
     {
       "action": "sidebar_collap_z",
       "default": "zc",
-      "description": "Collapses the table with the fold-style key.",
+      "description": "Collapses the item or moves to its parent with the fold-style key.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1058,7 +1122,7 @@
     {
       "action": "sidebar_expand_all",
       "default": "L",
-      "description": "Expands every table.",
+      "description": "Expands every schema and partition level without loading columns.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1066,7 +1130,7 @@
     {
       "action": "sidebar_collap_all",
       "default": "H",
-      "description": "Collapses every table.",
+      "description": "Collapses all groups and table columns.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1074,7 +1138,7 @@
     {
       "action": "sidebar_filter",
       "default": "/",
-      "description": "Filters tables by name.",
+      "description": "Searches hidden objects by name or routine signature.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1082,7 +1146,7 @@
     {
       "action": "sidebar_filter_c",
       "default": "F",
-      "description": "Clears the sidebar filter.",
+      "description": "Clears the sidebar filter and restores the original view.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1090,7 +1154,7 @@
     {
       "action": "sidebar_next",
       "default": "n",
-      "description": "Moves to the next table.",
+      "description": "Moves to the next visible table or routine.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]
@@ -1098,7 +1162,7 @@
     {
       "action": "sidebar_prev",
       "default": "N",
-      "description": "Moves to the previous table.",
+      "description": "Moves to the previous visible table or routine.",
       "category": "sidebar",
       "surfaces": ["sidebar"],
       "modes": ["n"]

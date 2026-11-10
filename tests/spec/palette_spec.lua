@@ -82,6 +82,29 @@ test("open('sidebar'): returns actions table", function()
   gt(#captured.items, 0, "sidebar actions count")
 end)
 
+test("zoom is discoverable on every surface with its configured key", function()
+  local grip = require("dadbod-grip")
+  local previous = grip._keymaps
+  local ok, err = pcall(function()
+    grip._keymaps = { zoom = "<F27>" }
+    for _, context in ipairs({ "grid", "query", "sidebar" }) do
+      palette.open(context)
+      local zoom
+      for _, item in ipairs(captured.items) do
+        if item.label:find("Zoom pane", 1, true) then zoom = item end
+      end
+      assert(zoom and zoom.key == "<F27>", "zoom missing or wrong shortcut in " .. context)
+    end
+    grip._keymaps = { zoom = false }
+    palette.open("grid")
+    for _, item in ipairs(captured.items) do
+      assert(not item.label:find("Zoom pane", 1, true), "disabled shortcut remains in palette")
+    end
+  end)
+  grip._keymaps = previous
+  assert(ok, err)
+end)
+
 test("grid has more actions than query (grid-specific actions)", function()
   captured = nil
   palette.open("grid")

@@ -35,7 +35,7 @@ Action names map 1:1 to the entries in `lua/dadbod-grip/keymaps.lua`.
 | Key | Action |
 |-----|--------|
 | `i` / `<CR>` | Edit cell under cursor |
-| `gB` | Open cell value in a split buffer (`:w` stages; JSON pretty-printed; read-only grids: view mode, `q` closes) |
+| `gB` | Open cell value in a split buffer (`:w` stages; JSON opens as stored; read-only grids: view mode, `q` closes) |
 | `x` | Set cell to NULL |
 | `gU` | Set column value for all visible rows (skips staged-deleted rows; confirms above 50 rows) |
 | `p` | Paste clipboard into cell |
@@ -200,7 +200,7 @@ Note: explain query plan is accessible via `gQ` (removed from tab system).
 | `<C-p>` | Command palette (searchable action list) |
 | `<C-CR>` | Execute query |
 | `<S-CR>` | Execute and always open result in a new split (never reuses existing grid) |
-| (auto) | SQL completion fires as you type: tables, columns, aliases, federation |
+| (auto) | SQL suggestions after two characters or a qualifier dot; nothing selected or inserted |
 | `<C-Space>` | Manually trigger SQL completion |
 | `<C-x><C-o>` | SQL completion: Vim-standard omnifunc / nvim-cmp source |
 | `gA` | AI SQL generation |

@@ -621,3 +621,12 @@ UPDATE internal_investigations SET case_metadata = '{"priority":"high","watchers
 UPDATE internal_investigations SET case_metadata = '{"priority":"medium","watchers":1,"platform_metrics":{"subscribers":47300,"video_views_total":2100000},"notable_content":["ply_count_video","formula_comparison"],"tags":["youtube","viral"]}' WHERE id = 5;
 
 
+
+-- Read-only report used by the daily-workflow lesson.
+CREATE VIEW incident_summary AS
+SELECT incident_type,
+       COUNT(*) AS incident_count,
+       MAX(severity) AS max_severity,
+       SUM(CASE WHEN resolved THEN 0 ELSE 1 END) AS open_count
+FROM consumer_incidents
+GROUP BY incident_type;

@@ -161,9 +161,10 @@ local function run_script(parsed, script, timeout_ms, opts)
   local path = script_file(script)
   local args = sqlcmd_args(parsed, opts)
   vim.list_extend(args, { "-i", path })
+  -- opts.hooks: a grid write's on_start/on_complete/on_spawn_error.
+  local run_opts = vim.tbl_extend("force", {}, opts and opts.hooks or {}, { env = sqlcmd_env(parsed) })
   local stdout, stderr, code = adapters.run_cmd(args,
-    timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT),
-    { env = sqlcmd_env(parsed) })
+    timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT), run_opts)
   os.remove(path)
   return stdout, stderr, code
 end
@@ -201,9 +202,12 @@ local function sqlcmd_error(stdout, stderr, code)
 end
 
 --- Parse sqlcmd's tab-separated text output. Fields are trimmed and NULL
---- reads as "", so trailing spaces and the text 'NULL' do not survive: grids
---- built from this are read-only (see M.query); JSON pages carry exact values.
-local function parse_sqlcmd_table(raw)
+--- reads as `null_value` ("" by default, which the catalog queries below rely
+--- on; M.query passes vim.NIL), so trailing spaces and the text 'NULL' do not
+--- survive: grids built from this are read-only (see M.query); JSON pages
+--- carry exact values.
+local function parse_sqlcmd_table(raw, null_value)
+  if null_value == nil then null_value = "" end
   if not raw or raw == "" then
     return { columns = {}, rows = {} }
   end
@@ -222,7 +226,7 @@ local function parse_sqlcmd_table(raw)
     local fields = {}
     for field in (line .. "\t"):gmatch("([^\t]*)\t") do
       field = vim.trim(field)
-      if field == "NULL" then field = "" end
+      if field == "NULL" then field = null_value end
       table.insert(fields, field)
     end
     return fields
@@ -257,7 +261,7 @@ local function parse_sqlcmd_table(raw)
       -- sqlcmd prints a CLR value such as geography as its raw bytes, and a
       -- NUL among them would break rendering the grid.
       for k, field in ipairs(row) do
-        row[k] = field:gsub("%z", "")
+        if type(field) == "string" then row[k] = field:gsub("%z", "") end
       end
       while #row < #columns do table.insert(row, "") end
       table.insert(rows, row)
@@ -389,13 +393,13 @@ end
 
 --- Decode one FOR JSON row: a flat object with no whitespace between tokens.
 --- Numbers keep their exact text (a bigint or decimal would not survive a Lua
---- number), bits become 1/0 and null becomes "", as in the text output; the
---- third result marks the positions that held a real empty string.
---- Returns keys, values, empties; nil for anything else, such as the nested
---- object a dotted column alias produces or a row cut off at the -y width.
+--- number), bits become 1/0 and null becomes vim.NIL, so "" is always a real
+--- empty string.
+--- Returns keys, values; nil for anything else, such as the nested object a
+--- dotted column alias produces or a row cut off at the -y width.
 local function decode_json_row(line)
   if line:sub(1, 1) ~= "{" then return nil end
-  local keys, values, empties = {}, {}, {}
+  local keys, values = {}, {}
   local pos = 2
   while true do
     if line:sub(pos, pos) ~= '"' then return nil end
@@ -412,10 +416,9 @@ local function decode_json_row(line)
       if not value_end then return nil end
       ok, value = pcall(vim.json.decode, line:sub(pos, value_end))
       if not ok then return nil end
-      if value == "" then empties[#keys + 1] = true end
     else
       local literal = line:match("^%a+", pos)
-      if literal == "null" then value = ""
+      if literal == "null" then value = vim.NIL
       elseif literal == "true" then value = "1"
       elseif literal == "false" then value = "0"
       elseif not literal then
@@ -432,15 +435,15 @@ local function decode_json_row(line)
     local sep = line:sub(pos, pos)
     if sep == "}" then
       if pos ~= #line then return nil end
-      return keys, values, empties
+      return keys, values
     end
     if sep ~= "," then return nil end
     pos = pos + 1
   end
 end
 
---- Types SQL Server cannot compare with =, reported so value lookups such as
---- sql.build_insert_lookup leave them out.
+--- Types SQL Server cannot compare with = or sort, reported so the grid
+--- refuses to sort them and filters compare them as text (sql.equals_sql).
 local INCOMPARABLE_TYPES = {
   text = true, ntext = true, image = true, xml = true, geography = true, geometry = true,
 }
@@ -514,14 +517,14 @@ end
 -- First words the generic code already routes (mutation preview, DDL confirm).
 local ROUTED_ELSEWHERE = {
   UPDATE = true, DELETE = true, INSERT = true, ALTER = true, DROP = true, CREATE = true,
-  BEGIN = true, COMMIT = true, ROLLBACK = true,
+  BEGIN = true, COMMIT = true, ROLLBACK = true, MERGE = true,
 }
 -- First words that make a statement rather than a table name: anything else
 -- ("order lines", a typo) stays a table name, as the sidebar passes them.
 local STATEMENT_WORDS = {
   SELECT = true, WITH = true, EXEC = true, EXECUTE = true, DECLARE = true, PRINT = true,
   SET = true, IF = true, WHILE = true, USE = true, RAISERROR = true, THROW = true,
-  TRUNCATE = true, MERGE = true, DBCC = true, WAITFOR = true, GRANT = true, REVOKE = true,
+  TRUNCATE = true, DBCC = true, WAITFOR = true, GRANT = true, REVOKE = true,
   DENY = true, OPEN = true, FETCH = true, CLOSE = true, DEALLOCATE = true,
 }
 local WRITE_WORDS = {
@@ -638,16 +641,11 @@ function M.plan_query(sql_str)
   return { kind = "select", sql = vim.trim(trimmed:sub(1, toks[order_at].s - 1)), sorts = sorts }
 end
 
---- Character types: the grid's "" can be a real empty string in these.
-local TEXT_TYPES = {
-  char = true, varchar = true, nchar = true, nvarchar = true, text = true, ntext = true,
-}
-
 --- FOR JSON prints floats as 1.500000000000000e+000; show the shortest
 --- decimal that reads back the same. Everything else arrives as the grid
 --- shows it (binaries already as hex, see PAGE_BATCH).
 local function json_cell(value, type_name)
-  if value == "" then return value end
+  if value == "" or value == vim.NIL then return value end
   local base = base_type(type_name)
   if base == "float" or base == "real" then
     local n = tonumber(value)
@@ -702,24 +700,23 @@ local function parse_json_page(raw)
   -- Every row is one line starting with "{". Other lines are the describe
   -- array and server messages such as "Warning: Null value is eliminated by
   -- an aggregate".
-  local rows, empty_cells = {}, {}
+  local rows = {}
   for line in raw:gmatch("[^\r\n]+") do
     line = vim.trim(line)
     if line:sub(1, 1) == "{" then
-      local keys, values, empties = decode_json_row(line)
+      local keys, values = decode_json_row(line)
       if not keys or #keys ~= #columns then return nil end
       local row = {}
       for i, key in ipairs(keys) do
         if key ~= columns[i] then return nil end
         row[i] = json_cell(values[i], types[i])
-        if not row[i] then return nil end
+        if row[i] == nil then return nil end
       end
       rows[#rows + 1] = row
-      if next(empties) then empty_cells[#rows] = empties end
     end
   end
   local incomparable
-  local column_types, generated, required_text = {}, {}, {}
+  local column_types, generated = {}, {}
   for i, col in ipairs(described) do
     local base = base_type(col.type)
     if INCOMPARABLE_TYPES[base] then
@@ -728,16 +725,15 @@ local function parse_json_page(raw)
     end
     column_types[col.name] = col.type
     if col.generated then generated[col.name] = true end
-    if TEXT_TYPES[base] and not col.nullable then required_text[col.name] = true end
   end
   return {
     columns = columns, rows = rows, types = types, incomparable = incomparable,
-    column_types = column_types, generated = generated, required_text = required_text,
-    empty_cells = empty_cells,
+    column_types = column_types, generated = generated,
   }
 end
 
-local function run_query(sql_str, url, timeout_ms)
+--- null_value: what NULL reads as on the text path (see parse_sqlcmd_table).
+local function run_query(sql_str, url, timeout_ms, null_value)
   if vim.fn.executable("sqlcmd") == 0 then
     return nil, "sqlcmd not found. Install Microsoft sqlcmd tools."
   end
@@ -764,7 +760,7 @@ local function run_query(sql_str, url, timeout_ms)
   if code ~= 0 then
     return nil, sqlcmd_error(stdout, stderr, code)
   end
-  local result = parse_sqlcmd_table(stdout)
+  local result = parse_sqlcmd_table(stdout, null_value)
   result.text = true
   return result, nil
 end
@@ -805,7 +801,8 @@ local function run_query_async(sql_str, url, timeout_ms, callback)
 end
 
 function M.query(sql_str, url)
-  local parsed, err = run_query(sql_str, url)
+  -- Cells are strings or vim.NIL (SQL NULL), as from every adapter.
+  local parsed, err = run_query(sql_str, url, nil, vim.NIL)
   if not parsed then return nil, err end
   return {
     rows = parsed.rows,
@@ -813,13 +810,12 @@ function M.query(sql_str, url)
     primary_keys = {},
     readonly = parsed.text or nil,
     readonly_reason = parsed.text and "plain text output" or nil,
+    -- Only the JSON path knows these and carries exact values, so only it
+    -- names the adapter whose literals writes and SQL exports use.
+    storage_adapter = not parsed.text and "sqlserver" or nil,
     incomparable_columns = parsed.incomparable,
-    -- Only the JSON path knows these; the text path leaves them nil and the
-    -- grid keeps treating "" as NULL there.
     column_types = parsed.column_types,
     generated_columns = parsed.generated,
-    required_text_columns = parsed.required_text,
-    empty_cells = parsed.empty_cells,
   }, nil
 end
 
@@ -848,6 +844,34 @@ function M.execute(sql_str, url)
   end
   local n = stdout:match("%((%d+) rows? affected%)") or stderr:match("%((%d+) rows? affected%)") or "0"
   return { affected = tonumber(n) or 0, message = stdout:gsub("%s+$", "") }, nil
+end
+
+--- Apply a grid's staged changes, or undo an applied batch, as one verified
+--- transaction: see sqlserver_write.lua for the script.
+function M.grid_write(plan, url, opts)
+  if vim.fn.executable("sqlcmd") == 0 then
+    return nil, "sqlcmd not found. Install Microsoft sqlcmd tools."
+  end
+  if adapters.session_opts().readonly then
+    return nil, "read-only connection: statement not run"
+  end
+  local parsed, parse_err = parse_url(url)
+  if not parsed then return nil, parse_err end
+  local transaction = require("dadbod-grip.transaction")
+  local writer = require("dadbod-grip.sqlserver_write")
+  local script, err = transaction.compile(plan, "sqlserver")
+  if not script then return nil, err end
+  -- -y 0, as for a grid page: each event stays on one line at any length.
+  local stdout, stderr, code = transaction.submit("sqlserver", opts, function(hooks)
+    return sqlcmd(parsed, script, nil, { json = true, hooks = hooks })
+  end)
+  if code ~= 0 and not stdout:find(writer.COMMIT, 1, true) then
+    return nil, sqlcmd_error(stdout, stderr, code)
+  end
+  local events = writer.events(plan, stdout, M._decode_json_row, M._json_cell)
+  local result, decode_err = transaction.decode(plan, stdout, "sqlserver", events or {})
+  if result then result.sql = script end
+  return result, decode_err
 end
 
 function M.ping(url)
@@ -949,7 +973,13 @@ function M.get_column_info(table_name, url)
 %s,
       IS_NULLABLE,
       COALESCE(COLUMN_DEFAULT, '') AS column_default,
-      ''
+      '',
+      CASE WHEN DATA_TYPE = 'timestamp'
+          OR COLUMNPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA) + '.' + QUOTENAME(TABLE_NAME)),
+            COLUMN_NAME, 'IsComputed') = 1
+          OR COALESCE(COLUMNPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA) + '.' + QUOTENAME(TABLE_NAME)),
+            COLUMN_NAME, 'GeneratedAlwaysType'), 0) <> 0
+        THEN 1 ELSE 0 END AS is_generated
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_SCHEMA = '%s'
       AND TABLE_NAME = '%s'
@@ -967,6 +997,9 @@ function M.get_column_info(table_name, url)
       is_nullable = row[3] or "",
       column_default = row[4] or "",
       constraints = row[5] or "",
+      -- Computed, rowversion and period columns: no INSERT or UPDATE takes
+      -- them. IDENTITY is left writable, since Undo writes it back.
+      generated = row[6] == "1" or nil,
     })
   end
   return cols, nil
@@ -1193,6 +1226,7 @@ M._sqlcmd_script = sqlcmd_script
 M._normalize_query_sql = normalize_query_sql
 M._json_page_sql = json_page_sql
 M._decode_json_row = decode_json_row
+M._json_cell = json_cell
 M._parse_json_page = parse_json_page
 
 return M

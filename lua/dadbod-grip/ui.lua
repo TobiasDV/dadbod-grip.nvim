@@ -377,8 +377,55 @@ function M.dismiss_float(opts)
 end
 
 --- The float owned by the outermost blocking() call, or nil when none is up.
---- @type table|nil  { msg = string }
+--- @type table|nil  { msg = string, active = boolean }
 local _spinner = nil
+
+--- How long a blocking() call must run before its float starts showing elapsed
+--- time. Under this the float is barely on screen, and a number that flashes
+--- "0.1s" on every fast schema fetch is noise rather than information.
+M._timer_threshold_ms = 500
+
+--- Columns the float reserves for the elapsed suffix. Claimed up front at
+--- creation so a timer that appears mid-run cannot push the message past the
+--- window edge and make it truncate.
+local TIMER_WIDTH = 8
+
+--- Slack columns the float carries past its rendered content. The label line is
+--- `"  " .. frame .. " " .. msg`, four columns wider than msg itself, so this
+--- leaves two spare at each end rather than fitting the text exactly.
+local FLOAT_PADDING = 6
+
+--- Columns kept clear at the screen edges, capping how wide a long label can
+--- push the float. `width` is the inner text area and nvim draws the border
+--- outside it, so this is two columns of border plus a one-column gap on each
+--- side. At the cap the border lands one column inside the terminal; drop it to
+--- 2 and the border sits flush, drop it to 0 and the float runs off-screen.
+local SCREEN_MARGIN = 4
+
+--- Unit conversions for the elapsed readout. MS_PER_MINUTE is the point where
+--- format_elapsed switches from seconds to minutes, derived rather than spelled
+--- out so the cutover cannot drift from the arithmetic below it.
+local MS_PER_SECOND      = 1000
+local SECONDS_PER_MINUTE = 60
+local MS_PER_MINUTE      = SECONDS_PER_MINUTE * MS_PER_SECOND
+
+--- Format a millisecond duration for the spinner float: one decimal under a
+--- minute, minutes and zero-padded seconds past it.
+---
+--- Deliberately not the "1234ms" the grid status line and history use. Those
+--- report a finished number that gets read once; this one ticks ~12x a second
+--- in the corner of the eye, where four changing digits are harder to read
+--- than one.
+--- @param ms number
+--- @return string
+function M.format_elapsed(ms)
+  if ms < MS_PER_MINUTE then
+    return string.format("%.1fs", ms / MS_PER_SECOND)
+  end
+  local total = math.floor(ms / MS_PER_SECOND)
+  return string.format("%dm%02ds",
+    math.floor(total / SECONDS_PER_MINUTE), total % SECONDS_PER_MINUTE)
+end
 
 --- Show an animated spinner float, run fn(), then clear the float.
 ---
@@ -390,10 +437,16 @@ local _spinner = nil
 ---   start_async(function(result) ... done = true end)
 ---   vim.wait(30000, function() return done end, 50)
 ---
---- The spinner (braille frames) animates during vim.system():wait() and
---- vim.wait() calls inside fn() because both pump the libuv event loop.
+--- The spinner (braille frames) animates during vim.wait() calls inside fn().
+--- vim.system():wait() alone does not pump scheduled Neovim callbacks; use the
+--- adapter run_cmd helper or vim.wait() for live updates.
 --- eventignore="all" suppresses plugin autocmds (WinNew/BufNew) that add
 --- 200-400ms overhead from noice/treesitter/nvim-cmp handlers.
+---
+--- Once a call passes M._timer_threshold_ms the float appends live elapsed
+--- time to its label, so a slow query is visibly slow while it runs instead of
+--- only after. It is wall time for the whole blocking() call, which can include
+--- several nested steps. The grid status line times the db round-trip alone.
 ---
 --- Calls nest: only the outermost one owns the float, and an inner call just
 --- relabels it for the duration of its own work. Closing the inner float would
@@ -426,11 +479,20 @@ function M.blocking(msg, fn)
 
   local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
   local fi = 1
+  local show_running_time = require("dadbod-grip").get_opts().show_running_time
 
-  local display = "  " .. msg
+  local w = math.max(1, math.min(vim.fn.strdisplaywidth(msg) + 2 + FLOAT_PADDING + TIMER_WIDTH,
+    vim.o.columns - SCREEN_MARGIN))
+  local function label_line(label, suffix)
+    -- Keep the timer visible even when a long or wide label must be shortened.
+    suffix = M.truncate_display(suffix, w, false)
+    local prefix = M.truncate_display("  " .. frames[fi] .. " ",
+      math.max(0, w - vim.fn.strdisplaywidth(suffix)), false)
+    local available = w - vim.fn.strdisplaywidth(prefix .. suffix)
+    return prefix .. M.truncate_display(label, math.max(0, available - 2)) .. suffix
+  end
   local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "  " .. display, "" })
-  local w = math.min(vim.fn.strdisplaywidth(display) + 6, vim.o.columns - 4)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", label_line(msg, ""), "" })
 
   -- Suppress plugin autocmds during float create to avoid 200-400ms overhead.
   local ei = vim.o.eventignore
@@ -442,10 +504,17 @@ function M.blocking(msg, fn)
     col      = math.floor((vim.o.columns - w) / 2),
   })
   vim.o.eventignore = ei
+  vim.wo[win].wrap = false
 
   -- Claimed only now: a nested call reaching this far would have had no float
   -- to borrow, and every one after it must find a live window to relabel.
-  _spinner = { msg = msg }
+  local spinner = { msg = msg, active = true }
+  _spinner = spinner
+
+  -- Started here, not per nested call: a nested label swap describes one step
+  -- of the work, but the number next to it answers "how long has this been
+  -- going", which is the outermost call's clock.
+  local t0 = vim.uv.hrtime()
 
   -- Best-effort paint before fn() runs. Keep this on Neovim's stable Ex
   -- command rather than the experimental nvim__redraw API.
@@ -454,23 +523,47 @@ function M.blocking(msg, fn)
   -- Animate: timer fires during vim.system():wait() and vim.wait() event loop pumps.
   -- libuv timer callbacks are "fast events" - nvim API calls are forbidden there.
   -- vim.schedule_wrap defers the API work into the main loop, which pumps during wait().
-  -- Reads _spinner.msg, not the upvalue, so a nested call's label shows while
-  -- it runs.
+  -- Nested calls update this owner's message while keeping its original clock.
   local timer = vim.uv.new_timer()
-  timer:start(80, 80, vim.schedule_wrap(function()
-    fi = (fi % #frames) + 1
-    if vim.api.nvim_buf_is_valid(buf) then
-      pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false,
-        { "", "  " .. frames[fi] .. " " .. ((_spinner and _spinner.msg) or msg), "" })
-      pcall(vim.cmd, "redraw")
+  local function stop_timer()
+    spinner.active = false
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
     end
+  end
+  timer:start(80, 80, vim.schedule_wrap(function()
+    -- stop()/close() cannot retract work already queued by schedule_wrap.
+    -- An old callback must not borrow the state of a later operation.
+    if _spinner ~= spinner or not spinner.active then return end
+    if not vim.api.nvim_win_is_valid(win) or not vim.api.nvim_buf_is_valid(buf)
+        or vim.api.nvim_win_get_buf(win) ~= buf then
+      stop_timer()
+      return
+    end
+    fi = (fi % #frames) + 1
+    local elapsed_ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
+    local suffix = (show_running_time and elapsed_ms >= M._timer_threshold_ms)
+      and (" " .. M.format_elapsed(elapsed_ms)) or ""
+    -- A nested step can have a longer label; resize only when it needs room or
+    -- the editor has shrunk, never once per timer tick.
+    local width = math.max(1, math.min(math.max(w,
+      vim.fn.strdisplaywidth(spinner.msg) + 2 + FLOAT_PADDING + TIMER_WIDTH),
+      vim.o.columns - SCREEN_MARGIN))
+    if width ~= w then
+      w = width
+      vim.api.nvim_win_set_config(win, { relative = "editor", width = w,
+        row = math.floor((vim.o.lines - 3) / 2), col = math.floor((vim.o.columns - w) / 2) })
+    end
+    pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false,
+      { "", label_line(spinner.msg, suffix), "" })
+    pcall(vim.cmd, "redraw")
   end))
 
   local rets = { pcall(fn) }
   local ok   = table.remove(rets, 1)
 
-  timer:stop()
-  timer:close()
+  stop_timer()
   -- Released before the close below: anything the cleanup triggers must see
   -- no spinner rather than one that is about to vanish.
   _spinner = nil

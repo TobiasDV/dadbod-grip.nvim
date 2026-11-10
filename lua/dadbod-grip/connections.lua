@@ -202,7 +202,8 @@ local function read_json_connections(path, source)
   for _, entry in ipairs(data) do
     if type(entry) == "table" and entry.name and entry.url then
       local c = { name = entry.name, url = entry.url,
-                  type = entry.type, source = source or "file" }
+                  type = entry.type, source = source or "file",
+                  _registry_path = vim.fn.fnamemodify(path, ":p") }
       if entry.id then c.id = entry.id end
       if entry.attachments then c.attachments = entry.attachments end
       if entry.last_used then c.last_used = entry.last_used end
@@ -216,9 +217,8 @@ local function read_json_connections(path, source)
 end
 
 --- Read connections from the project-local file only.
---- Use this for all mutation paths (add, touch, remove, save_attachments).
---- Keeping mutation local-only prevents global connections from leaking into
---- the local file on every write.
+--- Use this for project-local mutations (add, touch, remove, save_attachments).
+--- Switches update the owning file instead of copying a global profile here.
 local function read_local_connections()
   return read_json_connections(connections_path(), "file")
 end
@@ -391,9 +391,10 @@ local function write_file_connections(conns)
   vim.fn.writefile({ json }, connections_path())
 end
 
---- Write connections to ~/.grip/connections.json, keeping every field.
-local function write_global_connections(conns)
-  ensure_global_grip_dir()
+--- Write a single registry, preserving supported profile fields and record order.
+--- Never pass the merged read_file_connections() list here.
+local function write_registry_connections(conns, path)
+  paths.ensure_dir(vim.fn.fnamemodify(path, ":h"))
   local data = {}
   for _, c in ipairs(conns) do
     local entry = { name = c.name, url = c.url }
@@ -406,7 +407,11 @@ local function write_global_connections(conns)
     if c.color then entry.color = c.color end
     table.insert(data, entry)
   end
-  vim.fn.writefile({ vim.fn.json_encode(data) }, global_connections_path())
+  vim.fn.writefile({ vim.fn.json_encode(data) }, path)
+end
+
+local function write_global_connections(conns)
+  write_registry_connections(conns, global_connections_path())
 end
 
 --- Resolve a persisted connection by opaque ID.
@@ -533,7 +538,7 @@ function M.list()
         -- fetch whose file entry no longer carries them.
         c = vim.tbl_extend("force", {}, c)
         for _, field in ipairs({
-          "id", "type", "env_file", "mode", "color", "attachments", "last_used",
+          "id", "type", "env_file", "mode", "color", "attachments", "last_used", "_registry_path",
         }) do
           if c[field] == nil then c[field] = filed[field] end
         end
@@ -717,22 +722,112 @@ function M.touch(url)
   end
 end
 
---- Remove a connection from .grip/connections.json by name.
-function M.remove(name)
-  local conns = read_local_connections()
-  local filtered = {}
-  for _, c in ipairs(conns) do
-    if c.name ~= name then
-      table.insert(filtered, c)
+--- Splice one entry from an already-validated JSON array. Track only top-level
+--- separators: strings and nested values may contain commas or brackets.
+--- Surviving records stay verbatim, including unknown fields and exact numbers.
+local function without_registry_entry(raw, opener, selected)
+  local spans, commas = {}, {}
+  local start, depth, quoted, escaped = opener + 1, 0, false, false
+  local function add_span(last)
+    local first = start
+    while first <= last and raw:sub(first, first):match("%s") do first = first + 1 end
+    while last >= first and raw:sub(last, last):match("%s") do last = last - 1 end
+    if first <= last then table.insert(spans, { first, last }) end
+  end
+  for pos = opener + 1, #raw do
+    local char = raw:sub(pos, pos)
+    if quoted then
+      if escaped then escaped = false
+      elseif char == "\\" then escaped = true
+      elseif char == '"' then quoted = false end
+    elseif char == '"' then quoted = true
+    elseif char == "[" or char == "{" then depth = depth + 1
+    elseif char == "}" then depth = depth - 1
+    elseif char == "]" then
+      if depth == 0 then add_span(pos - 1); break end
+      depth = depth - 1
+    elseif char == "," and depth == 0 then
+      add_span(pos - 1)
+      table.insert(commas, pos)
+      start = pos + 1
     end
   end
-  write_file_connections(filtered)
+  local span = spans[selected]
+  if not span then return nil end
+  local first, last = span[1], span[2]
+  if commas[selected] then last = commas[selected]
+  elseif selected > 1 then first = commas[selected - 1] end
+  return raw:sub(1, first - 1) .. raw:sub(last + 1)
+end
+
+-- Persisted IDs are opaque strings. Numeric IDs can round during JSON decode,
+-- making a stale selection compare equal to a different stored identity.
+local function deletable_id(id)
+  return id == nil or (type(id) == "string" and id ~= "")
+end
+
+--- Remove exactly one saved profile. Picker rows carry original registry
+--- provenance independently of their display source (a local override can
+--- display as global). Match URL and ID together; a changed or ambiguous
+--- selection must not remove a replacement or a same-name peer.
+--- Legacy remove(name) remains local/custom-only and requires a unique name.
+--- @return boolean removed
+--- @return string|nil reason "missing", "ambiguous", "registry", "identity", or "invalid"
+function M.remove(target)
+  local by_name = type(target) == "string"
+  local path = vim.fn.fnamemodify(connections_path(), ":p")
+  if not by_name then
+    if type(target) ~= "table" or type(target.url) ~= "string" or target.url == ""
+        or type(target._registry_path) ~= "string" then return false, "missing" end
+    if not deletable_id(target.id) then return false, "identity" end
+    local origin = target._registry_path
+    local global_path = vim.fn.fnamemodify(global_connections_path(), ":p")
+    if origin ~= path and (configured_connections_path() or origin ~= global_path) then
+      return false, "registry"
+    end
+    path = origin
+  end
+
+  -- Read the actual registry, not the UI projection or the merged list.
+  -- Reconstructing survivors through a field whitelist loses extension data;
+  -- decoding and re-encoding also rounds large JSON numbers. Decode only to
+  -- validate and locate the selected identity, then splice the original text.
+  if vim.fn.filereadable(path) == 0 then return false, "missing" end
+  local read_ok, lines = pcall(vim.fn.readfile, path, "b")
+  if not read_ok then return false, "invalid" end
+  -- readfile represents a physical NUL as an embedded newline in a list
+  -- item. NUL is invalid JSON; do not accidentally normalize it to whitespace.
+  for _, line in ipairs(lines) do
+    if line:find("\n", 1, true) then return false, "invalid" end
+  end
+  local raw = table.concat(lines, "\n")
+  local opener = raw:find("%S")
+  if not opener or raw:sub(opener, opener) ~= "[" then return false, "invalid" end
+  local valid, conns = pcall(vim.json.decode, raw)
+  if not valid or type(conns) ~= "table" then return false, "invalid" end
+  local selected
+  for index, c in ipairs(conns) do
+    if type(c) == "table" and type(c.name) == "string" and type(c.url) == "string" then
+      local matches = by_name and c.name == target
+        or (not by_name and c.url == target.url and c.id == target.id)
+      if matches then
+        if not deletable_id(c.id) then return false, "identity" end
+        if selected then return false, "ambiguous" end
+        selected = index
+      end
+    end
+  end
+  if not selected then return false, "missing" end
+  local updated = without_registry_entry(raw, opener, selected)
+  if not updated then return false, "invalid" end
+  vim.fn.writefile(vim.split(updated, "\n", { plain = true }), path, "b")
+  return true
 end
 
 --- Switch active connection. Routes file connections through grip.open(),
 --- DB connections through vim.g.db + workspace open.
---- Auto-saves to .grip/connections.json if not already persisted.
---- opts: { write = bool, watch_ms = number, mode = "ro"|"rw" }: session-only,
+--- Touches the owning registry; new named URLs save to the project registry.
+--- opts: { write = bool, watch_ms = number, mode = "ro"|"rw", on_ready = function }: session-only,
 --- never persisted.
 --- @return boolean committed  false when the switch aborted and nothing changed
 function M.switch(url, name, conn_type, opts)
@@ -759,32 +854,38 @@ function M.switch(url, name, conn_type, opts)
     return false
   end
 
-  -- Single read of the local file; everything below (type resolution,
-  -- rename/insert, MRU touch) mutates this same in-memory list, and it is
-  -- written back at most once at the end instead of once per mutation.
-  local local_conns = read_local_connections()
+  -- Resolve consent before retaining any registry snapshot across a blocking
+  -- prompt or target read. The mutation path below reads fresh profile data.
+  local selected = M.entry_for(url)
+  local allowed, prepared = require("dadbod-grip.connection_switch").prepare(url,
+    conn_type == "file" or (selected and selected.type == "file") or is_file_url(conn_url),
+    function() return M.expand_url(url) == conn_url end)
+  if not allowed then return false end
 
-  -- Resolve type: param > local connections > global connections > auto-detect.
-  -- The global file is only read when actually needed for the lookup, since
-  -- most callers already pass conn_type or have a locally-known type.
+  -- Find the owning registry independently of conn_type: the picker passes
+  -- a type, but a global-only profile must still be touched in its own file.
+  -- A deliberate local override wins, matching entry_for()'s precedence.
+  local local_conns = read_local_connections()
   local resolved_type = conn_type
-  local in_local = false
+  local saved_entry
   for _, c in ipairs(local_conns) do
     if c.url == url then
-      in_local = true
+      saved_entry = saved_entry or c
       resolved_type = resolved_type or c.type
     end
   end
-  -- The global file is only read when the entry is not local, since most
-  -- callers pass conn_type or have a locally-known entry.
-  local in_global = false
-  local global_conns = {}
-  if not in_local and not configured_connections_path() then
+
+  -- Keep type precedence: param > local > global > auto-detect. The global
+  -- registry is needed for ownership when absent locally, or as a type
+  -- fallback. A configured path remains the only registry in that mode.
+  local global_conns, in_global
+  if not configured_connections_path() and (not saved_entry or not resolved_type) then
     global_conns = read_json_connections(global_connections_path(), "global")
     for _, c in ipairs(global_conns) do
       if c.url == url then
-        in_global = true
         resolved_type = resolved_type or c.type
+        if not saved_entry then saved_entry, in_global = c, true end
+        break
       end
     end
   end
@@ -792,33 +893,20 @@ function M.switch(url, name, conn_type, opts)
     resolved_type = "file"
   end
 
-  -- Always upsert when a name is provided. This handles both insert (new
-  -- URL) and rename (existing URL with a stale generic name like "vim.g.db").
-  -- Without this, an already-saved URL would keep a stale name forever even
-  -- when switching with the correct one.
-  --
-  -- Except for an entry that lives only in the global file: a local copy
-  -- would carry none of its env_file/mode/color, and because entry_for()
-  -- reads the local file first, that copy would shadow the real entry and
-  -- the next connect would fail to resolve its ${VAR}. Its MRU stamp goes
-  -- to the global file instead.
+  -- Global profiles stay global. A stripped-down local upsert would shadow
+  -- env_file/mode/color/id on every later lookup, including the next query.
   if in_global then
-    if touch_conn(global_conns, url) then
-      write_global_connections(global_conns)
-    end
+    if touch_conn(global_conns, url) then write_global_connections(global_conns) end
   else
+    -- Preserve local insert/rename behavior, including stale vim.g.db names.
     local changed = false
     if name and name ~= "" then
       upsert_conn(local_conns, name, url)
       changed = true
     end
     -- Touch AFTER upsert so first-time connections get last_used stamped.
-    if touch_conn(local_conns, url) then
-      changed = true
-    end
-    if changed then
-      write_file_connections(local_conns)
-    end
+    if touch_conn(local_conns, url) then changed = true end
+    if changed then write_file_connections(local_conns) end
   end
 
   -- The one place a mode override is set or cleared. Connecting the ordinary
@@ -900,7 +988,7 @@ function M.switch(url, name, conn_type, opts)
         if not schema.is_open() and auto_sidebar then
           schema.toggle(url)
         elseif schema.is_open() then
-          schema.refresh(url)
+          schema.refresh(url, { switch = true })
         end
         require("dadbod-grip.query_pad").open(db_url)
         vim.notify("Grip: opening " .. label, vim.log.levels.INFO)
@@ -912,21 +1000,15 @@ function M.switch(url, name, conn_type, opts)
   -- Regular DB connection: set vim.g.db and open full workspace
   vim.g.db = url
 
-  -- Restore persisted attachments for DuckDB connections (local file only;
-  -- attachments are always saved to local by M.save_attachments).
+  -- Restore attachments from the selected profile, including global-only
+  -- profiles. A deliberate local override still owns its own attachments.
   --
   -- One of the four paths that bypass db.resolve(), so it expands by hand:
   -- the adapter's attachment registry is keyed by the URL the adapter is
   -- called with, which is the *expanded* one on every query, and the stored
   -- DSNs are templates that only become connectable here.
   if conn_url:find("^duckdb:") then
-    local stored_atts
-    for _, c in ipairs(local_conns) do
-      if c.url == url and c.attachments then
-        stored_atts = c.attachments
-        break
-      end
-    end
+    local stored_atts = saved_entry and saved_entry.attachments
     if stored_atts then
       local live_atts = {}
       for _, a in ipairs(stored_atts) do
@@ -959,7 +1041,7 @@ function M.switch(url, name, conn_type, opts)
 
   local label = name or url
 
-  vim.schedule(function()
+  local function open_workspace()
     local schema = require("dadbod-grip.schema")
     local auto_sidebar = require("dadbod-grip").get_opts().open_sidebar
 
@@ -969,12 +1051,12 @@ function M.switch(url, name, conn_type, opts)
     -- layout. Built the other way round, each pane appeared empty and filled
     -- in a second later, which read as the plugin assembling itself on screen.
     ui.blocking("connecting to " .. label .. "...", function()
-      if auto_sidebar or schema.is_open() then schema.prefetch(url) end
+      if auto_sidebar or schema.is_open() then schema.prefetch(url, prepared) end
 
       if not schema.is_open() and auto_sidebar then
         schema.toggle(url)
       elseif schema.is_open() then
-        schema.refresh(url)
+        schema.refresh(url, { switch = true, prepared = prepared })
       end
 
       -- Show welcome screen in the main content area
@@ -993,6 +1075,10 @@ function M.switch(url, name, conn_type, opts)
     -- an empty screen for however long the schema took to arrive.
     vim.notify("Grip: connected to " .. label, vim.log.levels.INFO)
 
+    -- A blocking catalog fetch pumps scheduled work. Run dependent setup here,
+    -- after the workspace has finished placing/focusing its panes.
+    if opts and opts.on_ready then opts.on_ready() end
+
     -- Pre-warm completion schema cache in background (avoids freeze on first keypress)
     vim.schedule(function()
       pcall(function()
@@ -1000,7 +1086,8 @@ function M.switch(url, name, conn_type, opts)
       end)
     end)
 
-  end)
+  end
+  if prepared then open_workspace() else vim.schedule(open_workspace) end
   return true
 end
 
@@ -1022,7 +1109,7 @@ function M.current()
 end
 
 --- Persist attachments for a DuckDB connection URL.
---- Called after attach/detach to update .grip/connections.json.
+--- Called after attach/detach to update the profile's owning registry.
 ---
 --- `url` is the connection URL as stored (templated), since that is the key
 --- the entry lives under on disk; the live adapter registry is keyed by the
@@ -1034,22 +1121,28 @@ end
 --- template is resolved again on replay by M.switch/expand_dsn. Records with
 --- no template (a literal DSN) round-trip byte-identically, as before.
 function M.save_attachments(url, attachments)
-  local file_conns = read_local_connections()
-  local found = false
-  for _, c in ipairs(file_conns) do
-    if c.url == url then
-      c.attachments = attachments and #attachments > 0 and {} or nil
-      if attachments then
-        for _, a in ipairs(attachments) do
-          table.insert(c.attachments, { dsn = a.template or a.dsn, alias = a.alias })
+  local function save_to(conns, write_conns)
+    for _, c in ipairs(conns) do
+      if c.url == url then
+        c.attachments = attachments and #attachments > 0 and {} or nil
+        if attachments then
+          for _, a in ipairs(attachments) do
+            table.insert(c.attachments, { dsn = a.template or a.dsn, alias = a.alias })
+          end
         end
+        write_conns(conns)
+        return true
       end
-      found = true
-      break
     end
+    return false
   end
-  if found then
-    write_file_connections(file_conns)
+
+  -- Local overrides own their attachments, matching switch()/entry_for().
+  -- A configured registry is exclusive; otherwise a global-only profile
+  -- must keep attachment edits there without creating a local shadow.
+  if save_to(read_local_connections(), write_file_connections) then return end
+  if not configured_connections_path() then
+    save_to(read_json_connections(global_connections_path(), "global"), write_global_connections)
   end
 end
 
@@ -1288,9 +1381,18 @@ function M.pick(opts)
         end
         return
       end
+      -- An ad-hoc/env/discovered-only row is not a saved profile. In
+      -- particular, its display name must never delete a saved namesake.
+      if not c._registry_path then return end
       if ui.confirm("Remove '" .. c.name .. "'? (y/N): ") then
-        M.remove(c.name)
-        refresh_fn(build_picker_items())
+        local removed, reason = M.remove(c)
+        if removed then
+          refresh_fn(build_picker_items())
+        elseif reason == "identity" then
+          vim.notify("Grip: profile ID must be a non-empty string or absent; no profile removed.", vim.log.levels.WARN)
+        else
+          vim.notify("Grip: connection changed or is ambiguous; reopen the picker before deleting.", vim.log.levels.WARN)
+        end
       end
     end,
     actions = {

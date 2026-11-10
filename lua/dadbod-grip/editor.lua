@@ -86,7 +86,7 @@ local function try_enum_hint(buf, values)
 end
 
 -- Sentinel: caller uses this to distinguish "user set NULL" from "user cancelled".
-M.NULL_VALUE = "__GRIP_NULL__"
+M.NULL_VALUE = vim.NIL
 
 -- Translate the sentinel to a real nil for staging. Callers MUST use this
 -- instead of `v == M.NULL_VALUE and nil or v` — that and/or expression
@@ -112,6 +112,24 @@ end
 --                       the editor stays context-free)
 function M.open(prompt, initial_value, on_save, opts)
   opts = opts or {}
+  local km = require("dadbod-grip.keymaps")
+  -- These hints belong to this editor's bindings, not a later setup() call.
+  local save_key = km.get("editor_save") or km.get("editor_save_alt")
+  local cancel_keys = {}
+  for _, action in ipairs({ "editor_cancel_q", "editor_cancel" }) do
+    local key = km.get(action)
+    if key then cancel_keys[#cancel_keys + 1] = key end
+  end
+  local function footer(mode)
+    local parts = { mode == "i" and "INSERT" or "NORMAL" }
+    if save_key then parts[#parts + 1] = save_key .. "=save" end
+    if mode == "i" then
+      parts[#parts + 1] = "<Esc>=normal" -- intrinsic Vim behavior, not a mapping
+    elseif #cancel_keys > 0 then
+      parts[#parts + 1] = table.concat(cancel_keys, "/") .. "=cancel"
+    end
+    return "  " .. table.concat(parts, "  ") .. "  "
+  end
   local caller_win = vim.api.nvim_get_current_win()  -- save for restore on close
   local pre_fill = initial_value or ""
   -- Split on newlines so nvim_buf_set_lines receives clean per-line strings
@@ -150,7 +168,7 @@ function M.open(prompt, initial_value, on_save, opts)
     border = ui.border(),
     title = " " .. (prompt or "edit") .. " ",
     title_pos = "center",
-    footer     = "  INSERT  <CR>=save  <Esc>=normal  ",
+    footer     = footer("i"),
     footer_pos = "right",
     zindex = 60,
   })
@@ -179,19 +197,22 @@ function M.open(prompt, initial_value, on_save, opts)
     end)
   end
 
-  local function do_save()
+  local initial_tick = vim.api.nvim_buf_get_changedtick(edit_buf)
+  local function do_save(explicit_null, explicit_empty)
     if closed then return end
     closed = true
     local lines = vim.api.nvim_buf_get_lines(edit_buf, 0, -1, false)
     -- Join all lines to support multi-line editing (for cells with embedded newlines)
     local val = table.concat(lines, "\n")
+    local unchanged_null = initial_value == nil and val == ""
+      and vim.api.nvim_buf_get_changedtick(edit_buf) == initial_tick
     vim.cmd("stopinsert")
     if vim.api.nvim_win_is_valid(float_win) then
       vim.api.nvim_win_close(float_win, true)
     end
     restore_caller()
-    -- Empty string -> NULL signal
-    local result = val == "" and M.NULL_VALUE or val
+    -- Blank text is text. An unchanged NULL editor remains a no-op.
+    local result = (explicit_null == true or (unchanged_null and explicit_empty ~= true)) and M.NULL_VALUE or val
     on_save(result)
   end
 
@@ -209,10 +230,7 @@ function M.open(prompt, initial_value, on_save, opts)
   -- Live footer: updates when mode changes so the user always sees the right hints
   local function _set_footer(mode_char)
     if not vim.api.nvim_win_is_valid(float_win) then return end
-    local f = mode_char == "i"
-      and "  INSERT  <CR>=save  <Esc>=normal  "
-      or  "  NORMAL  <CR>=save  q/<Esc>=cancel  "
-    vim.api.nvim_win_set_config(float_win, { footer = f, footer_pos = "right" })
+    vim.api.nvim_win_set_config(float_win, { footer = footer(mode_char), footer_pos = "right" })
   end
   vim.api.nvim_create_autocmd("InsertEnter", {
     group = _ag, buffer = edit_buf,
@@ -223,9 +241,14 @@ function M.open(prompt, initial_value, on_save, opts)
     callback = function() _set_footer("n") end,
   })
 
+  vim.api.nvim_buf_create_user_command(edit_buf, "GripCellNull", function() do_save(true) end, {})
+  vim.api.nvim_buf_create_user_command(edit_buf, "GripCellEmpty", function()
+    vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, { "" })
+    do_save(false, true)
+  end, {})
+
   -- Keymaps (buf-local)
   -- NOTE: INSERT <Esc> is intentionally NOT mapped; natural Vim exits to NORMAL mode
-  local km = require("dadbod-grip.keymaps")
   for _, mode in ipairs({ "i", "n" }) do
     km.bind("cell_editor", edit_buf, "editor_save", mode, do_save, { noremap = true })
     km.bind("cell_editor", edit_buf, "editor_save_alt", mode, do_save, { noremap = true })

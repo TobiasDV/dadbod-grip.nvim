@@ -7,7 +7,7 @@ local db = require("dadbod-grip.db")
 local view = require("dadbod-grip.view")
 
 local url = "sqlite:tests/seed_sqlite.db"
-grip.setup({ open_sidebar = true })
+grip.setup({ open_sidebar = true, connections_path = vim.fn.tempname() .. "_connections.json" })
 assert(connections.switch(url, "seed", "sqlite"))
 assert(vim.wait(5000, function()
   return schema.is_open() and query_pad.get_pad_bufnr()

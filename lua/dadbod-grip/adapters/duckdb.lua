@@ -6,6 +6,8 @@ local db_util  = require("dadbod-grip.db")
 local adapters = require("dadbod-grip.adapters")
 local sql_util = require("dadbod-grip.sql")
 local esc      = sql_util.escape_literal
+local timing   = require("dadbod-grip.engine_timing")
+local queue    = require("dadbod-grip.duckdb_queue")
 
 local M = {}
 
@@ -31,9 +33,15 @@ local _installed_ext = {}
 local _attachments = {}
 
 --- Catalog cache: url -> { db_name -> true }
---- Populated lazily by querying duckdb_databases() for persistently-attached DBs
---- not registered via M.attach() (e.g. ATTACH statements baked into the .duckdb file).
+--- Populated lazily by querying duckdb_databases() for catalog-qualified name
+--- resolution. Attachments belong to each CLI session, not the database file.
 local _catalog_cache = {}
+local _catalog_generation = {}
+
+function M.invalidate_schema(url)
+  _catalog_cache[url] = nil
+  _catalog_generation[url] = (_catalog_generation[url] or 0) + 1
+end
 
 --- Forward declaration: body assigned after duckdb() is defined (Lua scoping).
 local get_catalog_set
@@ -417,6 +425,26 @@ local function extract_path(url)
   return path
 end
 
+local function local_attachment_path(dsn)
+  if dsn:match("^duckdb:") then return extract_path(dsn) end
+  -- Other scanner/remote schemes do not share a local DuckDB file lock.
+  if detect_extension(dsn) or dsn:match("^[%a][%w+.-]*:") then return nil end
+  return dsn
+end
+
+local function coordination_keys(db_path, url, validation_dsn)
+  local paths = { db_path }
+  for _, attachment in ipairs(url and _attachments[url] or {}) do
+    local path = local_attachment_path(attachment.dsn)
+    if path then paths[#paths + 1] = path end
+  end
+  if validation_dsn then
+    local path = local_attachment_path(validation_dsn)
+    if path then paths[#paths + 1] = path end
+  end
+  return queue.keys(paths)
+end
+
 --- Name DuckDB gives the main catalog: the file's basename without its
 --- extension ("softrear" for /data/softrear.duckdb), or "memory" for the
 --- in-memory instance. Every catalog query that has to name the main database
@@ -496,7 +524,7 @@ local function duckdb_args(db, opts, flags)
   return args
 end
 
-local function duckdb(db_path, sql_str, timeout_ms, url)
+local function duckdb(db_path, sql_str, timeout_ms, url, opts)
   local setup_sql = ""
   local effective_timeout = timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT)
 
@@ -520,10 +548,16 @@ local function duckdb(db_path, sql_str, timeout_ms, url)
     effective_timeout = math.max(effective_timeout, NETWORK_TIMEOUT)
   end
 
-  local effective_sql, has_setup = with_csv_setup(setup_sql, sql_str)
-
   local args = duckdb_args(db_path, adapters.session_opts(), { "-csv", "-header" })
-  local stdout, stderr, code = adapters.run_cmd(args, effective_timeout, { stdin = effective_sql })
+  local profile = timing.prepare(sql_str, opts)
+  local effective_sql, has_setup = with_csv_setup(setup_sql, (profile and profile.prefix or "") .. sql_str)
+
+  local stdout, stderr, code, engine = timing.run(profile, function()
+    return queue.run(coordination_keys(db_path, url), args, effective_timeout, { stdin = effective_sql, raw_output = true,
+      on_start = opts and opts.on_start, on_complete = opts and opts.on_complete,
+      on_spawn_error = opts and opts.on_spawn_error,
+      terminate_on_interrupt = (profile and profile.path ~= nil) or (opts and opts.on_start ~= nil) })
+  end)
   if has_setup then stdout = strip_csv_setup(stdout) end
 
   -- Track httpfs install state from stderr output
@@ -540,7 +574,7 @@ local function duckdb(db_path, sql_str, timeout_ms, url)
   -- The ATTACH prefix carried the attachment DSNs into this process; a failing
   -- attachment gets them quoted back. Masked here rather than at each of the
   -- ~15 places that return this stderr onwards.
-  return stdout, redact_query_error(stderr, url), code
+  return stdout, redact_query_error(stderr, url), code, engine, profile and profile.path ~= nil
 end
 
 --- Assigned here (after duckdb() is in scope) so the upvalue resolves correctly.
@@ -548,7 +582,8 @@ end
 --- Result is cached per URL; invalidated when attachments change.
 get_catalog_set = function(db_path, url)
   if _catalog_cache[url] then return _catalog_cache[url] end
-  local stdout = duckdb(db_path,
+  local generation = _catalog_generation[url]
+  local stdout, _, code = duckdb(db_path,
     "SELECT database_name FROM duckdb_databases() WHERE NOT internal", nil, url)
   local cats = {}
   for line in (stdout or ""):gmatch("[^\r\n]+") do
@@ -556,7 +591,7 @@ get_catalog_set = function(db_path, url)
       cats[line] = true
     end
   end
-  _catalog_cache[url] = cats
+  if code == 0 and generation == _catalog_generation[url] then _catalog_cache[url] = cats end
   return cats
 end
 
@@ -571,7 +606,7 @@ local function duckdb_async(db_path, sql_str, timeout_ms, url, callback)
     effective_timeout = math.max(effective_timeout, NETWORK_TIMEOUT)
   end
   local args = duckdb_args(db_path, adapters.session_opts(), { "-csv", "-header" })
-  adapters.run_cmd_async(args, effective_timeout, function(stdout, stderr, code)
+  return queue.run_async(coordination_keys(db_path, url), args, effective_timeout, function(stdout, stderr, code)
     if url then note_ext_installed(url, code) end
     if has_setup then stdout = strip_csv_setup(stdout) end
     -- Same reason as in duckdb(): the ATTACH prefix is in this SQL.
@@ -580,11 +615,11 @@ local function duckdb_async(db_path, sql_str, timeout_ms, url, callback)
 end
 
 --- Run DML without CSV mode (to get change count output).
-local function duckdb_exec(db_path, sql_str, timeout_ms, url)
-  local effective_sql = sql_str
+local function duckdb_exec(db_path, sql_str, timeout_ms, url, opts)
+  local setup_sql = ""
   local effective_timeout = timeout_ms or adapters.configured_timeout(DEFAULT_TIMEOUT)
   if url then
-    effective_sql = build_attach_prefix(url) .. effective_sql
+    setup_sql = build_attach_prefix(url)
     -- Same one-off extension fetch as in duckdb(): a DML statement against an
     -- attached table is as likely to be the first call of the session as a SELECT.
     if attach_install_pending(url) then
@@ -593,10 +628,15 @@ local function duckdb_exec(db_path, sql_str, timeout_ms, url)
   end
 
   local args = duckdb_args(db_path, adapters.session_opts())
+  local profile = timing.prepare(sql_str, opts)
+  local effective_sql = setup_sql .. (profile and profile.prefix or "") .. sql_str
   -- Same reason as in duckdb(): the ATTACH prefix is in this SQL.
-  local stdout, stderr, code = adapters.run_cmd(args, effective_timeout, { stdin = effective_sql })
+  local stdout, stderr, code, engine = timing.run(profile, function()
+    return queue.run(coordination_keys(db_path, url), args, effective_timeout, { stdin = effective_sql,
+      terminate_on_interrupt = profile and profile.path ~= nil })
+  end)
   if url then note_ext_installed(url, code) end
-  return stdout, redact_query_error(stderr, url), code
+  return stdout, redact_query_error(stderr, url), code, engine
 end
 
 --- Statement kinds a subquery can hold. Everything else -- DESCRIBE (db.describe_file
@@ -611,7 +651,7 @@ local function strip_leading_noise(s)
   while true do
     local t = (s:gsub("^%s+", ""))
     if t:sub(1, 2) == "--" then
-      t = (t:gsub("^%-%-[^\n]*\n?", ""))
+      t = (t:gsub("^%-%-[^\r\n]*[\r\n]?", ""))
     elseif t:sub(1, 2) == "/*" then
       local close = t:find("*/", 3, true)
       if not close then return t end
@@ -642,9 +682,10 @@ end
 --- Returns nil when the statement is not a wrappable query, in which case the
 --- caller runs it unchanged.
 local NESTED_JSON_TEMPLATE = [[
-SELECT CASE WHEN regexp_matches(typeof(COLUMNS('(.*)')), '^(STRUCT|MAP|UNION)\(|\]$')
-            THEN to_json(COLUMNS('(.*)'))::VARCHAR
-            ELSE COLUMNS('(.*)')::VARCHAR
+SELECT CASE WHEN COLUMNS('(.*)') IS NULL THEN 'N'
+            WHEN regexp_matches(typeof(COLUMNS('(.*)')), '^(STRUCT|MAP|UNION)\(|\]$')
+            THEN 'V' || to_json(COLUMNS('(.*)'))::VARCHAR
+            ELSE 'V' || COLUMNS('(.*)')::VARCHAR
        END AS "\1"
 FROM (
 %s
@@ -661,7 +702,8 @@ local function nested_json_sql(sql_str)
   return string.format(NESTED_JSON_TEMPLATE, body)
 end
 
-function M.query(sql_str, url)
+function M.query(sql_str, url, opts)
+  if type(opts) ~= "table" then opts = nil end
   if vim.fn.executable("duckdb") == 0 then
     return nil, "duckdb not found. Install duckdb."
   end
@@ -669,17 +711,33 @@ function M.query(sql_str, url)
   local db_path = extract_path(url)
   if not db_path then return nil, "Invalid DuckDB URL: " .. url end
 
-  local wrapped = nested_json_sql(sql_str)
-  local stdout, stderr, code
-  if wrapped then
-    stdout, stderr, code = duckdb(db_path, wrapped, nil, url)
+  local requested = opts and opts.engine_timing == true
+  local single_sql = timing.statement(sql_str)
+  local wrapped = single_sql and nested_json_sql(single_sql) or nil
+  local absent
+  if requested then
+    local single, reason = timing.statement(sql_str)
+    -- Eligibility controls collection only. If the legacy wrapper would need
+    -- compatibility fallback (e.g. a terminal semicolon followed by a comment),
+    -- keep that exact conversion/fallback path without enabling profiling.
+    if not single or nested_json_sql(single) ~= wrapped then
+      absent = timing.unsupported(reason or "unsupported_statement")
+      opts = nil
+    else
+      local probe_err
+      opts, absent, probe_err = timing.options(opts)
+      if probe_err then return nil, probe_err end
+    end
   end
-  -- The rewrite is an enhancement, never a new failure mode: a DuckDB too old for
-  -- COLUMNS(...) AS "\1", or a statement the subquery cannot hold after all, falls
-  -- back to the original query -- and to its own error message, so a genuinely
-  -- broken user query still reports what is wrong with it, not with the wrapper.
-  if not wrapped or code ~= 0 then
-    stdout, stderr, code = duckdb(db_path, sql_str, nil, url)
+  local stdout, stderr, code, engine
+  if wrapped then
+    stdout, stderr, code, engine = duckdb(db_path, wrapped, nil, url, opts)
+  end
+  -- Never rerun a user's statement after any attempt, including a volatile
+  -- SELECT. Unwrappable syntax is classified before execution; wrapper errors
+  -- are surfaced instead of falling back to a second run.
+  if not wrapped then
+    stdout, stderr, code, engine = duckdb(db_path, sql_str, nil, url, opts)
   end
   if code ~= 0 then
     local msg = stderr ~= "" and stderr or ("duckdb exited with code " .. code)
@@ -696,11 +754,17 @@ function M.query(sql_str, url)
 
   local parsed, parse_err = db_util.parse_csv(stdout)
   if not parsed then return nil, parse_err end
+  if wrapped then
+    parsed, parse_err = require("dadbod-grip.transport").duckdb_values(parsed)
+    if not parsed then return nil, parse_err end
+  end
 
   return {
     rows = parsed.rows,
     columns = parsed.columns,
     primary_keys = {},
+    lossless = wrapped ~= nil,
+    engine_timing = engine or absent,
   }, nil
 end
 
@@ -1150,7 +1214,8 @@ function M.get_table_stats(table_name, url)
   }, nil
 end
 
-function M.execute(sql_str, url)
+function M.execute(sql_str, url, opts)
+  if type(opts) ~= "table" then opts = nil end
   if vim.fn.executable("duckdb") == 0 then
     return nil, "duckdb not found. Install duckdb."
   end
@@ -1158,7 +1223,18 @@ function M.execute(sql_str, url)
   local db_path = extract_path(url)
   if not db_path then return nil, "Invalid DuckDB URL: " .. url end
 
-  local stdout, stderr, code = duckdb_exec(db_path, sql_str, nil, url)
+  local absent
+  if opts and opts.engine_timing == true then
+    local single, reason = timing.statement(sql_str)
+    if not single then absent = timing.unsupported(reason); opts = nil
+    else
+      local probe_err
+      opts, absent, probe_err = timing.options(opts)
+      if probe_err then return nil, probe_err end
+    end
+  end
+
+  local stdout, stderr, code, engine = duckdb_exec(db_path, sql_str, nil, url, opts)
   if code ~= 0 then
     local msg = stderr ~= "" and stderr or ("duckdb exited with code " .. code)
     return nil, msg
@@ -1166,7 +1242,7 @@ function M.execute(sql_str, url)
 
   -- DuckDB text mode outputs "Changes: N" or row counts
   local n = stdout:match("(%d+)") or "0"
-  return { affected = tonumber(n) or 0, message = n .. " row(s) affected" }, nil
+  return { affected = tonumber(n) or 0, message = n .. " row(s) affected", engine_timing = engine or absent }, nil
 end
 
 --- Resolve relative file paths in a DSN to absolute paths.
@@ -1268,12 +1344,12 @@ local function store_attachment(url, dsn, alias, template)
       a.dsn = dsn
       a.extension = ext
       a.template = template
-      _catalog_cache[url] = nil  -- attachment list changed; re-query on next use
+      M.invalidate_schema(url)
       return
     end
   end
   table.insert(_attachments[url], { dsn = dsn, alias = alias, extension = ext, template = template })
-  _catalog_cache[url] = nil  -- attachment list changed; re-query on next use
+  M.invalidate_schema(url)
 end
 
 
@@ -1341,7 +1417,8 @@ function M.attach(url, dsn, alias, template)
   -- (both also open the same file), causing "Failed to lock file" on connection switch.
   local args = duckdb_args(":memory:", nil)
 
-  local _, stderr_attach, code_attach = adapters.run_cmd(args, timeout, { stdin = test_sql })
+  local _, stderr_attach, code_attach = queue.run(coordination_keys(":memory:", nil, dsn),
+    args, timeout, { stdin = test_sql })
   if code_attach ~= 0 then
     -- The DSN is in the SQL the CLI just rejected, so its stderr can quote
     -- the credentials straight back at us. Never return it raw.
@@ -1366,7 +1443,7 @@ function M.detach(url, alias)
   for i, a in ipairs(atts) do
     if a.alias == alias then
       table.remove(atts, i)
-      _catalog_cache[url] = nil  -- attachment list changed
+      M.invalidate_schema(url)
       return
     end
   end
@@ -1385,11 +1462,11 @@ end
 function M.load_attachments(url, attachments)
   if not attachments or #attachments == 0 then
     _attachments[url] = nil
-    _catalog_cache[url] = nil
+    M.invalidate_schema(url)
     return
   end
   _attachments[url] = {}
-  _catalog_cache[url] = nil
+  M.invalidate_schema(url)
   for _, a in ipairs(attachments) do
     local dsn = M.url_to_dsn(a.dsn)
     local err = M.attach(url, dsn, a.alias, a.template)
@@ -1510,10 +1587,37 @@ function M.get_schema_batch_async(url, callback)
   local main_catalog = main_catalog_name(db_path)
   local sql_str = _make_schema_batch_sql(has_attachments, main_catalog)
 
-  duckdb_async(db_path, sql_str, nil, url, function(stdout, _, code)
+  return duckdb_async(db_path, sql_str, nil, url, function(stdout, _, code)
     if code ~= 0 then callback(nil); return end
     callback(_parse_schema_batch_rows(db_util.parse_csv(stdout), main_catalog))
   end)
+end
+
+--- Completion uses the actual CLI session's catalog, without loading extensions.
+--- Keep this on the same queue, attachment and read-only path as schema warming.
+function M.get_completion_functions_async(url, callback)
+  local path = extract_path(url)
+  if not path then vim.schedule(function() callback(nil) end); return end
+  return duckdb_async(path,
+    "SELECT DISTINCT function_name, function_type FROM duckdb_functions() "
+      .. "WHERE schema_name = 'main' AND (database_name IN ('system', 'temp') "
+      .. "OR database_name = current_database()) AND function_type IN "
+      .. "('scalar', 'aggregate', 'macro', 'table', 'table_macro') ORDER BY function_name, function_type",
+    nil, url, function(stdout, _, code)
+      if code ~= 0 then callback(nil); return end
+      local functions, seen = {}, {}
+      for _, row in ipairs(db_util.parse_csv(stdout).rows or {}) do
+        local name, kind = row[1], row[2]
+        -- Unquoted SQL identifiers only. Operator and quoted names require a
+        -- separate insertion/quoting contract and are deliberately omitted.
+        local key = tostring(name) .. ":" .. tostring(kind)
+        if type(name) == "string" and name:match("^[%a_][%w_]*$") and not seen[key] then
+          seen[key] = true
+          functions[#functions + 1] = { name = name, type = kind }
+        end
+      end
+      callback(functions)
+    end)
 end
 
 -- Exposed for testing
@@ -1545,5 +1649,20 @@ M._nested_json_sql = nested_json_sql
 --- query gets depends on that state, so a spec asserting on either branch has to
 --- be able to start from a cold session.
 M._forget_installed_extensions = function() _installed_ext = {} end
+
+function M.grid_write(plan, url, opts)
+  local transaction = require("dadbod-grip.transaction")
+  local path = extract_path(url)
+  if not path then return nil, "Invalid DuckDB URL" end
+  local script, err = transaction.compile(plan, "duckdb")
+  if not script then return nil, err end
+  local stdout, stderr, code = transaction.submit('duckdb', opts, function(hooks)
+    return duckdb(path, script, nil, url, hooks)
+  end)
+  if code ~= 0 then return nil, stderr ~= "" and stderr or ("duckdb exited with code " .. code) end
+  local result, decode_err = transaction.decode(plan, stdout, "duckdb")
+  if result then result.sql = script end
+  return result, decode_err
+end
 
 return M

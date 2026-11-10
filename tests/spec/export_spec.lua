@@ -156,12 +156,11 @@ end)
 
 -- ── JSON edge cases ───────────────────────────────────────────────────────────
 
-test("format_export json: numeric value is unquoted in output", function()
+test("format_export json: numeric text stays quoted to preserve its type and spelling", function()
   local lines = fmt({ {"alice", "42"} }, {"name", "score"}, "json", "t")
   local joined = table.concat(lines, "\n")
-  -- "score": 42  (no quotes around 42)
-  contains(joined, '"score": 42')
-  not_contains(joined, '"score": "42"')
+  contains(joined, '"score": "42"')
+  not_contains(joined, '"score": 42')
 end)
 
 test("format_export json: value with backslash is escaped", function()
@@ -293,7 +292,8 @@ end)
 
 test("format_export sql: SQL Server literals by column type", function()
   local lines = fmt({ { "1", "李", "0xDEAD", nil, "" } }, { "id", "name", "b", "n", "e" }, "sql", "t",
-    { kind = "sqlserver", types = { id = "int", name = "nvarchar(10)", b = "varbinary(8)", n = "int", e = "varchar(5)" } })
+    { storage_adapter = "sqlserver",
+      column_types = { id = "int", name = "nvarchar(10)", b = "varbinary(8)", n = "int", e = "varchar(5)" } })
   eq(lines[1], [[INSERT INTO "t" ("id", "name", "b", "n", "e") VALUES (N'1', N'李', 0xDEAD, NULL, N'');]])
 end)
 
@@ -301,12 +301,9 @@ test("format_export sql: without an adapter the output is unchanged", function()
   eq(fmt({ { "1", "x" } }, { "id", "name" }, "sql", "t")[1], [[INSERT INTO "t" ("id", "name") VALUES ('1', 'x');]])
 end)
 
-test("export rows from a result: NULL and '' stay apart where the adapter knows", function()
-  local rows = view._export_rows_from_result({
-    columns = { "id", "a", "b" }, rows = { { "1", "", "" } }, empty_cells = { [1] = { [3] = true } },
-  })
-  eq(rows[1][2], nil, "NULL")
-  eq(rows[1][3], "", "''")
+test("format_export sql: a typed NULL from a full result exports as NULL", function()
+  local lines = fmt({ { "1", vim.NIL, "" } }, { "id", "a", "b" }, "sql", "t", { storage_adapter = "sqlserver" })
+  eq(lines[1], [[INSERT INTO "t" ("id", "a", "b") VALUES (N'1', NULL, N'');]])
 end)
 
 -- ── summary ─────────────────────────────────────────────────────────────────

@@ -73,6 +73,13 @@ Open the disposable demo:
 ```
 
 The demo recreates its database from the bundled seed each time, so edits cannot damage your own data.
+It opens the schema sidebar and walkthrough with the cursor inside the first SQL block. Press `<C-CR>` to run that block; opening the demo does not run it automatically. To browse a table first, press `gb`, select `rolls`, press Enter, and then press `2` to return to SQL.
+
+The walkthrough's **Daily practice** section covers finding a view, filtering and exporting results, staging an edit, reviewing SQL, undoing or applying it, and keeping useful queries. Both demo engines include an incident summary view. DuckDB adds a collapsible reporting schema and a SQL macro. The [demo guide](demo/README.md) also provides an optional local PostgreSQL lab for nested partitions, a view, and function source browsing.
+
+Run `:Grip` or `:GripHome` for the welcome screen. The DBG logo sits above four action rows: open the demo, connect a database, browse tables, and open SQL. Use Tab/Shift-Tab or native `j`/`k` to select a row, then press Enter. The diagram follows configured keys; with defaults, `1` opens schema, `2` opens SQL, and `3` opens the table picker.
+
+Other panes have contextual actions: `2` in SQL opens history, and `1` in schema opens connections. Press `?` for that pane's effective keys; the help ends with Chonk's About section. Default bindings remain unchanged.
 
 ### Connect to a database
 
@@ -133,10 +140,20 @@ These commands cover the normal path:
 | `:GripExport` | Exports the current page or every matching row. |
 | `:GripImport` | Previews and stages CSV, TSV, or JSON rows from the clipboard or `!command`. |
 | `:GripHome` | Returns to the welcome screen. |
+| `:GripZoom` | Maximizes the current pane or restores its split layout. |
+| `:GripZen` | Toggles automatic shortcut hints across the session. |
+
+A slow query counts up while it runs: past half a second the loading float appends live elapsed time (`querying users... 3.4s`), so a long wait is legible before the grid appears. After a successful query, the results footer keeps its client-observed query duration, such as `Query: 3.4s client`.
+
+After a successful write and reload, the footer keeps `Write: ... client` for the database write and a separate `Query` duration for the SELECT that refreshes the grid. An interrupted or timed-out client wait leaves the database outcome unknown. Refresh and check the database before retrying the write.
 
 In the query pad, `<C-CR>` runs SQL and `gA` generates SQL. In the grid, `f` filters by the current cell, `s` sorts the current column, `gf` follows a foreign key, and `gE` exports to the clipboard.
 
 The complete command and keymap reference lives in `:help dadbod-grip`. The [documentation website](https://jorypestorious.com/dadbod-grip-web/) provides task-focused guides and screenshots.
+
+Use `gb` to focus the sidebar, then `<Esc>` to close it. Press `gz` in the grid, query pad, sidebar, or welcome screen to zoom that pane, and press it again to restore the layout. Native `<C-w>` window navigation still works, and `<C-p>` opens the searchable command palette in the grid, query pad, and sidebar.
+
+Opening SQL from another zoomed pane restores its split layout. Result shortcut hints fit in two rows for each window's width and stay visible during horizontal table scrolling. Narrow panes prioritize help and core actions.
 
 ## Files and federation
 
@@ -165,18 +182,31 @@ require("dadbod-grip").setup({
   timeout = 10000,
   completion = true,
   open_sidebar = true,
+  show_running_time = true,
+  show_result_time = true,
+  show_hints = true,
+  engine_timing = false,
 })
 ```
 
 Set `open_sidebar = false` to connect directly into the main workspace. Set `completion = false` when another completion engine owns SQL suggestions. Set `ai = false` to skip SQL generation and schema preloading; the AI keys remain registered and explain that AI is disabled.
 
+Standalone SQL suggestions wait for two characters or a qualifier dot and leave your text unchanged until you select a match. DuckDB completion also offers catalog functions in expressions and table functions after `FROM` or `JOIN`. Catalogs warm in the background through the query queue; completion adds no extension installs or loads.
+
+Set `show_running_time = false` to hide the loading counter or `show_result_time = false` to hide retained timing labels. Set `show_hints = false` for Zen display, or use `:GripZen` to toggle it during the session. These controls are independent; Zen keeps essential status and explicit `?` help available without changing pane layout.
+
+Set `engine_timing = true` to collect DuckDB profiler latency during an eligible single statement's original execution. Profiling adds overhead and never reruns the statement. Batches and other adapters report unsupported timing; missing or invalid profiles report unavailable timing. See `:help grip-engine-timing` for the metric and support limits.
+
+Set `highlights = { GripColHighlight = { link = "Visual" }, GripHeaderActive = { link = "Visual" } }` to follow your colorscheme's selection colors. Overrides survive colorscheme and connection changes. See `:help grip-highlights` for supported groups and precedence.
+
 All default values, picker integrations, connection fields, remappable actions, and AI-provider options live in `:help grip-config` and the [getting-started guide](https://jorypestorious.com/dadbod-grip-web/docs/getting-started).
+Welcome actions are also configurable, for example `keymaps = { welcome_next = "<F2>", welcome_activate = "<F3>" }`. Setting an action to `false` removes its mapping. Welcome keeps command fallbacks visible, and `?` shows effective keys for the current pane. The palette remains available in the grid, query pad, and sidebar.
 
 ## Safety and privacy
 
 Dadbod Grip stages cell edits, inserted rows, and deletions in memory. Nothing reaches the database until you inspect the generated SQL and confirm the apply action. A connection with `"mode": "ro"` disables editing and asks the database client for a read-only session, but database permissions remain the real security boundary.
 
-Dadbod Grip sends all database SQL and AI request content through stdin. Statements, mutation values, prompts, schema context, existing SQL, and request bodies stay out of process arguments. API-key lookup commands also enter the shell through stdin.
+Dadbod Grip keeps original SQL, mutation values, AI prompts, schema context, and request bodies out of process arguments. They travel through stdin, as do API-key lookup commands. SQLite reads also use a generated SQL script with selected column identifiers, created as 0600 inside a fresh 0700 temporary directory and removed after the client exits. Those identifiers can be sensitive.
 
 For `:GripImport !command`, the parent shell receives the script through stdin, but child commands retain normal shell argument visibility. Pass credentials through environment variables, stdin, or configuration files instead of command arguments.
 

@@ -6,9 +6,9 @@
 -- ============================================================
 --
 -- Setup (DuckDB):
---   duckdb ~/.local/share/nvim/grip/demo/softrear.duckdb < demo/softrear.sql
+--   duckdb ~/.local/share/nvim/grip/softrear.duckdb < demo/softrear.sql
 -- Open:
---   :Grip ~/.local/share/nvim/grip/demo/softrear.duckdb
+--   :Grip ~/.local/share/nvim/grip/softrear.duckdb
 --
 -- Or via plugin:
 --   :GripStart
@@ -859,3 +859,26 @@ UPDATE internal_investigations SET case_metadata = '{"priority":"critical","watc
 UPDATE internal_investigations SET case_metadata = '{"priority":"resolved","watchers":0,"outcome":"acquired","acquisition_details":{"division":"R_D","clearance":"restricted","nda_signed":true},"tags":["formula","academic"]}'::JSON WHERE id = 3;
 UPDATE internal_investigations SET case_metadata = '{"priority":"high","watchers":2,"platform_metrics":{"subscribers":12000,"posts_last_90_days":0},"risk_assessment":{"exposure_risk":7,"dormancy":"suspicious"},"tags":["reddit","moderator"]}'::JSON WHERE id = 4;
 UPDATE internal_investigations SET case_metadata = '{"priority":"medium","watchers":1,"platform_metrics":{"subscribers":47300,"video_views_total":2100000},"notable_content":["ply_count_video","formula_comparison"],"tags":["youtube","viral"]}'::JSON WHERE id = 5;
+
+-- Read-only report used by the daily-workflow lesson.
+CREATE VIEW incident_summary AS
+SELECT incident_type,
+       COUNT(*) AS incident_count,
+       MAX(severity) AS max_severity,
+       SUM(CASE WHEN resolved THEN 0 ELSE 1 END) AS open_count
+FROM consumer_incidents
+GROUP BY incident_type;
+
+-- DuckDB's native schema keeps reporting objects separate from editable tables.
+CREATE SCHEMA reporting;
+CREATE MACRO reporting.severity_label(score) AS
+  CASE WHEN score IS NULL THEN 'unrated'
+       WHEN score >= 8 THEN 'high'
+       WHEN score >= 5 THEN 'medium'
+       ELSE 'low' END;
+CREATE VIEW reporting.monthly_incidents AS
+SELECT strftime(CAST(incident_date AS TIMESTAMP), '%Y-%m') AS month,
+       COUNT(*) AS incident_count,
+       reporting.severity_label(MAX(severity)) AS highest_priority
+FROM main.consumer_incidents
+GROUP BY month;
